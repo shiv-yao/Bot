@@ -1,0 +1,28 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>⚔️ MEV Desk</title>
+</head>
+<body style="background:#0f172a;color:white">
+<h1>⚔️ MEV Trading Desk</h1>
+<h2>Capital: <span id="cap"></span></h2>
+<h3>Last Signal: <span id="sig"></span></h3>
+<h3>Logs</h3>
+<ul id="logs"></ul>
+<script>
+async function load(){
+    let r = await fetch('/data')
+    let d = await r.json()
+    document.getElementById("cap").innerText = d.capital
+    document.getElementById("sig").innerText = d.last_signal
+    let logs=""
+    d.logs.slice().reverse().forEach(l=>{
+        logs += `<li>${l}</li>`
+    })
+    document.getElementById("logs").innerHTML = logs
+}
+setInterval(load,1000)
+</script>
+</body>
+</html>
