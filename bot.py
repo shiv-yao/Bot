@@ -41,6 +41,7 @@ async def rpc_post(method, params):
 async def sync_sol_balance():
     kp = load_keypair()
     if not kp:
+        engine.log("SAFE MODE: no PRIVATE_KEY")
         return
 
     res = await rpc_post("getBalance", [str(kp.pubkey())])
@@ -207,13 +208,25 @@ async def do_test_buy():
         pass
 
     entry_price = 0.0
-    if token_amount > 0:
-        entry_price = BUY_AMOUNT_SOL / token_amount
 
+    # 方法1：用 Jupiter quote 算 entry
+    try:
+        if "outAmount" in order:
+            token_amount = int(order["outAmount"]) / 1_000_000
+            if token_amount > 0:
+                entry_price = BUY_AMOUNT_SOL / token_amount
+    except Exception:
+        pass
+
+    # 方法2：fallback 用即時價格
     if entry_price <= 0:
         price_now = await get_price(TEST_TARGET_MINT)
         if price_now and price_now > 0:
             entry_price = price_now
+
+    # 方法3：最後 fallback，避免 0
+    if entry_price <= 0:
+        entry_price = 0.000000001
 
     engine.positions = [{
         "token": TEST_TARGET_MINT,
@@ -296,9 +309,18 @@ async def monitor():
 
                 entry = p.get("entry_price", 0.0)
                 if not entry or entry <= 0:
-                    engine.log("SKIP MONITOR: invalid entry_price")
-                    await asyncio.sleep(8)
-                    continue
+                    # 自動補 entry，避免壞倉位
+                    price_now = await get_price(p["token"])
+                    if price_now and price_now > 0:
+                        p["entry_price"] = price_now
+                        p["last_price"] = price_now
+                        p["peak_price"] = max(p.get("peak_price", 0.0), price_now)
+                        entry = price_now
+                        engine.log(f"FIX ENTRY PRICE: {entry}")
+                    else:
+                        engine.log("SKIP MONITOR: invalid entry_price")
+                        await asyncio.sleep(8)
+                        continue
 
                 p["last_price"] = price
                 p["peak_price"] = max(p.get("peak_price", price), price)
