@@ -1,3 +1,7 @@
+import os
+
+if not os.getenv("PRIVATE_KEY"):
+    print("⚠️ SAFE MODE")
 import asyncio
 from wallet import get_rpc, load_keypair
 from jupiter import get_quote, get_swap_tx
