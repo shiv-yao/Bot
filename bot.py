@@ -26,6 +26,12 @@ TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
 
+# Phase I
+ADD_ON_WIN = os.getenv("ADD_ON_WIN", "true").lower() == "true"
+ADD_TRIGGER_PCT = float(os.getenv("ADD_TRIGGER_PCT", "0.08"))      # 浮盈 8% 加倉
+ADD_SIZE_MULTIPLIER = float(os.getenv("ADD_SIZE_MULTIPLIER", "0.5"))  # 加倉 = 基礎倉位 50%
+MAX_ADDS_PER_POSITION = int(os.getenv("MAX_ADDS_PER_POSITION", "1"))
+
 CANDIDATES = set()
 
 
@@ -98,6 +104,7 @@ async def sync_positions():
                 "peak_price": old.get("peak_price", entry),
                 "pnl_pct": old.get("pnl_pct", 0.0),
                 "alpha_score": old.get("alpha_score", 0.0),
+                "adds": old.get("adds", 0),
             })
 
     engine.positions = new_positions
@@ -193,10 +200,71 @@ def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
 
 
+def get_position(mint: str):
+    for p in engine.positions:
+        if p["token"] == mint:
+            return p
+    return None
+
+
 def calc_position_size() -> float:
     capital = max(engine.capital, 0.0)
     raw = capital * RISK_PCT_PER_TRADE
     return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, raw))
+
+
+async def place_buy_order(mint: str, size_sol: float):
+    kp = load_keypair()
+    if not kp:
+        engine.log("NO KEYPAIR")
+        return None, None, None
+
+    amount_atomic = int(size_sol * 1e9)
+
+    order = await get_order(
+        input_mint=SOL,
+        output_mint=mint,
+        amount_atomic=amount_atomic,
+        taker=str(kp.pubkey()),
+    )
+    if not order:
+        return None, None, "BUY ORDER FAIL"
+
+    result = await execute_order(order, kp)
+    if not result:
+        return None, None, "BUY EXEC FAIL"
+
+    signed_tx = result.get("signed_tx")
+    if not signed_tx:
+        return None, None, "BUY NO SIGNED TX"
+
+    sig_json, err = await send_signed_tx(signed_tx)
+    if err:
+        return None, None, err
+
+    token_amount = 0.0
+    try:
+        if "outAmount" in order:
+            token_amount = int(order["outAmount"]) / 1_000_000
+    except Exception:
+        pass
+
+    entry = 0.0
+    try:
+        if token_amount > 0:
+            entry = size_sol / token_amount
+    except Exception:
+        pass
+
+    if entry <= 0:
+        price_now = await get_price(mint)
+        if price_now and price_now > 0:
+            entry = price_now
+
+    if entry <= 0:
+        entry = 1e-9
+
+    return sig_json, token_amount, entry
 
 
 async def buy(mint: str, alpha_score_value: float = 0.0):
@@ -216,66 +284,14 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
         return
 
-    kp = load_keypair()
-    if not kp:
-        engine.log("NO KEYPAIR")
-        return
-
     size = calc_position_size()
-    amount_atomic = int(size * 1e9)
-
     engine.log(f"TRY BUY {mint[:8]} size={size:.6f}")
 
-    order = await get_order(
-        input_mint=SOL,
-        output_mint=mint,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
-    )
-    if not order:
+    sig_json, token_amount, entry = await place_buy_order(mint, size)
+    if not sig_json:
         engine.stats["errors"] += 1
-        engine.log("BUY ORDER FAIL")
+        engine.log(str(entry) if isinstance(entry, str) else "BUY FAILED")
         return
-
-    result = await execute_order(order, kp)
-    if not result:
-        engine.stats["errors"] += 1
-        engine.log("BUY EXEC FAIL")
-        return
-
-    signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("BUY NO SIGNED TX")
-        return
-
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return
-
-    token_amount = 0.0
-    try:
-        if "outAmount" in order:
-            token_amount = int(order["outAmount"]) / 1_000_000
-    except Exception:
-        pass
-
-    entry = 0.0
-    try:
-        if token_amount > 0:
-            entry = size / token_amount
-    except Exception:
-        pass
-
-    if entry <= 0:
-        price_now = await get_price(mint)
-        if price_now and price_now > 0:
-            entry = price_now
-
-    if entry <= 0:
-        entry = 1e-9
 
     engine.positions.append({
         "token": mint,
@@ -285,6 +301,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         "peak_price": entry,
         "pnl_pct": 0.0,
         "alpha_score": alpha_score_value,
+        "adds": 0,
     })
 
     engine.stats["buys"] += 1
@@ -296,6 +313,53 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
     })
     engine.trade_history = engine.trade_history[-50:]
     engine.log(f"BUY SUCCESS {mint[:8]}")
+
+
+async def add_to_winner(position: dict):
+    mint = position["token"]
+
+    if position.get("adds", 0) >= MAX_ADDS_PER_POSITION:
+        return
+
+    if MODE != "REAL":
+        return
+
+    add_size = calc_position_size() * ADD_SIZE_MULTIPLIER
+    if add_size <= 0:
+        return
+
+    engine.log(f"TRY ADD {mint[:8]} size={add_size:.6f}")
+
+    sig_json, add_token_amount, add_entry = await place_buy_order(mint, add_size)
+    if not sig_json:
+        engine.stats["errors"] += 1
+        engine.log("ADD FAILED")
+        return
+
+    old_amount = position["amount"]
+    old_entry = position["entry_price"]
+
+    new_amount = old_amount + add_token_amount
+    if new_amount > 0:
+        blended_entry = ((old_amount * old_entry) + (add_token_amount * add_entry)) / new_amount
+    else:
+        blended_entry = old_entry
+
+    position["amount"] = new_amount
+    position["entry_price"] = blended_entry
+    position["last_price"] = blended_entry
+    position["peak_price"] = max(position.get("peak_price", blended_entry), blended_entry)
+    position["adds"] = position.get("adds", 0) + 1
+
+    engine.stats["adds"] += 1
+    engine.last_trade = f"ADD {mint[:8]}"
+    engine.trade_history.append({
+        "side": "ADD",
+        "mint": mint,
+        "result": sig_json,
+    })
+    engine.trade_history = engine.trade_history[-50:]
+    engine.log(f"ADD SUCCESS {mint[:8]}")
 
 
 async def sell(position: dict):
@@ -384,6 +448,9 @@ async def monitor():
 
                     engine.log(f"{p['token'][:8]} PNL {round(pnl * 100, 2)}%")
 
+                    if ADD_ON_WIN and pnl >= ADD_TRIGGER_PCT and p.get("adds", 0) < MAX_ADDS_PER_POSITION:
+                        await add_to_winner(p)
+
                     if pnl >= TAKE_PROFIT:
                         engine.log("TAKE PROFIT HIT")
                         await sell(p)
@@ -431,7 +498,7 @@ async def handle_mempool(event: dict):
 
 async def bot_loop():
     engine.mode = MODE
-    engine.log("FUND MODE START")
+    engine.log("PHASE I START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -454,13 +521,9 @@ async def bot_loop():
                     await buy(mint, alpha_score_value=score)
 
             smart_money_mint = await wallet_graph_signal(RPC)
-
-if smart_money_mint:
-    engine.log(f"SMART MONEY {smart_money_mint[:8]}")
-    await buy(smart_money_mint, alpha_score_value=999)
             if smart_money_mint and not has_position(smart_money_mint):
                 engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
-                await buy(smart_money_mint, alpha_score_value=99.0)
+                await buy(smart_money_mint, alpha_score_value=999.0)
 
             engine.stats["signals"] += 1
             engine.log("LOOP RUNNING")
