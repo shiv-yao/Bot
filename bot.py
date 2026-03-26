@@ -1,6 +1,7 @@
 import os
 import asyncio
 import httpx
+import random
 
 from state import engine
 from wallet import load_keypair
@@ -9,89 +10,36 @@ from jupiter import get_order, execute_order
 RPC = os.getenv("RPC", "").strip()
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-TEST_TARGET_MINT = os.getenv("TEST_TARGET_MINT", "").strip()
-AUTO_TEST_BUY = os.getenv("AUTO_TEST_BUY", "false").lower() == "true"
-BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.002"))
 MODE = os.getenv("MODE", "PAPER").upper()
 
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.15"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.07"))
-ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "false").lower() == "true"
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+POSITION_SIZE_SOL = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
 
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.2"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.1"))
+
+ENABLE_AUTO_SELL = True
+
+
+# ================= RPC =================
 
 async def rpc_post(method, params):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                RPC,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                },
-            )
-            return resp.json()
+            r = await client.post(RPC, json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params
+            })
+            return r.json()
     except Exception as e:
-        engine.log(f"RPC ERROR: {e}")
+        engine.log(f"RPC ERROR {e}")
         return None
 
 
-async def sync_sol_balance():
-    kp = load_keypair()
-    if not kp:
-        engine.log("SAFE MODE: no PRIVATE_KEY")
-        return
-
-    res = await rpc_post("getBalance", [str(kp.pubkey())])
-    if not res or "result" not in res:
-        return
-
-    lamports = res["result"]["value"]
-    engine.sol_balance = lamports / 1e9
-    engine.capital = engine.sol_balance
-
-
-async def sync_positions():
-    kp = load_keypair()
-    if not kp:
-        return
-
-    res = await rpc_post(
-        "getTokenAccountsByOwner",
-        [
-            str(kp.pubkey()),
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"},
-        ],
-    )
-    if not res or "result" not in res:
-        return
-
-    old_map = {p["token"]: p for p in engine.positions}
-    new_positions = []
-
-    for item in res["result"]["value"]:
-        info = item["account"]["data"]["parsed"]["info"]
-        mint = info["mint"]
-        amount = float(info["tokenAmount"].get("uiAmount") or 0)
-
-        if amount > 0:
-            old = old_map.get(mint, {})
-            entry = old.get("entry_price", 0.0)
-
-            new_positions.append({
-                "token": mint,
-                "amount": amount,
-                "entry_price": entry,
-                "last_price": old.get("last_price", entry),
-                "peak_price": old.get("peak_price", entry),
-                "pnl_pct": old.get("pnl_pct", 0.0),
-            })
-
-    engine.positions = new_positions
-
+# ================= PRICE =================
 
 async def get_price(mint):
     try:
@@ -102,283 +50,204 @@ async def get_price(mint):
                     "inputMint": mint,
                     "outputMint": SOL_MINT,
                     "amount": "1000000",
-                    "slippageBps": 100,
-                },
+                    "slippageBps": 100
+                }
             )
 
-        if r.status_code != 200:
-            return None
-
         data = r.json()
-        out_amount = data.get("outAmount")
-        if not out_amount:
+        out = data.get("outAmount")
+        if not out:
             return None
 
-        out_sol = int(out_amount) / 1e9
-        return out_sol / 1_000_000
-    except Exception as e:
-        engine.log(f"PRICE ERROR: {e}")
+        sol = int(out) / 1e9
+        return sol / 1_000_000
+
+    except:
         return None
 
 
-async def send_signed_tx(signed_tx_b64: str):
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            RPC,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "sendTransaction",
-                "params": [
-                    signed_tx_b64,
-                    {
-                        "skipPreflight": True,
-                        "encoding": "base64",
-                    },
-                ],
-            },
-        )
+# ================= SNIPER（簡版） =================
 
-    if resp.status_code != 200:
-        return None, f"SEND TX FAILED: {resp.text}"
-
-    data = resp.json()
-    if "error" in data:
-        return None, f"RPC ERROR: {data['error']}"
-
-    return data, None
+async def scan_new_tokens():
+    # 模擬（你之後可以接 pump.fun / mempool）
+    test_list = [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    ]
+    return random.choice(test_list)
 
 
-async def do_test_buy():
-    if MODE != "REAL":
-        engine.log("PAPER mode: skip real buy")
+# ================= BUY =================
+
+async def do_buy(mint):
+    if len(engine.positions) >= MAX_POSITIONS:
+        return
+
+    if any(p["token"] == mint for p in engine.positions):
         return
 
     kp = load_keypair()
     if not kp:
-        engine.log("NO KEYPAIR")
         return
 
-    if not TEST_TARGET_MINT:
-        engine.log("NO TEST_TARGET_MINT")
-        return
+    amount_atomic = int(POSITION_SIZE_SOL * 1e9)
 
-    amount_atomic = int(BUY_AMOUNT_SOL * 1e9)
+    engine.log(f"TRY BUY {mint[:6]}")
 
-    engine.log("TRY ORDER")
     order = await get_order(
-        input_mint=SOL_MINT,
-        output_mint=TEST_TARGET_MINT,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
+        SOL_MINT,
+        mint,
+        amount_atomic,
+        str(kp.pubkey())
     )
     if not order:
-        engine.stats["errors"] += 1
-        engine.log("ORDER FAILED")
+        engine.log("ORDER FAIL")
         return
 
-    engine.log("TRY EXECUTE")
     result = await execute_order(order, kp)
     if not result:
-        engine.stats["errors"] += 1
-        engine.log("EXECUTE FAILED")
+        engine.log("EXEC FAIL")
         return
 
     signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("NO SIGNED TX")
-        return
 
-    engine.log("TRY SEND TX")
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return
+    async with httpx.AsyncClient() as client:
+        await client.post(RPC, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [signed_tx, {"skipPreflight": True}]
+        })
+
+    # ===== entry price 修正 =====
+    entry = 0.0
+    try:
+        token_amount = int(order["outAmount"]) / 1_000_000
+        if token_amount > 0:
+            entry = POSITION_SIZE_SOL / token_amount
+    except:
+        pass
+
+    if entry <= 0:
+        price = await get_price(mint)
+        if price:
+            entry = price
+
+    if entry <= 0:
+        entry = 1e-9
+
+    engine.positions.append({
+        "token": mint,
+        "amount": token_amount,
+        "entry_price": entry,
+        "last_price": entry,
+        "peak_price": entry,
+        "pnl_pct": 0
+    })
 
     engine.stats["buys"] += 1
-    engine.last_trade = f"BUY {TEST_TARGET_MINT[:8]}"
-
-    token_amount = 0.0
-    try:
-        if "outAmount" in order:
-            token_amount = int(order["outAmount"]) / 1_000_000
-    except Exception:
-        pass
-
-    entry_price = 0.0
-
-    # 方法1：用 Jupiter quote 算 entry
-    try:
-        if "outAmount" in order:
-            token_amount = int(order["outAmount"]) / 1_000_000
-            if token_amount > 0:
-                entry_price = BUY_AMOUNT_SOL / token_amount
-    except Exception:
-        pass
-
-    # 方法2：fallback 用即時價格
-    if entry_price <= 0:
-        price_now = await get_price(TEST_TARGET_MINT)
-        if price_now and price_now > 0:
-            entry_price = price_now
-
-    # 方法3：最後 fallback，避免 0
-    if entry_price <= 0:
-        entry_price = 0.000000001
-
-    engine.positions = [{
-        "token": TEST_TARGET_MINT,
-        "amount": token_amount,
-        "entry_price": entry_price,
-        "last_price": entry_price,
-        "peak_price": entry_price,
-        "pnl_pct": 0.0,
-    }]
-
-    engine.trade_history.append({
-        "side": "BUY",
-        "mint": TEST_TARGET_MINT,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-50:]
-
     engine.log("BUY SUCCESS")
 
 
-async def do_sell(mint, amount_atomic):
+# ================= SELL =================
+
+async def do_sell(p):
     kp = load_keypair()
     if not kp:
-        engine.log("SELL FAILED: no key")
-        return False
+        return
 
-    engine.log("TRY SELL ORDER")
+    mint = p["token"]
+    amount_atomic = int(p["amount"] * 1_000_000)
+
+    engine.log(f"SELL {mint[:6]}")
+
     order = await get_order(
-        input_mint=mint,
-        output_mint=SOL_MINT,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
+        mint,
+        SOL_MINT,
+        amount_atomic,
+        str(kp.pubkey())
     )
     if not order:
-        engine.stats["errors"] += 1
-        engine.log("SELL ORDER FAILED")
-        return False
+        return
 
-    engine.log("TRY SELL EXECUTE")
     result = await execute_order(order, kp)
     if not result:
-        engine.stats["errors"] += 1
-        engine.log("SELL EXECUTE FAILED")
-        return False
+        return
 
     signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("SELL NO SIGNED TX")
-        return False
 
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return False
+    async with httpx.AsyncClient() as client:
+        await client.post(RPC, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [signed_tx, {"skipPreflight": True}]
+        })
 
+    engine.positions = [x for x in engine.positions if x != p]
     engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {mint[:8]}"
-    engine.trade_history.append({
-        "side": "SELL",
-        "mint": mint,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-50:]
     engine.log("SELL SUCCESS")
-    engine.positions = []
-    return True
 
+
+# ================= MONITOR =================
 
 async def monitor():
     while True:
         try:
-            if ENABLE_AUTO_SELL and engine.positions:
-                p = engine.positions[0]
+            for p in engine.positions:
                 price = await get_price(p["token"])
                 if not price:
-                    await asyncio.sleep(8)
                     continue
 
-                entry = p.get("entry_price", 0.0)
-                if not entry or entry <= 0:
-                    # 自動補 entry，避免壞倉位
-                    price_now = await get_price(p["token"])
-                    if price_now and price_now > 0:
-                        p["entry_price"] = price_now
-                        p["last_price"] = price_now
-                        p["peak_price"] = max(p.get("peak_price", 0.0), price_now)
-                        entry = price_now
-                        engine.log(f"FIX ENTRY PRICE: {entry}")
-                    else:
-                        engine.log("SKIP MONITOR: invalid entry_price")
-                        await asyncio.sleep(8)
-                        continue
+                entry = p["entry_price"]
+                if entry <= 0:
+                    continue
 
                 p["last_price"] = price
-                p["peak_price"] = max(p.get("peak_price", price), price)
+                p["peak_price"] = max(p["peak_price"], price)
 
                 pnl = (price - entry) / entry
                 p["pnl_pct"] = pnl
 
-                engine.log(f"PNL {round(pnl * 100, 2)}%")
+                engine.log(f"{p['token'][:6]} PNL {round(pnl*100,2)}%")
 
                 if pnl >= TAKE_PROFIT_PCT:
-                    engine.log("TAKE PROFIT HIT")
-                    await do_sell(p["token"], int(p["amount"] * 1_000_000))
-                    await asyncio.sleep(8)
+                    await do_sell(p)
                     continue
 
                 if pnl <= -STOP_LOSS_PCT:
-                    engine.log("STOP LOSS HIT")
-                    await do_sell(p["token"], int(p["amount"] * 1_000_000))
-                    await asyncio.sleep(8)
+                    await do_sell(p)
                     continue
 
-                peak = p.get("peak_price", price)
-                if peak > 0:
-                    drawdown = (peak - price) / peak
-                    if peak > entry and drawdown >= TRAILING_STOP_PCT:
-                        engine.log("TRAILING STOP HIT")
-                        await do_sell(p["token"], int(p["amount"] * 1_000_000))
-                        await asyncio.sleep(8)
-                        continue
+                drawdown = (p["peak_price"] - price) / p["peak_price"]
+                if drawdown >= TRAILING_STOP_PCT:
+                    await do_sell(p)
+                    continue
 
         except Exception as e:
-            engine.log(f"MONITOR ERROR {e}")
+            engine.log(f"MONITOR ERR {e}")
 
-        await asyncio.sleep(8)
+        await asyncio.sleep(6)
 
+
+# ================= MAIN LOOP =================
 
 async def bot_loop():
     engine.mode = MODE
-    engine.log("BOT LOOP STARTED")
+    engine.log("FUND MODE START")
 
     asyncio.create_task(monitor())
 
-    bought = False
-
     while True:
         try:
-            await sync_sol_balance()
-            await sync_positions()
+            mint = await scan_new_tokens()
 
-            if AUTO_TEST_BUY and not bought:
-                await do_test_buy()
-                bought = True
+            if mint:
+                await do_buy(mint)
 
             engine.stats["signals"] += 1
-            engine.last_signal = "heartbeat"
-            engine.log("LOOP RUNNING")
+            engine.last_signal = "alpha_scan"
 
         except Exception as e:
-            engine.log(f"ERROR {e}")
+            engine.log(f"LOOP ERR {e}")
 
-        await asyncio.sleep(8)
+        await asyncio.sleep(5)
