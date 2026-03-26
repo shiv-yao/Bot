@@ -1,92 +1,57 @@
 import os
+import threading
 import asyncio
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, HTMLResponse
 
 app = FastAPI()
 
-BOT_STATUS = {"ok": False, "error": "not started"}
+BOT_STATUS = {"ok": False, "error": ""}
 
-@app.on_event("startup")
-async def startup():
-    async def runner():
+def start_bot_thread():
+    def run():
         try:
             from bot import bot_loop
-            BOT_STATUS["ok"] = True
-            BOT_STATUS["error"] = ""
-            await bot_loop()
+            asyncio.run(bot_loop())
         except Exception as e:
             BOT_STATUS["ok"] = False
             BOT_STATUS["error"] = str(e)
-            print("BOT CRASH:", repr(e))
+            print("BOT CRASH:", e)
 
-    asyncio.create_task(runner())
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
 
-@app.get("/health")
-async def health():
-    return {
-        "ok": True,
-        "bot_ok": BOT_STATUS["ok"],
-        "bot_error": BOT_STATUS["error"],
-    }
+@app.on_event("startup")
+def startup():
+    BOT_STATUS["ok"] = True
+    start_bot_thread()
 
 @app.get("/data")
-async def data():
-    return JSONResponse({
+def data():
+    return {
         "running": True,
         "mode": "PAPER",
-        "sol_balance": 0.0,
-        "capital": 0.0,
-        "last_signal": "",
-        "last_trade": "",
-        "positions": [],
         "logs": [
             f"bot_ok={BOT_STATUS['ok']}",
-            f"bot_error={BOT_STATUS['error']}",
-        ],
-        "stats": {
-            "signals": 0,
-            "buys": 0,
-            "sells": 0,
-            "errors": 0
-        },
-        "trade_history": []
-    })
+            f"bot_error={BOT_STATUS['error']}"
+        ]
+    }
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
+def home():
     return """
-<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Dashboard</title>
-  <style>
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,sans-serif; background:#0b1020; color:#e5e7eb; padding:20px; }
-    .wrap { max-width:900px; margin:0 auto; }
-    .card { background:#121a2f; border:1px solid #1f2a44; border-radius:14px; padding:16px; margin-bottom:14px; }
-    .title { font-size:28px; font-weight:700; margin-bottom:18px; }
-    pre { white-space:pre-wrap; word-break:break-word; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="title">⚔️ Dashboard</div>
-    <div class="card"><pre id="out">loading...</pre></div>
-  </div>
-  <script>
-    async function load() {
-      const res = await fetch('/data');
-      const d = await res.json();
-      document.getElementById('out').textContent = JSON.stringify(d, null, 2);
+    <h1>Dashboard</h1>
+    <pre id="out"></pre>
+    <script>
+    async function load(){
+        const r = await fetch('/data');
+        const d = await r.json();
+        document.getElementById('out').textContent =
+            JSON.stringify(d, null, 2);
     }
-    load();
-    setInterval(load, 2000);
-  </script>
-</body>
-</html>
-"""
+    load(); setInterval(load,2000);
+    </script>
+    """
 
 if __name__ == "__main__":
     import uvicorn
