@@ -413,10 +413,10 @@ async def handle_mempool(event: dict):
             engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
             return
 
-        engine.log(f"SNIPER HIT {mint[:6]}")
+        engine.log(f"SNIPER HIT {mint[:8]}")
 
         if has_position(mint):
-            engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
+            engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:8]}")
             return
 
         if len(engine.positions) >= MAX_POSITIONS:
@@ -425,7 +425,7 @@ async def handle_mempool(event: dict):
 
         ok = await rug_filter(mint)
         if not ok:
-            engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
+            engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
             return
 
         await buy(mint)
