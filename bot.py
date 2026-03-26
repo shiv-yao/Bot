@@ -510,7 +510,7 @@ async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
 
     engine.mode = MODE
-    engine.log("PHASE K START")
+    engine.log("PHASE L START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -526,28 +526,31 @@ async def bot_loop():
                 LAST_SMART_WALLET_REFRESH = now
                 engine.log(f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)}")
 
-            # 🔥 Phase L：流動性建立（最強 alpha）
-                liq_mint = await liquidity_signal(RPC)
-
+            # 1. liquidity alpha
+            liq_mint = await liquidity_signal(RPC)
             if liq_mint and not has_position(liq_mint):
-               engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
-               await buy(liq_mint, alpha_score_value=1500.0)
+                engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
+                await buy(liq_mint, alpha_score_value=1500.0)
 
+            # 2. insider alpha
             insider_mint = await insider_signal(RPC)
             if insider_mint and not has_position(insider_mint):
                 engine.log(f"INSIDER HIT {insider_mint[:8]}")
                 await buy(insider_mint, alpha_score_value=1000.0)
 
+            # 3. smart money alpha
             smart_money_mint = await wallet_graph_signal(RPC)
             if smart_money_mint and not has_position(smart_money_mint):
                 engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
                 await buy(smart_money_mint, alpha_score_value=500.0)
 
+            # 4. auto smart wallet alpha
             auto_smart_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS)
             if auto_smart_mint and not has_position(auto_smart_mint):
                 engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
                 await buy(auto_smart_mint, alpha_score_value=700.0)
 
+            # 5. alpha ranking from mempool universe
             ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
