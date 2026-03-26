@@ -410,20 +410,25 @@ async def monitor():
 async def handle_mempool(event: dict):
     try:
         mint = event.get("mint")
+        sig = event.get("signature", "")
+
         if not mint:
+            engine.log("MEMPOOL SKIP: NO MINT")
             return
 
-        # 過濾垃圾
-        if len(mint) < 30:
+        if mint == SOL:
+            engine.log("MEMPOOL SKIP: SOL")
             return
+
+        if len(mint) < 32 or len(mint) > 44:
+            engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
+            return
+
+        engine.log(f"DECODE HIT {mint[:8]} sig={sig[:8]}")
 
         CANDIDATES.add(mint)
-
-        # 控制池大小（基金級會控 universe）
-        if len(CANDIDATES) > 50:
+        if len(CANDIDATES) > 100:
             CANDIDATES.pop()
-
-        engine.log(f"CANDIDATE ADD {mint[:8]}")
 
     except Exception as e:
         engine.stats["errors"] += 1
