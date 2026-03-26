@@ -1,3 +1,4 @@
+CANDIDATES = set()
 import os
 import asyncio
 import httpx
