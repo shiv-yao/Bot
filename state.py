@@ -13,6 +13,7 @@ class Engine:
             "buys": 0,
             "sells": 0,
             "errors": 0,
+            "adds": 0,
         }
         self.trade_history = []
 
