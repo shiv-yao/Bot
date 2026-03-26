@@ -454,6 +454,10 @@ async def bot_loop():
                     await buy(mint, alpha_score_value=score)
 
             smart_money_mint = await wallet_graph_signal(RPC)
+
+if smart_money_mint:
+    engine.log(f"SMART MONEY {smart_money_mint[:8]}")
+    await buy(smart_money_mint, alpha_score_value=999)
             if smart_money_mint and not has_position(smart_money_mint):
                 engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
                 await buy(smart_money_mint, alpha_score_value=99.0)
