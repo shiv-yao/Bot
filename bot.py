@@ -7,30 +7,23 @@ from wallet import load_keypair
 from jupiter import get_order, execute_order
 from mempool import mempool_stream
 from wallet_graph import wallet_graph_signal
+from alpha_engine import rank_candidates
 
 RPC = os.getenv("RPC", "").strip()
 SOL = "So11111111111111111111111111111111111111112"
 
 MODE = os.getenv("MODE", "REAL").upper()
-TEST_TARGET_MINT = os.getenv("TEST_TARGET_MINT", "").strip()
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
+MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
+MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.10"))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
 STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
 TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
-
-# 白名單：只狙擊你信任的 mint
-WHITELIST_MINTS = {
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-}
-
-# 如果有設 TEST_TARGET_MINT，也自動加入白名單
-if TEST_TARGET_MINT:
-    WHITELIST_MINTS.add(TEST_TARGET_MINT)
 
 
 async def rpc_post(method: str, params: list):
@@ -94,7 +87,6 @@ async def sync_positions():
         if amount > 0:
             old = old_map.get(mint, {})
             entry = old.get("entry_price", 0.0)
-
             new_positions.append({
                 "token": mint,
                 "amount": amount,
@@ -102,6 +94,7 @@ async def sync_positions():
                 "last_price": old.get("last_price", entry),
                 "peak_price": old.get("peak_price", entry),
                 "pnl_pct": old.get("pnl_pct", 0.0),
+                "alpha_score": old.get("alpha_score", 0.0),
             })
 
     engine.positions = new_positions
@@ -197,7 +190,13 @@ def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
 
 
-async def buy(mint: str):
+def calc_position_size() -> float:
+    capital = max(engine.capital, 0.0)
+    raw = capital * RISK_PCT_PER_TRADE
+    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, raw))
+
+
+async def buy(mint: str, alpha_score_value: float = 0.0):
     if MODE != "REAL":
         engine.log("PAPER MODE: buy skipped")
         return
@@ -210,10 +209,6 @@ async def buy(mint: str):
         engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:8]}")
         return
 
-    if mint not in WHITELIST_MINTS:
-        engine.log(f"BUY BLOCKED: NOT WHITELIST {mint[:8]}")
-        return
-
     if not await rug_filter(mint):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
         return
@@ -223,10 +218,10 @@ async def buy(mint: str):
         engine.log("NO KEYPAIR")
         return
 
-    size = POSITION_SIZE
+    size = calc_position_size()
     amount_atomic = int(size * 1e9)
 
-    engine.log(f"TRY BUY {mint[:8]}")
+    engine.log(f"TRY BUY {mint[:8]} size={size:.6f}")
 
     order = await get_order(
         input_mint=SOL,
@@ -286,6 +281,7 @@ async def buy(mint: str):
         "last_price": entry,
         "peak_price": entry,
         "pnl_pct": 0.0,
+        "alpha_score": alpha_score_value,
     })
 
     engine.stats["buys"] += 1
@@ -413,39 +409,11 @@ async def monitor():
 async def handle_mempool(event: dict):
     try:
         mint = event.get("mint")
-
         if not mint:
-            engine.log("MEMPOOL SKIP: NO MINT")
             return
 
-        if mint == SOL:
-            engine.log("MEMPOOL SKIP: SOL")
-            return
-
-        if len(mint) < 32 or len(mint) > 44:
-            engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
-            return
-
-        if mint not in WHITELIST_MINTS:
-            engine.log(f"MEMPOOL SKIP: NOT WHITELIST {mint[:8]}")
-            return
-
-        engine.log(f"SNIPER HIT {mint[:8]}")
-
-        if has_position(mint):
-            engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:8]}")
-            return
-
-        if len(engine.positions) >= MAX_POSITIONS:
-            engine.log("BUY BLOCKED: MAX_POSITIONS")
-            return
-
-        ok = await rug_filter(mint)
-        if not ok:
-            engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
-            return
-
-        await buy(mint)
+        # 這版基金級先不直接用 mempool 買，只記錄
+        engine.log(f"MEMPOOL CANDIDATE {mint[:8]}")
 
     except Exception as e:
         engine.stats["errors"] += 1
@@ -454,7 +422,7 @@ async def handle_mempool(event: dict):
 
 async def bot_loop():
     engine.mode = MODE
-    engine.log("PHASE D START")
+    engine.log("FUND MODE START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -464,20 +432,28 @@ async def bot_loop():
             await sync_sol_balance()
             await sync_positions()
 
-            mint = await wallet_graph_signal(RPC)
-            if mint:
-                if mint in WHITELIST_MINTS:
-                    engine.log(f"SMART MONEY HIT {mint[:8]}")
-                    await buy(mint)
-                else:
-                    engine.log(f"SMART MONEY SKIP {mint[:8]}")
+            ranked = await rank_candidates()
+            if ranked:
+                best = ranked[0]
+                mint = best["mint"]
+                score = best["score"]
+
+                engine.last_signal = f"alpha:{score:.2f}"
+                engine.log(f"BEST {mint[:8]} score={score:.2f}")
+
+                if score > 20:
+                    await buy(mint, alpha_score_value=score)
+
+            smart_money_mint = await wallet_graph_signal(RPC)
+            if smart_money_mint and not has_position(smart_money_mint):
+                engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
+                await buy(smart_money_mint, alpha_score_value=99.0)
 
             engine.stats["signals"] += 1
-            engine.last_signal = "mempool+wallet"
             engine.log("LOOP RUNNING")
 
         except Exception as e:
             engine.stats["errors"] += 1
             engine.log(f"LOOP ERROR {e}")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(4)
