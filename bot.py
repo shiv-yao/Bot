@@ -589,6 +589,15 @@ async def bot_loop():
                 if score > 22 and not has_position(mint):
                     await buy(mint, alpha_score_value=score)
 
+            # 9. fallback alpha（保底進場）
+            if len(engine.positions) < MAX_POSITIONS and CANDIDATES:
+                import random
+
+                mint = random.choice(list(CANDIDATES))
+                if not has_position(mint):
+                    engine.log(f"FALLBACK BUY {mint[:8]}")
+                    await buy(mint, alpha_score_value=10.0)
+
             engine.stats["signals"] += 1
             engine.log("LOOP RUNNING")
 
