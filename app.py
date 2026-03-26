@@ -26,3 +26,12 @@ def data():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
+
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/")
+def dashboard(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
