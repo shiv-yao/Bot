@@ -143,7 +143,7 @@ def extract_mints_from_tx(tx: dict):
 async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallets: int = 10):
     wallet_counter = Counter()
 
-    sample_mints = list(candidate_mints)[:30]
+    sample_mints = list(candidate_mints)[:-50]
 
     for mint in sample_mints:
         sigs = await get_signatures_for_address(rpc, mint, limit=10)
