@@ -1,52 +1,82 @@
 import json
-import re
+import asyncio
+import httpx
 import websockets
 
 RPC_WS = "wss://api.mainnet-beta.solana.com"
+RPC_HTTP = "https://api.mainnet-beta.solana.com"
+
 SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-BASE58_REGEX = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
-
-BAD_WORDS = {
-    "ComputeBudget111111111111111111111111111111",
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "11111111111111111111111111111111",
+IGNORE_MINTS = {
+    SOL_MINT,
+    USDC_MINT,
 }
 
-def looks_like_mint(s: str) -> bool:
-    if len(s) < 32 or len(s) > 44:
-        return False
-    if s in BAD_WORDS:
-        return False
-    if s == SOL_MINT:
-        return False
 
-    # 過濾明顯假字串
-    lowered = s.lower()
-    for bad in ["compute", "budget", "invoke", "success", "program", "log", "raydium", "jupiter", "system", "token"]:
-        if bad in lowered:
-            return False
+async def get_transaction(signature: str):
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                RPC_HTTP,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [
+                        signature,
+                        {
+                            "commitment": "confirmed",
+                            "maxSupportedTransactionVersion": 0,
+                            "encoding": "json",
+                        },
+                    ],
+                },
+            )
 
-    return True
+        if r.status_code != 200:
+            return None
 
-def extract_mint(logs):
-    candidates = []
+        data = r.json()
+        return data.get("result")
+    except Exception:
+        return None
 
-    for log in logs:
-        matches = re.findall(BASE58_REGEX, log)
-        for m in matches:
-            if looks_like_mint(m):
-                candidates.append(m)
 
-    # 去重後回第一個
+def extract_mints_from_balances(tx: dict):
+    result = []
+
+    meta = tx.get("meta") or {}
+    for key in ["postTokenBalances", "preTokenBalances"]:
+        for row in meta.get(key, []) or []:
+            mint = row.get("mint")
+            if not mint:
+                continue
+            if mint in IGNORE_MINTS:
+                continue
+            if len(mint) < 32 or len(mint) > 44:
+                continue
+            result.append(mint)
+
+    # 去重
     seen = set()
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            return c
+    deduped = []
+    for m in result:
+        if m not in seen:
+            seen.add(m)
+            deduped.append(m)
 
-    return None
+    return deduped
+
+
+async def decode_signature_to_mints(signature: str):
+    tx = await get_transaction(signature)
+    if not tx:
+        return []
+
+    return extract_mints_from_balances(tx)
+
 
 async def mempool_stream(callback):
     async with websockets.connect(RPC_WS, ping_interval=20, ping_timeout=20) as ws:
@@ -63,24 +93,36 @@ async def mempool_stream(callback):
         await ws.send(json.dumps(sub))
 
         while True:
-            msg = await ws.recv()
-            data = json.loads(msg)
+            raw = await ws.recv()
+            data = json.loads(raw)
 
             if "params" not in data:
                 continue
 
             value = data["params"]["result"]["value"]
+            signature = value.get("signature")
+            err = value.get("err")
             logs = value.get("logs", [])
 
-            # 只處理可能是 swap 的交易
-            if not any("swap" in l.lower() or "liquidity" in l.lower() for l in logs):
+            if err is not None:
                 continue
 
-            mint = extract_mint(logs)
+            # 先用 logs 粗篩，減少 getTransaction 次數
+            joined = " ".join(logs).lower()
+            if not any(x in joined for x in ["swap", "liquidity", "raydium", "jupiter"]):
+                continue
 
-            if mint:
+            if not signature:
+                continue
+
+            # 給 RPC 一點時間，避免 processed 時 getTransaction 還抓不到
+            await asyncio.sleep(0.4)
+
+            mints = await decode_signature_to_mints(signature)
+            for mint in mints:
                 await callback({
                     "type": "swap",
+                    "signature": signature,
                     "mint": mint,
                     "logs": logs,
                 })
