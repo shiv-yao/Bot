@@ -519,6 +519,9 @@ async def bot_loop():
 
                 if score > 25:
                     await buy(mint, alpha_score_value=score)
+                if score > 40:
+    engine.log(f"BREAKOUT BUY {mint[:8]}")
+    await buy(mint, alpha_score_value=score)
 
             smart_money_mint = await wallet_graph_signal(RPC)
             if smart_money_mint and not has_position(smart_money_mint):
