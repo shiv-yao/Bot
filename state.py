@@ -20,5 +20,4 @@ class Engine:
         self.logs.append(msg)
         self.logs = self.logs[-100:]
 
-
 engine = Engine()
