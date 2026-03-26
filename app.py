@@ -1,28 +1,21 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.templating import Jinja2Templates
-import asyncio
-from bot import bot_loop
-from state import engine
-from db import fetch_recent_trades
+import os
+from fastapi import FastAPI
 
-app = FastAPI(title="Multi-Position Institutional Dashboard")
-templates = Jinja2Templates(directory="templates")
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(bot_loop())
+app = FastAPI()
 
 @app.get("/")
-async def dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
-
-@app.get("/data")
-def data():
-    payload = dict(engine)
-    payload["trade_history"] = fetch_recent_trades(50)
-    return JSONResponse(payload)
+def root():
+    return {"status": "root ok"}
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/data")
+def data():
+    return {"data": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
