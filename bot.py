@@ -195,3 +195,53 @@ async def bot_loop() -> None:
             engine.log(f"BOT LOOP ERROR: {e}")
 
         await asyncio.sleep(8)
+
+import os
+import httpx
+import asyncio
+
+from state import engine
+from wallet import load_keypair
+from jupiter import get_order, execute_order
+
+RPC = os.getenv("RPC", "").strip()
+SOL_MINT = "So11111111111111111111111111111111111111112"
+TEST_TARGET_MINT = os.getenv("TEST_TARGET_MINT", "").strip()
+AUTO_TEST_BUY = os.getenv("AUTO_TEST_BUY", "false").lower() == "true"
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.002"))
+MODE = os.getenv("MODE", "PAPER").upper()
+
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.15"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.07"))
+ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "false").lower() == "true"
+
+async def get_token_price_in_sol(mint: str) -> float | None:
+    # 用 1 token 的 10^6 單位近似，不夠精準但先可用
+    amount_atomic = 1_000_000
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": mint,
+                    "outputMint": SOL_MINT,
+                    "amount": str(amount_atomic),
+                    "slippageBps": 100,
+                },
+            )
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        out_amount = data.get("outAmount")
+        if not out_amount:
+            return None
+
+        # outAmount 是 lamports，這裡近似每 1e6 token atomic 的 SOL
+        return (int(out_amount) / 1e9) / 1_000_000
+
+    except Exception as e:
+        engine.log(f"PRICE ERROR: {e}")
+        return None
