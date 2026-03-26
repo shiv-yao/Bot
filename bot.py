@@ -450,7 +450,7 @@ async def bot_loop():
                 engine.last_signal = f"alpha:{score:.2f}"
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
-                if score > 25:
+                if score > 30:
                     await buy(mint, alpha_score_value=score)
 
             smart_money_mint = await wallet_graph_signal(RPC)
