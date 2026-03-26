@@ -7,78 +7,127 @@ from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
 
-RPC = os.getenv("RPC", "").strip()
-SOL_MINT = "So11111111111111111111111111111111111111112"
+RPC = os.getenv("RPC", "")
+SOL = "So11111111111111111111111111111111111111112"
 
 MODE = os.getenv("MODE", "PAPER").upper()
 
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-POSITION_SIZE_SOL = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
+MAX_POSITIONS = 3
+POSITION_SIZE = 0.002
 
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.2"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.1"))
-
-ENABLE_AUTO_SELL = True
-
-
-# ================= RPC =================
-
-async def rpc_post(method, params):
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(RPC, json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params
-            })
-            return r.json()
-    except Exception as e:
-        engine.log(f"RPC ERROR {e}")
-        return None
+TAKE_PROFIT = 0.25
+STOP_LOSS = 0.1
+TRAILING = 0.12
 
 
 # ================= PRICE =================
 
 async def get_price(mint):
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
                     "inputMint": mint,
-                    "outputMint": SOL_MINT,
+                    "outputMint": SOL,
                     "amount": "1000000",
                     "slippageBps": 100
                 }
             )
-
         data = r.json()
         out = data.get("outAmount")
         if not out:
             return None
-
-        sol = int(out) / 1e9
-        return sol / 1_000_000
-
+        return (int(out) / 1e9) / 1_000_000
     except:
         return None
 
 
-# ================= SNIPER（簡版） =================
+# ================= ALPHA ENGINE =================
 
-async def scan_new_tokens():
-    # 模擬（你之後可以接 pump.fun / mempool）
-    test_list = [
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+async def get_token_info(mint):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": SOL,
+                    "outputMint": mint,
+                    "amount": "100000000",
+                    "slippageBps": 100
+                }
+            )
+        data = r.json()
+
+        return {
+            "liquidity": data.get("otherAmountThreshold", 0),
+            "priceImpact": data.get("priceImpactPct", 1)
+        }
+    except:
+        return None
+
+
+async def alpha_score(mint):
+    info = await get_token_info(mint)
+    if not info:
+        return 0
+
+    liquidity = info["liquidity"]
+    impact = info["priceImpact"]
+
+    score = 0
+
+    # liquidity
+    if liquidity > 1_000_000:
+        score += 40
+    elif liquidity > 100_000:
+        score += 20
+
+    # price impact（越低越好）
+    if impact < 0.01:
+        score += 30
+    elif impact < 0.05:
+        score += 10
+
+    # momentum（簡版）
+    price = await get_price(mint)
+    if price:
+        score += random.randint(5, 25)
+
+    return score
+
+
+# ================= SNIPER =================
+
+async def scan_tokens():
+    return [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     ]
-    return random.choice(test_list)
+
+
+async def pick_best_token():
+    tokens = await scan_tokens()
+
+    best = None
+    best_score = 0
+
+    for t in tokens:
+        score = await alpha_score(t)
+        engine.log(f"{t[:6]} score {score}")
+
+        if score > best_score:
+            best = t
+            best_score = score
+
+    if best_score < 30:
+        return None
+
+    return best
 
 
 # ================= BUY =================
 
-async def do_buy(mint):
+async def buy(mint):
     if len(engine.positions) >= MAX_POSITIONS:
         return
 
@@ -89,51 +138,29 @@ async def do_buy(mint):
     if not kp:
         return
 
-    amount_atomic = int(POSITION_SIZE_SOL * 1e9)
+    amt = int(POSITION_SIZE * 1e9)
 
-    engine.log(f"TRY BUY {mint[:6]}")
-
-    order = await get_order(
-        SOL_MINT,
-        mint,
-        amount_atomic,
-        str(kp.pubkey())
-    )
+    order = await get_order(SOL, mint, amt, str(kp.pubkey()))
     if not order:
-        engine.log("ORDER FAIL")
         return
 
     result = await execute_order(order, kp)
     if not result:
-        engine.log("EXEC FAIL")
         return
 
-    signed_tx = result.get("signed_tx")
+    signed = result.get("signed_tx")
 
     async with httpx.AsyncClient() as client:
         await client.post(RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
-            "params": [signed_tx, {"skipPreflight": True}]
+            "params": [signed, {"skipPreflight": True}]
         })
 
-    # ===== entry price 修正 =====
-    entry = 0.0
-    try:
-        token_amount = int(order["outAmount"]) / 1_000_000
-        if token_amount > 0:
-            entry = POSITION_SIZE_SOL / token_amount
-    except:
-        pass
+    token_amount = int(order["outAmount"]) / 1_000_000
 
-    if entry <= 0:
-        price = await get_price(mint)
-        if price:
-            entry = price
-
-    if entry <= 0:
-        entry = 1e-9
+    entry = POSITION_SIZE / token_amount if token_amount > 0 else 1e-9
 
     engine.positions.append({
         "token": mint,
@@ -144,28 +171,20 @@ async def do_buy(mint):
         "pnl_pct": 0
     })
 
-    engine.stats["buys"] += 1
-    engine.log("BUY SUCCESS")
+    engine.log(f"BUY {mint[:6]}")
 
 
 # ================= SELL =================
 
-async def do_sell(p):
+async def sell(p):
     kp = load_keypair()
     if not kp:
         return
 
     mint = p["token"]
-    amount_atomic = int(p["amount"] * 1_000_000)
+    amt = int(p["amount"] * 1_000_000)
 
-    engine.log(f"SELL {mint[:6]}")
-
-    order = await get_order(
-        mint,
-        SOL_MINT,
-        amount_atomic,
-        str(kp.pubkey())
-    )
+    order = await get_order(mint, SOL, amt, str(kp.pubkey()))
     if not order:
         return
 
@@ -173,81 +192,68 @@ async def do_sell(p):
     if not result:
         return
 
-    signed_tx = result.get("signed_tx")
+    signed = result.get("signed_tx")
 
     async with httpx.AsyncClient() as client:
         await client.post(RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
-            "params": [signed_tx, {"skipPreflight": True}]
+            "params": [signed, {"skipPreflight": True}]
         })
 
     engine.positions = [x for x in engine.positions if x != p]
-    engine.stats["sells"] += 1
-    engine.log("SELL SUCCESS")
+    engine.log(f"SELL {mint[:6]}")
 
 
 # ================= MONITOR =================
 
 async def monitor():
     while True:
-        try:
-            for p in engine.positions:
-                price = await get_price(p["token"])
-                if not price:
-                    continue
+        for p in engine.positions:
+            price = await get_price(p["token"])
+            if not price:
+                continue
 
-                entry = p["entry_price"]
-                if entry <= 0:
-                    continue
+            entry = p["entry_price"]
 
-                p["last_price"] = price
-                p["peak_price"] = max(p["peak_price"], price)
+            p["last_price"] = price
+            p["peak_price"] = max(p["peak_price"], price)
 
-                pnl = (price - entry) / entry
-                p["pnl_pct"] = pnl
+            pnl = (price - entry) / entry
+            p["pnl_pct"] = pnl
 
-                engine.log(f"{p['token'][:6]} PNL {round(pnl*100,2)}%")
+            engine.log(f"{p['token'][:6]} {round(pnl*100,2)}%")
 
-                if pnl >= TAKE_PROFIT_PCT:
-                    await do_sell(p)
-                    continue
+            if pnl >= TAKE_PROFIT:
+                await sell(p)
+                continue
 
-                if pnl <= -STOP_LOSS_PCT:
-                    await do_sell(p)
-                    continue
+            if pnl <= -STOP_LOSS:
+                await sell(p)
+                continue
 
-                drawdown = (p["peak_price"] - price) / p["peak_price"]
-                if drawdown >= TRAILING_STOP_PCT:
-                    await do_sell(p)
-                    continue
-
-        except Exception as e:
-            engine.log(f"MONITOR ERR {e}")
+            dd = (p["peak_price"] - price) / p["peak_price"]
+            if dd >= TRAILING:
+                await sell(p)
 
         await asyncio.sleep(6)
 
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 
 async def bot_loop():
-    engine.mode = MODE
-    engine.log("FUND MODE START")
+    engine.log("ALPHA ENGINE START")
 
     asyncio.create_task(monitor())
 
     while True:
-        try:
-            mint = await scan_new_tokens()
+        mint = await pick_best_token()
 
-            if mint:
-                await do_buy(mint)
+        if mint:
+            await buy(mint)
 
-            engine.stats["signals"] += 1
-            engine.last_signal = "alpha_scan"
-
-        except Exception as e:
-            engine.log(f"LOOP ERR {e}")
+        engine.stats["signals"] += 1
+        engine.last_signal = "alpha"
 
         await asyncio.sleep(5)
