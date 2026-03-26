@@ -1,4 +1,3 @@
-CANDIDATES = set()
 import os
 import asyncio
 import httpx
@@ -16,6 +15,7 @@ SOL = "So11111111111111111111111111111111111111112"
 MODE = os.getenv("MODE", "REAL").upper()
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.10"))
@@ -25,6 +25,8 @@ STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
 TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
+
+CANDIDATES = set()
 
 
 async def rpc_post(method: str, params: list):
@@ -410,25 +412,17 @@ async def monitor():
 async def handle_mempool(event: dict):
     try:
         mint = event.get("mint")
-        sig = event.get("signature", "")
-
         if not mint:
-            engine.log("MEMPOOL SKIP: NO MINT")
-            return
-
-        if mint == SOL:
-            engine.log("MEMPOOL SKIP: SOL")
             return
 
         if len(mint) < 32 or len(mint) > 44:
-            engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
             return
-
-        engine.log(f"DECODE HIT {mint[:8]} sig={sig[:8]}")
 
         CANDIDATES.add(mint)
         if len(CANDIDATES) > 100:
             CANDIDATES.pop()
+
+        engine.log(f"CANDIDATE ADD {mint[:8]}")
 
     except Exception as e:
         engine.stats["errors"] += 1
@@ -448,25 +442,6 @@ async def bot_loop():
             await sync_positions()
 
             ranked = await rank_candidates(CANDIDATES)
-
-# 🔥 Smart Money 信號
-smart_mint = await wallet_graph_signal(RPC)
-
-if smart_mint:
-    engine.log(f"SMART MONEY HIT {smart_mint[:8]}")
-    await buy(smart_mint, alpha_score_value=99.0)
-
-# 🔥 Alpha Ranking（正常策略）
-elif ranked:
-    best = ranked[0]
-    mint = best["mint"]
-    score = best["score"]
-
-    engine.last_signal = f"alpha:{score:.2f}"
-    engine.log(f"BEST {mint[:8]} score={score:.2f}")
-
-    if score > 20:
-        await buy(mint, alpha_score_value=score)
             if ranked:
                 best = ranked[0]
                 mint = best["mint"]
