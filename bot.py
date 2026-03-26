@@ -176,7 +176,7 @@ async def do_test_buy() -> None:
     if token_amount > 0:
         entry_price = BUY_AMOUNT_SOL / token_amount
 
-    # === 寫入持倉（這段一定要真的覆蓋掉原本 positions）===
+    # === 寫入持倉 ===
     engine.positions = [{
         "token": TEST_TARGET_MINT,
         "amount": token_amount,
