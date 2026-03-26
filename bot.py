@@ -2,6 +2,7 @@ import os
 import asyncio
 import httpx
 
+from insider_engine import insider_signal
 from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
