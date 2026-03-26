@@ -1,7 +1,7 @@
 import asyncio
 
 async def bot_loop():
-    print("🚀 BOT START")
+    print("🚀 BOT STARTED")
 
     while True:
         print("⏱ LOOP RUNNING")
