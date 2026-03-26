@@ -1,28 +1,67 @@
+import base64
+import os
+from typing import Any, Dict, Optional
+
 import httpx
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
-JUP_URL = "https://quote-api.jup.ag/v6"
+JUP_BASE = "https://api.jup.ag/swap/v2"
 
-async def get_quote(input_mint, output_mint, amount):
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{JUP_URL}/quote",
+def _headers() -> dict:
+    api_key = os.getenv("JUP_API_KEY", "").strip()
+    headers = {}
+    if api_key:
+        headers["x-api-key"] = api_key
+    return headers
+
+async def get_order(
+    input_mint: str,
+    output_mint: str,
+    amount_atomic: int,
+    taker: str,
+) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{JUP_BASE}/order",
             params={
                 "inputMint": input_mint,
                 "outputMint": output_mint,
-                "amount": amount,
-                "slippageBps": 100
-            }
+                "amount": str(amount_atomic),
+                "taker": taker,
+            },
+            headers=_headers(),
         )
-        return r.json()
+        if resp.status_code >= 400:
+            return None
+        return resp.json()
 
-async def get_swap_tx(quote, user_pubkey):
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{JUP_URL}/swap",
-            json={
-                "quoteResponse": quote,
-                "userPublicKey": str(user_pubkey),
-                "wrapAndUnwrapSol": True
-            }
+async def execute_order(
+    order: Dict[str, Any],
+    keypair: Keypair,
+) -> Optional[Dict[str, Any]]:
+    tx_b64 = order.get("transaction")
+    request_id = order.get("requestId")
+    if not tx_b64 or not request_id:
+        return None
+
+    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    signed_tx = VersionedTransaction(raw_tx.message, [keypair])
+    signed_b64 = base64.b64encode(bytes(signed_tx)).decode()
+
+    payload = {
+        "signedTransaction": signed_b64,
+        "requestId": request_id,
+    }
+    if order.get("lastValidBlockHeight") is not None:
+        payload["lastValidBlockHeight"] = order["lastValidBlockHeight"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{JUP_BASE}/execute",
+            json=payload,
+            headers={"Content-Type": "application/json", **_headers()},
         )
-        return r.json()
+        if resp.status_code >= 400:
+            return None
+        return resp.json()
