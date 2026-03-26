@@ -473,31 +473,66 @@ async def monitor():
         await asyncio.sleep(5)
 
 
-async def handle_mempool(event: dict):
-    try:
-        mint = event.get("mint")
-        if not mint:
-            return
+async def bot_loop():
+    global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
 
-        if len(mint) < 32 or len(mint) > 44:
-            return
+    engine.mode = MODE
+    engine.log("PHASE K START")
 
-        # 先加入候選池
-        CANDIDATES.add(mint)
-        if len(CANDIDATES) > 100:
-            CANDIDATES.pop()
+    asyncio.create_task(monitor())
+    asyncio.create_task(mempool_stream(handle_mempool))
 
-        engine.log(f"CANDIDATE ADD {mint[:8]}")
+    while True:
+        try:
+            await sync_sol_balance()
+            await sync_positions()
 
-        # 🔥 快速 alpha（讓你開始交易）
-        if len(engine.positions) < MAX_POSITIONS:
-            if mint not in [p["token"] for p in engine.positions]:
-                engine.log(f"FAST BUY {mint[:8]}")
-                asyncio.create_task(buy(mint, alpha_score_value=25.0))
+            # 每隔一段時間自動更新 smart wallets
+            now = asyncio.get_event_loop().time()
+            if now - LAST_SMART_WALLET_REFRESH > 60:
+                AUTO_SMART_WALLETS = await auto_discover_smart_wallets(RPC, CANDIDATES, max_wallets=8)
+                LAST_SMART_WALLET_REFRESH = now
+                engine.log(f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)}")
 
-    except Exception as e:
-        engine.stats["errors"] += 1
-        engine.log(f"MEMPOOL ERR {e}")
+            # 1. insider alpha
+            insider_mint = await insider_signal(RPC)
+            if insider_mint and not has_position(insider_mint):
+                engine.log(f"INSIDER HIT {insider_mint[:8]}")
+                await buy(insider_mint, alpha_score_value=1000.0)
+
+            # 2. smart money alpha（原本手動/既有）
+            smart_money_mint = await wallet_graph_signal(RPC)
+            if smart_money_mint and not has_position(smart_money_mint):
+                engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
+                await buy(smart_money_mint, alpha_score_value=500.0)
+
+            # 3. auto smart wallet alpha（新加）
+            auto_smart_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS)
+            if auto_smart_mint and not has_position(auto_smart_mint):
+                engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
+                await buy(auto_smart_mint, alpha_score_value=700.0)
+
+            # 4. alpha ranking from mempool universe
+            ranked = await rank_candidates(CANDIDATES)
+            if ranked:
+                best = ranked[0]
+                mint = best["mint"]
+                score = best["score"]
+
+                engine.last_signal = f"alpha:{score:.2f}"
+                engine.log(f"BEST {mint[:8]} score={score:.2f}")
+
+                if score > 22:
+                    await buy(mint, alpha_score_value=score)
+
+            engine.stats["signals"] += 1
+            engine.log("LOOP RUNNING")
+
+        except Exception as e:
+            engine.stats["errors"] += 1
+            engine.log(f"LOOP ERROR {e}")
+
+        await asyncio.sleep(4)
 
 
 async def bot_loop():
