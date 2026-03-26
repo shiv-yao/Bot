@@ -4,7 +4,7 @@
     "env": {
       "RPC": "https://api.mainnet-beta.solana.com",
       "JITO_RPC": "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
-      "PRIVATE_KEY": 2kEdJ5kLEVV7ZtiPDChXLoJmM53R6PJoho6k75hBckokscz3RgHCCKYSkRC4SPshVNV7NtUh18zL6W75rK3xTktC
+      "PRIVATE_KEY":2kEdJ5kLEVV7ZtiPDChXLoJmM53R6PJoho6k75hBckokscz3RgHCCKYSkRC4SPshVNV7NtUh18zL6W75rK3xTktC
       }
   }
 }
