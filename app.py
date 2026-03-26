@@ -8,24 +8,21 @@ app = FastAPI()
 async def health():
     return {"ok": True}
 
+from state import engine
+
 @app.get("/data")
 async def data():
     return JSONResponse({
-        "running": True,
-        "mode": "PAPER",
-        "sol_balance": 0.0,
-        "capital": 0.0,
-        "last_signal": "",
-        "last_trade": "",
-        "positions": [],
-        "logs": ["dashboard alive"],
-        "stats": {
-            "signals": 0,
-            "buys": 0,
-            "sells": 0,
-            "errors": 0
-        },
-        "trade_history": []
+        "running": engine.running,
+        "mode": engine.mode,
+        "sol_balance": engine.sol_balance,
+        "capital": engine.capital,
+        "last_signal": engine.last_signal,
+        "last_trade": engine.last_trade,
+        "positions": engine.positions,
+        "logs": engine.logs[-20:],
+        "stats": engine.stats,
+        "trade_history": engine.trade_history[-20:]
     })
 
 @app.get("/", response_class=HTMLResponse)
