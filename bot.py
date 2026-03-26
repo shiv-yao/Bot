@@ -194,14 +194,15 @@ async def buy(mint: str):
         return
 
     if len(engine.positions) >= MAX_POSITIONS:
-        engine.log("MAX POSITIONS REACHED")
+        engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
 
     if has_position(mint):
+        engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
         return
 
     if not await rug_filter(mint):
-        engine.log(f"RUG BLOCK {mint[:6]}")
+        engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
         return
 
     kp = load_keypair()
@@ -345,7 +346,6 @@ async def monitor():
     while True:
         try:
             if ENABLE_AUTO_SELL:
-                # 用 copy 避免迭代中刪除
                 for p in list(engine.positions):
                     price = await get_price(p["token"])
                     if not price:
@@ -399,14 +399,40 @@ async def monitor():
 
 async def handle_mempool(event: dict):
     try:
-        if event.get("type") == "swap":
-            engine.log("MEMPOOL HIT")
-            mint = TEST_TARGET_MINT
-            if mint:
-                await buy(mint)
+        mint = event.get("mint")
+
+        if not mint:
+            engine.log("MEMPOOL SKIP: NO MINT")
+            return
+
+        if mint == SOL:
+            engine.log("MEMPOOL SKIP: SOL")
+            return
+
+        if len(mint) < 32 or len(mint) > 44:
+            engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
+            return
+
+        engine.log(f"SNIPER HIT {mint[:6]}")
+
+        if has_position(mint):
+            engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
+            return
+
+        if len(engine.positions) >= MAX_POSITIONS:
+            engine.log("BUY BLOCKED: MAX_POSITIONS")
+            return
+
+        ok = await rug_filter(mint)
+        if not ok:
+            engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
+            return
+
+        await buy(mint)
+
     except Exception as e:
         engine.stats["errors"] += 1
-        engine.log(f"MEMPOOL ERR {e}")
+        engine.log(f"SNIPER ERROR {e}")
 
 
 async def bot_loop():
