@@ -160,15 +160,40 @@ async def do_test_buy() -> None:
         engine.log(f"RPC ERROR: {sig_json['error']}")
         return
 
-    engine.stats["buys"] += 1
-    engine.last_trade = f"BUY {TEST_TARGET_MINT[:8]}"
-    engine.trade_history.append({
-        "side": "BUY",
-        "mint": TEST_TARGET_MINT,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-50:]
-    engine.log("BUY SUCCESS")
+ engine.stats["buys"] += 1
+engine.last_trade = f"BUY {TEST_TARGET_MINT[:8]}"
+
+# === 計算拿到多少 token ===
+token_amount = 0.0
+try:
+    if "outAmount" in order:
+        token_amount = int(order["outAmount"]) / 1_000_000
+except Exception:
+    pass
+
+# === 計算 entry price ===
+entry_price = 0.0
+if token_amount > 0:
+    entry_price = BUY_AMOUNT_SOL / token_amount
+
+# === 寫入持倉（超重要）===
+engine.positions = [{
+    "token": TEST_TARGET_MINT,
+    "amount": token_amount,
+    "entry_price": entry_price,
+    "last_price": entry_price,
+    "peak_price": entry_price,
+    "pnl_pct": 0.0
+}]
+
+engine.trade_history.append({
+    "side": "BUY",
+    "mint": TEST_TARGET_MINT,
+    "result": sig_json,
+})
+engine.trade_history = engine.trade_history[-50:]
+
+engine.log("BUY SUCCESS")
 
 async def bot_loop() -> None:
     engine.mode = MODE
