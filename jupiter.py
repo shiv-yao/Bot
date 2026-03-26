@@ -9,7 +9,7 @@ from solders.transaction import VersionedTransaction
 JUP_BASE = "https://api.jup.ag/swap/v2"
 
 def _headers() -> dict:
-    api_key = os.getenv("JUP_API_KEY", "").strip()
+    api_key = os.getenv("", "").strip()
     headers = {}
     if api_key:
         headers["x-api-key"] = api_key
