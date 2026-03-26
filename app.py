@@ -1,5 +1,4 @@
 import os
-import threading
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -7,15 +6,16 @@ from fastapi.responses import HTMLResponse
 
 BOT_STATUS = {"ok": False, "error": ""}
 
-def run_bot():
+async def start_bot():
     try:
         print("🔥 IMPORT BOT")
         from bot import bot_loop
-        print("🔥 START BOT LOOP")
-        asyncio.run(bot_loop())
+        print("🔥 BOT START")
+        asyncio.create_task(bot_loop())   # ✅ 正確做法
+        BOT_STATUS["ok"] = True
     except Exception as e:
         import traceback
-        print("💀 BOT CRASH:")
+        print("💀 BOT ERROR")
         traceback.print_exc()
         BOT_STATUS["ok"] = False
         BOT_STATUS["error"] = str(e)
@@ -23,10 +23,9 @@ def run_bot():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 APP START")
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
-    BOT_STATUS["ok"] = True
+    await start_bot()
     yield
+    print("🛑 APP STOP")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -44,7 +43,7 @@ def data():
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-    <h1>Dashboard</h1>
+    <h1>🚀 Dashboard</h1>
     <pre id="out"></pre>
     <script>
     async function load(){
