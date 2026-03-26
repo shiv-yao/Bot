@@ -522,9 +522,9 @@ async def bot_loop():
 
             now = asyncio.get_event_loop().time()
             if now - LAST_SMART_WALLET_REFRESH > 30:
-    AUTO_SMART_WALLETS = await auto_discover_smart_wallets(RPC, CANDIDATES, max_wallets=8)
-    LAST_SMART_WALLET_REFRESH = now
-    engine.log(f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:3]}")
+               AUTO_SMART_WALLETS = await auto_discover_smart_wallets(RPC, CANDIDATES, max_wallets=8)
+               LAST_SMART_WALLET_REFRESH = now
+               engine.log(f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:3]}")
 
             # 1. liquidity alpha
             liq_mint = await liquidity_signal(RPC)
