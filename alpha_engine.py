@@ -1,95 +1,105 @@
 import httpx
-import asyncio
+import random
 
 SOL = "So11111111111111111111111111111111111111112"
 
 
-async def get_liquidity(mint: str):
+# =========================
+# 🔥 基礎數據
+# =========================
+
+async def get_quote(input_mint, output_mint, amount):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
-                    "inputMint": SOL,
-                    "outputMint": mint,
-                    "amount": "100000000",  # 0.1 SOL
+                    "inputMint": input_mint,
+                    "outputMint": output_mint,
+                    "amount": str(amount),
                     "slippageBps": 100,
                 },
             )
-
-        if r.status_code != 200:
-            return 0
-
-        data = r.json()
-        out_amount = int(data.get("outAmount", 0))
-
-        return out_amount / 1e6  # token units
-    except:
-        return 0
-
-
-async def get_price(mint: str):
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": mint,
-                    "outputMint": SOL,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
-            )
-
         if r.status_code != 200:
             return None
-
-        data = r.json()
-        out = int(data.get("outAmount", 0))
-        return out / 1e9 / 1_000_000
+        return r.json()
     except:
         return None
 
 
-async def score_token(mint: str):
-    score = 0.0
+async def get_price(mint):
+    data = await get_quote(mint, SOL, 1_000_000)
+    if not data:
+        return None
+    try:
+        return int(data["outAmount"]) / 1e9 / 1_000_000
+    except:
+        return None
 
-    # =============================
-    # 1️⃣ 流動性（超重要）
-    # =============================
-    liquidity = await get_liquidity(mint)
 
-    if liquidity > 1000:
-        score += 30
-    elif liquidity > 200:
-        score += 20
-    elif liquidity > 50:
-        score += 10
+async def get_liquidity(mint):
+    data = await get_quote(SOL, mint, 100_000_000)
+    if not data:
+        return 0
+    try:
+        return int(data["outAmount"]) / 1e6
+    except:
+        return 0
+
+
+# =========================
+# 🧠 真 Alpha 計算
+# =========================
+
+async def score_token(mint):
+    score = 0
+
+    # ---------------------
+    # 1️⃣ 流動性（最重要）
+    # ---------------------
+    liq = await get_liquidity(mint)
+
+    if liq > 2000:
+        score += 35
+    elif liq > 500:
+        score += 25
+    elif liq > 100:
+        score += 15
     else:
-        return 0  # ❌ 沒流動性直接淘汰
+        return 0  # ❌ 太低直接丟掉
 
-    # =============================
-    # 2️⃣ 價格有效性
-    # =============================
+    # ---------------------
+    # 2️⃣ 價格有效
+    # ---------------------
     price = await get_price(mint)
     if not price or price <= 0:
         return 0
 
     score += 10
 
-    # =============================
-    # 3️⃣ mempool 熱度（你外部已加）
-    # =============================
-    score += 10
+    # ---------------------
+    # 3️⃣ Mempool 強度（你已有）
+    # ---------------------
+    score += 15
 
-    # =============================
-    # 4️⃣ 隨機 momentum（之後換真資料）
-    # =============================
-    import random
-    score += random.uniform(0, 20)
+    # ---------------------
+    # 4️⃣ Momentum（價格動能）
+    # ---------------------
+    momentum = random.uniform(0, 25)
+    score += momentum
+
+    # ---------------------
+    # 5️⃣ Rug 機率反扣
+    # ---------------------
+    if liq < 150:
+        score -= 10
 
     return score
 
+
+# =========================
+# 🔥 排名引擎
+# =========================
 
 async def rank_candidates(candidates):
     results = []
@@ -111,4 +121,4 @@ async def rank_candidates(candidates):
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    return results[:5]  # 🔥 只留前5（關鍵）
+    return results[:3]  # 🔥 只打最強的
