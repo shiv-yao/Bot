@@ -442,7 +442,7 @@ async def bot_loop():
             await sync_sol_balance()
             await sync_positions()
 
-            ranked = await rank_candidates()
+            ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
                 mint = best["mint"]
