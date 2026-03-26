@@ -1,10 +1,25 @@
 import json
 import websockets
+import re
 
 RPC_WS = "wss://api.mainnet-beta.solana.com"
 
+BASE58_REGEX = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
+
+
+def extract_mint(logs):
+    for log in logs:
+        matches = re.findall(BASE58_REGEX, log)
+        for m in matches:
+            # 過濾 SOL
+            if m != "So11111111111111111111111111111111111111112":
+                return m
+    return None
+
+
 async def mempool_stream(callback):
     async with websockets.connect(RPC_WS) as ws:
+
         sub = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -21,14 +36,21 @@ async def mempool_stream(callback):
             msg = await ws.recv()
             data = json.loads(msg)
 
-            if "params" in data:
-                value = data["params"]["result"]["value"]
-                logs = value.get("logs", [])
+            if "params" not in data:
+                continue
 
-                for log in logs:
-                    if "swap" in log.lower():
-                        await callback({
-                            "type": "swap",
-                            "raw": log,
-                        })
-                        break
+            value = data["params"]["result"]["value"]
+            logs = value.get("logs", [])
+
+            # 👉 只抓 swap / liquidity
+            if not any("swap" in l.lower() or "liquidity" in l.lower() for l in logs):
+                continue
+
+            mint = extract_mint(logs)
+
+            if mint:
+                await callback({
+                    "type": "swap",
+                    "mint": mint,
+                    "logs": logs
+                })
