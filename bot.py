@@ -2,6 +2,7 @@ import os
 import asyncio
 import httpx
 
+from liquidity_engine import liquidity_signal
 from smart_wallet_auto import auto_discover_smart_wallets, smart_wallet_signal_from_auto
 from state import engine
 from wallet import load_keypair
