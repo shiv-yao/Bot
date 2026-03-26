@@ -181,24 +181,26 @@ async def rug_filter(mint: str) -> bool:
                 params={
                     "inputMint": SOL,
                     "outputMint": mint,
-                    "amount": "100000000",
-                    "slippageBps": 100,
+                    "amount": "10000000",  # 🔥 降到 0.01 SOL
+                    "slippageBps": 200,
                 },
             )
 
         data = r.json()
-        impact = data.get("priceImpactPct", 1)
-        out_amount = data.get("outAmount", 0)
+        out_amount = int(data.get("outAmount", 0) or 0)
+        impact = float(data.get("priceImpactPct", 1) or 1)
 
+        # 🔥 關鍵：允許早期池
         if out_amount == 0:
-            return False
-        if impact > 0.15:
+            return True   # ← 原本是 False
+
+        if impact > 0.6:
             return False
 
         return True
+
     except Exception:
         return False
-
 
 def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
