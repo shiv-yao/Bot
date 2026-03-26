@@ -87,6 +87,8 @@ async def sync_positions() -> None:
 
     engine.positions = positions
 
+import httpx
+
 async def do_test_buy() -> None:
     if MODE != "REAL":
         engine.log("PAPER mode: skip real buy")
@@ -122,12 +124,48 @@ async def do_test_buy() -> None:
         engine.log("EXECUTE FAILED")
         return
 
+    signed_tx = result.get("signed_tx")
+    if not signed_tx:
+        engine.stats["errors"] += 1
+        engine.log("NO SIGNED TX")
+        return
+
+    engine.log("TRY SEND TX")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        sig = await client.post(
+            RPC,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [
+                    signed_tx,
+                    {
+                        "skipPreflight": True,
+                        "encoding": "base64",
+                    },
+                ],
+            },
+        )
+
+    if sig.status_code != 200:
+        engine.stats["errors"] += 1
+        engine.log(f"SEND TX FAILED: {sig.text}")
+        return
+
+    sig_json = sig.json()
+    if "error" in sig_json:
+        engine.stats["errors"] += 1
+        engine.log(f"RPC ERROR: {sig_json['error']}")
+        return
+
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {TEST_TARGET_MINT[:8]}"
     engine.trade_history.append({
         "side": "BUY",
         "mint": TEST_TARGET_MINT,
-        "result": result,
+        "result": sig_json,
     })
     engine.trade_history = engine.trade_history[-50:]
     engine.log("BUY SUCCESS")
