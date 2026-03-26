@@ -31,7 +31,14 @@ CONFIG = {
     "MAX_OPEN_POSITIONS": int(os.getenv("MAX_OPEN_POSITIONS", "3")),
     "SCALE_OUT_PCT": float(os.getenv("SCALE_OUT_PCT", "0.5"))
 }
+engine.last_trade = f"BUY {token}"
+engine.stats["buys"] += 1
 
+engine.positions.append({
+    "token": token,
+    "amount": amount,
+    "pnl": 0
+})
 RPC = os.getenv("RPC")
 BIRDEYE = os.getenv("BIRDEYE_API_KEY")
 JUP_API_KEY = os.getenv("JUP_API_KEY")
