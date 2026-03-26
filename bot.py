@@ -474,20 +474,22 @@ async def handle_mempool(event: dict):
         mint = event.get("mint")
         if not mint:
             return
-            
 
         if len(mint) < 32 or len(mint) > 44:
             return
-# 🔥 快速 alpha（讓你開始交易）
-if len(engine.positions) < MAX_POSITIONS:
-    if mint not in [p["token"] for p in engine.positions]:
-        engine.log(f"FAST BUY {mint[:8]}")
-        asyncio.create_task(buy(mint, alpha_score_value=25))
+
+        # 先加入候選池
         CANDIDATES.add(mint)
         if len(CANDIDATES) > 100:
             CANDIDATES.pop()
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
+
+        # 🔥 快速 alpha（讓你開始交易）
+        if len(engine.positions) < MAX_POSITIONS:
+            if mint not in [p["token"] for p in engine.positions]:
+                engine.log(f"FAST BUY {mint[:8]}")
+                asyncio.create_task(buy(mint, alpha_score_value=25.0))
 
     except Exception as e:
         engine.stats["errors"] += 1
