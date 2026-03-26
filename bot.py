@@ -23,6 +23,15 @@ TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
 
+# 白名單：只狙擊你信任的 mint
+WHITELIST_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+}
+
+# 如果有設 TEST_TARGET_MINT，也自動加入白名單
+if TEST_TARGET_MINT:
+    WHITELIST_MINTS.add(TEST_TARGET_MINT)
+
 
 async def rpc_post(method: str, params: list):
     try:
@@ -198,11 +207,15 @@ async def buy(mint: str):
         return
 
     if has_position(mint):
-        engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
+        engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:8]}")
+        return
+
+    if mint not in WHITELIST_MINTS:
+        engine.log(f"BUY BLOCKED: NOT WHITELIST {mint[:8]}")
         return
 
     if not await rug_filter(mint):
-        engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
+        engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
         return
 
     kp = load_keypair()
@@ -213,7 +226,7 @@ async def buy(mint: str):
     size = POSITION_SIZE
     amount_atomic = int(size * 1e9)
 
-    engine.log(f"TRY BUY {mint[:6]}")
+    engine.log(f"TRY BUY {mint[:8]}")
 
     order = await get_order(
         input_mint=SOL,
@@ -283,7 +296,7 @@ async def buy(mint: str):
         "result": sig_json,
     })
     engine.trade_history = engine.trade_history[-50:]
-    engine.log(f"BUY SUCCESS {mint[:6]}")
+    engine.log(f"BUY SUCCESS {mint[:8]}")
 
 
 async def sell(position: dict):
@@ -299,7 +312,7 @@ async def sell(position: dict):
     mint = position["token"]
     amount_atomic = int(position["amount"] * 1_000_000)
 
-    engine.log(f"TRY SELL {mint[:6]}")
+    engine.log(f"TRY SELL {mint[:8]}")
 
     order = await get_order(
         input_mint=mint,
@@ -339,7 +352,7 @@ async def sell(position: dict):
         "result": sig_json,
     })
     engine.trade_history = engine.trade_history[-50:]
-    engine.log(f"SELL SUCCESS {mint[:6]}")
+    engine.log(f"SELL SUCCESS {mint[:8]}")
 
 
 async def monitor():
@@ -359,7 +372,7 @@ async def monitor():
                             p["last_price"] = price_now
                             p["peak_price"] = max(p.get("peak_price", 0.0), price_now)
                             entry = price_now
-                            engine.log(f"FIX ENTRY PRICE {p['token'][:6]} {entry}")
+                            engine.log(f"FIX ENTRY PRICE {p['token'][:8]} {entry}")
                         else:
                             engine.log("SKIP MONITOR: invalid entry_price")
                             continue
@@ -370,7 +383,7 @@ async def monitor():
                     pnl = (price - entry) / entry
                     p["pnl_pct"] = pnl
 
-                    engine.log(f"{p['token'][:6]} PNL {round(pnl * 100, 2)}%")
+                    engine.log(f"{p['token'][:8]} PNL {round(pnl * 100, 2)}%")
 
                     if pnl >= TAKE_PROFIT:
                         engine.log("TAKE PROFIT HIT")
@@ -413,6 +426,10 @@ async def handle_mempool(event: dict):
             engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
             return
 
+        if mint not in WHITELIST_MINTS:
+            engine.log(f"MEMPOOL SKIP: NOT WHITELIST {mint[:8]}")
+            return
+
         engine.log(f"SNIPER HIT {mint[:8]}")
 
         if has_position(mint):
@@ -449,8 +466,11 @@ async def bot_loop():
 
             mint = await wallet_graph_signal(RPC)
             if mint:
-                engine.log(f"SMART MONEY HIT {mint[:6]}")
-                await buy(mint)
+                if mint in WHITELIST_MINTS:
+                    engine.log(f"SMART MONEY HIT {mint[:8]}")
+                    await buy(mint)
+                else:
+                    engine.log(f"SMART MONEY SKIP {mint[:8]}")
 
             engine.stats["signals"] += 1
             engine.last_signal = "mempool+wallet"
