@@ -527,7 +527,7 @@ async def bot_loop():
             await sync_positions()
 
             now = asyncio.get_event_loop().time()
-            if now - LAST_SMART_WALLET_REFRESH > 15:
+            if now - LAST_SMART_WALLET_REFRESH > 5:
                 AUTO_SMART_WALLETS = await auto_discover_smart_wallets(
                     RPC, CANDIDATES, max_wallets=8
                 )
