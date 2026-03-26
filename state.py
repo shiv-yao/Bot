@@ -18,6 +18,7 @@ class Engine:
 
     def log(self, msg: str):
         self.logs.append(msg)
-        self.logs = self.logs[-100:]
+        self.logs = self.logs[-200:]
+
 
 engine = Engine()
