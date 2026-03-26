@@ -1,463 +1,270 @@
 import os
 import asyncio
-import httpx
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from state import engine
-from wallet import load_keypair
-from jupiter import get_order, execute_order
-from mempool import mempool_stream
-from wallet_graph import wallet_graph_signal
 
-RPC = os.getenv("RPC", "").strip()
-SOL = "So11111111111111111111111111111111111111112"
-
-MODE = os.getenv("MODE", "REAL").upper()
-TEST_TARGET_MINT = os.getenv("TEST_TARGET_MINT", "").strip()
-
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
-
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
-TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
-
-ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
+BOT_STATUS = {"ok": False, "error": ""}
 
 
-async def rpc_post(method: str, params: list):
+async def start_bot():
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                RPC,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                },
-            )
-        return r.json()
+        from bot import bot_loop
+        asyncio.create_task(bot_loop())
+        BOT_STATUS["ok"] = True
+        BOT_STATUS["error"] = ""
     except Exception as e:
-        engine.stats["errors"] += 1
-        engine.log(f"RPC ERROR {e}")
-        return None
+        BOT_STATUS["ok"] = False
+        BOT_STATUS["error"] = str(e)
+        engine.log(f"BOT START ERROR: {e}")
 
 
-async def sync_sol_balance():
-    kp = load_keypair()
-    if not kp:
-        engine.log("SAFE MODE: no PRIVATE_KEY")
-        return
-
-    res = await rpc_post("getBalance", [str(kp.pubkey())])
-    if not res or "result" not in res:
-        return
-
-    lamports = res["result"]["value"]
-    engine.sol_balance = lamports / 1e9
-    engine.capital = engine.sol_balance
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await start_bot()
+    yield
 
 
-async def sync_positions():
-    kp = load_keypair()
-    if not kp:
-        return
-
-    res = await rpc_post(
-        "getTokenAccountsByOwner",
-        [
-            str(kp.pubkey()),
-            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-            {"encoding": "jsonParsed"},
-        ],
-    )
-    if not res or "result" not in res:
-        return
-
-    old_map = {p["token"]: p for p in engine.positions}
-    new_positions = []
-
-    for item in res["result"]["value"]:
-        info = item["account"]["data"]["parsed"]["info"]
-        mint = info["mint"]
-        amount = float(info["tokenAmount"].get("uiAmount") or 0)
-
-        if amount > 0:
-            old = old_map.get(mint, {})
-            entry = old.get("entry_price", 0.0)
-
-            new_positions.append({
-                "token": mint,
-                "amount": amount,
-                "entry_price": entry,
-                "last_price": old.get("last_price", entry),
-                "peak_price": old.get("peak_price", entry),
-                "pnl_pct": old.get("pnl_pct", 0.0),
-            })
-
-    engine.positions = new_positions
+app = FastAPI(lifespan=lifespan)
 
 
-async def get_price(mint: str):
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": mint,
-                    "outputMint": SOL,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
-            )
-
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        out_amount = data.get("outAmount")
-        if not out_amount:
-            return None
-
-        out_sol = int(out_amount) / 1e9
-        return out_sol / 1_000_000
-    except Exception as e:
-        engine.log(f"PRICE ERROR {e}")
-        return None
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "bot_ok": BOT_STATUS["ok"],
+        "bot_error": BOT_STATUS["error"],
+    }
 
 
-async def send_signed_tx(signed_tx: str):
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                RPC,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        signed_tx,
-                        {
-                            "skipPreflight": True,
-                            "encoding": "base64",
-                        },
-                    ],
-                },
-            )
-
-        if r.status_code != 200:
-            return None, f"SEND TX FAILED: {r.text}"
-
-        data = r.json()
-        if "error" in data:
-            return None, f"RPC ERROR: {data['error']}"
-
-        return data, None
-    except Exception as e:
-        return None, f"SEND TX EXCEPTION: {e}"
-
-
-async def rug_filter(mint: str) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": SOL,
-                    "outputMint": mint,
-                    "amount": "100000000",
-                    "slippageBps": 100,
-                },
-            )
-
-        data = r.json()
-        impact = data.get("priceImpactPct", 1)
-        out_amount = data.get("outAmount", 0)
-
-        if out_amount == 0:
-            return False
-        if impact > 0.15:
-            return False
-
-        return True
-    except Exception:
-        return False
-
-
-def has_position(mint: str) -> bool:
-    return any(p["token"] == mint for p in engine.positions)
-
-
-async def buy(mint: str):
-    if MODE != "REAL":
-        engine.log("PAPER MODE: buy skipped")
-        return
-
-    if len(engine.positions) >= MAX_POSITIONS:
-        engine.log("BUY BLOCKED: MAX_POSITIONS")
-        return
-
-    if has_position(mint):
-        engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
-        return
-
-    if not await rug_filter(mint):
-        engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
-        return
-
-    kp = load_keypair()
-    if not kp:
-        engine.log("NO KEYPAIR")
-        return
-
-    size = POSITION_SIZE
-    amount_atomic = int(size * 1e9)
-
-    engine.log(f"TRY BUY {mint[:6]}")
-
-    order = await get_order(
-        input_mint=SOL,
-        output_mint=mint,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
-    )
-    if not order:
-        engine.stats["errors"] += 1
-        engine.log("BUY ORDER FAIL")
-        return
-
-    result = await execute_order(order, kp)
-    if not result:
-        engine.stats["errors"] += 1
-        engine.log("BUY EXEC FAIL")
-        return
-
-    signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("BUY NO SIGNED TX")
-        return
-
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return
-
-    token_amount = 0.0
-    try:
-        if "outAmount" in order:
-            token_amount = int(order["outAmount"]) / 1_000_000
-    except Exception:
-        pass
-
-    entry = 0.0
-    try:
-        if token_amount > 0:
-            entry = size / token_amount
-    except Exception:
-        pass
-
-    if entry <= 0:
-        price_now = await get_price(mint)
-        if price_now and price_now > 0:
-            entry = price_now
-
-    if entry <= 0:
-        entry = 1e-9
-
-    engine.positions.append({
-        "token": mint,
-        "amount": token_amount,
-        "entry_price": entry,
-        "last_price": entry,
-        "peak_price": entry,
-        "pnl_pct": 0.0,
+@app.get("/data")
+def data():
+    return JSONResponse({
+        "running": engine.running,
+        "mode": engine.mode,
+        "sol_balance": engine.sol_balance,
+        "capital": engine.capital,
+        "last_signal": engine.last_signal,
+        "last_trade": engine.last_trade,
+        "positions": engine.positions,
+        "logs": engine.logs[-50:],
+        "stats": engine.stats,
+        "trade_history": engine.trade_history[-50:],
+        "bot_ok": BOT_STATUS["ok"],
+        "bot_error": BOT_STATUS["error"],
     })
 
-    engine.stats["buys"] += 1
-    engine.last_trade = f"BUY {mint[:8]}"
-    engine.trade_history.append({
-        "side": "BUY",
-        "mint": mint,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-50:]
-    engine.log(f"BUY SUCCESS {mint[:6]}")
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quant Dashboard</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0b1020;
+      color: #e5e7eb;
+      padding: 20px;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .title {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 18px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    .card {
+      background: #121a2f;
+      border: 1px solid #1f2a44;
+      border-radius: 14px;
+      padding: 16px;
+      overflow: auto;
+    }
+    .full { grid-column: 1 / -1; }
+    .two { grid-column: span 2; }
+    .label {
+      color: #93a3b8;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .value {
+      font-size: 24px;
+      font-weight: 700;
+    }
+    ul { margin: 0; padding-left: 18px; }
+    li { margin-bottom: 6px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      border-bottom: 1px solid #22304f;
+      text-align: left;
+      padding: 8px 6px;
+      vertical-align: top;
+    }
+    @media (max-width: 1000px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+      .two { grid-column: span 2; }
+    }
+    @media (max-width: 520px) {
+      .grid { grid-template-columns: 1fr; }
+      .two, .full { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">⚔️ Quant Dashboard</div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">模式</div>
+        <div class="value" id="mode">-</div>
+      </div>
+      <div class="card">
+        <div class="label">SOL 餘額</div>
+        <div class="value" id="sol_balance">0</div>
+      </div>
+      <div class="card">
+        <div class="label">資金</div>
+        <div class="value" id="capital">0</div>
+      </div>
+      <div class="card">
+        <div class="label">最後交易</div>
+        <div class="value" id="last_trade" style="font-size:16px;">-</div>
+      </div>
+
+      <div class="card">
+        <div class="label">訊號數</div>
+        <div class="value" id="signals">0</div>
+      </div>
+      <div class="card">
+        <div class="label">買入數</div>
+        <div class="value" id="buys">0</div>
+      </div>
+      <div class="card">
+        <div class="label">賣出數</div>
+        <div class="value" id="sells">0</div>
+      </div>
+      <div class="card">
+        <div class="label">錯誤數</div>
+        <div class="value" id="errors">0</div>
+      </div>
+
+      <div class="card full">
+        <div class="label">最新訊號</div>
+        <div id="last_signal">-</div>
+      </div>
+
+      <div class="card two">
+        <div class="label">持倉</div>
+        <div id="positions">無持倉</div>
+      </div>
+
+      <div class="card two">
+        <div class="label">Logs</div>
+        <ul id="logs"></ul>
+      </div>
+
+      <div class="card full">
+        <div class="label">Trade History</div>
+        <div id="history">暫無資料</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function load() {
+      const res = await fetch('/data');
+      const d = await res.json();
+
+      document.getElementById('mode').textContent = d.mode || '-';
+      document.getElementById('sol_balance').textContent = Number(d.sol_balance || 0).toFixed(6);
+      document.getElementById('capital').textContent = Number(d.capital || 0).toFixed(6);
+      document.getElementById('last_trade').textContent = d.last_trade || '-';
+      document.getElementById('last_signal').textContent = d.last_signal || '-';
+      document.getElementById('signals').textContent = d.stats?.signals ?? 0;
+      document.getElementById('buys').textContent = d.stats?.buys ?? 0;
+      document.getElementById('sells').textContent = d.stats?.sells ?? 0;
+      document.getElementById('errors').textContent = d.stats?.errors ?? 0;
+
+      const pos = document.getElementById('positions');
+      if (!d.positions || d.positions.length === 0) {
+        pos.textContent = '無持倉';
+      } else {
+        pos.innerHTML = '<ul>' + d.positions.map(
+          p => `<li>
+            ${p.token || '-'} |
+            amount=${p.amount ?? 0} |
+            entry=${p.entry_price ?? 0} |
+            last=${p.last_price ?? 0} |
+            peak=${p.peak_price ?? 0} |
+            pnl=${((p.pnl_pct ?? 0) * 100).toFixed(2)}%
+          </li>`
+        ).join('') + '</ul>';
+      }
+
+      const logs = document.getElementById('logs');
+      logs.innerHTML = '';
+      (d.logs || []).slice().reverse().forEach(line => {
+        const li = document.createElement('li');
+        li.textContent = line;
+        logs.appendChild(li);
+      });
+
+      const hist = document.getElementById('history');
+      const rows = d.trade_history || [];
+      if (rows.length === 0) {
+        hist.textContent = '暫無資料';
+      } else {
+        hist.innerHTML = `
+          <table>
+            <thead>
+              <tr>
+                <th>Side</th>
+                <th>Mint</th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(r => `
+                <tr>
+                  <td>${r.side ?? ''}</td>
+                  <td>${(r.mint ?? '').slice(0, 12)}</td>
+                  <td><pre style="white-space:pre-wrap;">${JSON.stringify(r.result ?? {}, null, 2)}</pre></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `;
+      }
+    }
+
+    load();
+    setInterval(load, 2000);
+  </script>
+</body>
+</html>
+    """
 
 
-async def sell(position: dict):
-    if MODE != "REAL":
-        engine.log("PAPER MODE: sell skipped")
-        return
-
-    kp = load_keypair()
-    if not kp:
-        engine.log("SELL FAILED: no key")
-        return
-
-    mint = position["token"]
-    amount_atomic = int(position["amount"] * 1_000_000)
-
-    engine.log(f"TRY SELL {mint[:6]}")
-
-    order = await get_order(
-        input_mint=mint,
-        output_mint=SOL,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
-    )
-    if not order:
-        engine.stats["errors"] += 1
-        engine.log("SELL ORDER FAIL")
-        return
-
-    result = await execute_order(order, kp)
-    if not result:
-        engine.stats["errors"] += 1
-        engine.log("SELL EXEC FAIL")
-        return
-
-    signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("SELL NO SIGNED TX")
-        return
-
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return
-
-    engine.positions = [p for p in engine.positions if p["token"] != mint]
-    engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {mint[:8]}"
-    engine.trade_history.append({
-        "side": "SELL",
-        "mint": mint,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-50:]
-    engine.log(f"SELL SUCCESS {mint[:6]}")
-
-
-async def monitor():
-    while True:
-        try:
-            if ENABLE_AUTO_SELL:
-                for p in list(engine.positions):
-                    price = await get_price(p["token"])
-                    if not price:
-                        continue
-
-                    entry = p.get("entry_price", 0.0)
-                    if not entry or entry <= 0:
-                        price_now = await get_price(p["token"])
-                        if price_now and price_now > 0:
-                            p["entry_price"] = price_now
-                            p["last_price"] = price_now
-                            p["peak_price"] = max(p.get("peak_price", 0.0), price_now)
-                            entry = price_now
-                            engine.log(f"FIX ENTRY PRICE {p['token'][:6]} {entry}")
-                        else:
-                            engine.log("SKIP MONITOR: invalid entry_price")
-                            continue
-
-                    p["last_price"] = price
-                    p["peak_price"] = max(p.get("peak_price", price), price)
-
-                    pnl = (price - entry) / entry
-                    p["pnl_pct"] = pnl
-
-                    engine.log(f"{p['token'][:6]} PNL {round(pnl * 100, 2)}%")
-
-                    if pnl >= TAKE_PROFIT:
-                        engine.log("TAKE PROFIT HIT")
-                        await sell(p)
-                        continue
-
-                    if pnl <= -STOP_LOSS:
-                        engine.log("STOP LOSS HIT")
-                        await sell(p)
-                        continue
-
-                    peak = p.get("peak_price", price)
-                    if peak > 0:
-                        drawdown = (peak - price) / peak
-                        if peak > entry and drawdown >= TRAILING:
-                            engine.log("TRAILING STOP HIT")
-                            await sell(p)
-                            continue
-
-        except Exception as e:
-            engine.stats["errors"] += 1
-            engine.log(f"MONITOR ERR {e}")
-
-        await asyncio.sleep(5)
-
-
-async def handle_mempool(event: dict):
-    try:
-        mint = event.get("mint")
-
-        if not mint:
-            engine.log("MEMPOOL SKIP: NO MINT")
-            return
-
-        if mint == SOL:
-            engine.log("MEMPOOL SKIP: SOL")
-            return
-
-        if len(mint) < 32 or len(mint) > 44:
-            engine.log(f"MEMPOOL SKIP: BAD MINT {mint}")
-            return
-
-        engine.log(f"SNIPER HIT {mint[:6]}")
-
-        if has_position(mint):
-            engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:6]}")
-            return
-
-        if len(engine.positions) >= MAX_POSITIONS:
-            engine.log("BUY BLOCKED: MAX_POSITIONS")
-            return
-
-        ok = await rug_filter(mint)
-        if not ok:
-            engine.log(f"BUY BLOCKED: RUG FILTER {mint[:6]}")
-            return
-
-        await buy(mint)
-
-    except Exception as e:
-        engine.stats["errors"] += 1
-        engine.log(f"SNIPER ERROR {e}")
-
-
-async def bot_loop():
-    engine.mode = MODE
-    engine.log("PHASE D START")
-
-    asyncio.create_task(monitor())
-    asyncio.create_task(mempool_stream(handle_mempool))
-
-    while True:
-        try:
-            await sync_sol_balance()
-            await sync_positions()
-
-            mint = await wallet_graph_signal(RPC)
-            if mint:
-                engine.log(f"SMART MONEY HIT {mint[:6]}")
-                await buy(mint)
-
-            engine.stats["signals"] += 1
-            engine.last_signal = "mempool+wallet"
-            engine.log("LOOP RUNNING")
-
-        except Exception as e:
-            engine.stats["errors"] += 1
-            engine.log(f"LOOP ERROR {e}")
-
-        await asyncio.sleep(2)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
