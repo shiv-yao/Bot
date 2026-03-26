@@ -544,37 +544,44 @@ async def bot_loop():
             if now - LAST_REAL_REFRESH > 15:
                 REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
                 LAST_REAL_REFRESH = now
-                engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)} {REAL_SMART_WALLETS[:5]}")
+                engine.log(
+                    f"REAL SMART {len(REAL_SMART_WALLETS)} {REAL_SMART_WALLETS[:5]}"
+                )
 
             # 3. liquidity alpha
             liq_mint = await liquidity_signal(RPC)
             if liq_mint and not has_position(liq_mint):
-                engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
-                await buy(liq_mint, alpha_score_value=1500.0)
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
+                    await buy(liq_mint, alpha_score_value=1500.0)
 
             # 4. insider alpha
             insider_mint = await insider_signal(RPC)
             if insider_mint and not has_position(insider_mint):
-                engine.log(f"INSIDER HIT {insider_mint[:8]}")
-                await buy(insider_mint, alpha_score_value=1000.0)
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"INSIDER HIT {insider_mint[:8]}")
+                    await buy(insider_mint, alpha_score_value=1000.0)
 
             # 5. smart money alpha
             smart_money_mint = await wallet_graph_signal(RPC)
             if smart_money_mint and not has_position(smart_money_mint):
-                engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
-                await buy(smart_money_mint, alpha_score_value=500.0)
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
+                    await buy(smart_money_mint, alpha_score_value=500.0)
 
             # 6. auto smart wallet alpha
             auto_smart_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS)
             if auto_smart_mint and not has_position(auto_smart_mint):
-                engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
-                await buy(auto_smart_mint, alpha_score_value=700.0)
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
+                    await buy(auto_smart_mint, alpha_score_value=700.0)
 
             # 7. real smart wallet alpha
             real_mint = await real_smart_signal(RPC, REAL_SMART_WALLETS, CANDIDATES)
             if real_mint and not has_position(real_mint):
-                engine.log(f"REAL SMART HIT {real_mint[:8]}")
-                await buy(real_mint, alpha_score_value=900.0)
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"REAL SMART HIT {real_mint[:8]}")
+                    await buy(real_mint, alpha_score_value=900.0)
 
             # 8. alpha ranking from mempool universe
             ranked = await rank_candidates(CANDIDATES)
@@ -587,16 +594,18 @@ async def bot_loop():
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
                 if score > 22 and not has_position(mint):
-                    await buy(mint, alpha_score_value=score)
+                    if len(engine.positions) < MAX_POSITIONS:
+                        await buy(mint, alpha_score_value=score)
 
             # 9. fallback alpha（保底進場）
-            if len(engine.positions) < MAX_POSITIONS and CANDIDATES:
+            if CANDIDATES:
                 import random
 
                 mint = random.choice(list(CANDIDATES))
                 if not has_position(mint):
-                    engine.log(f"FALLBACK BUY {mint[:8]}")
-                    await buy(mint, alpha_score_value=10.0)
+                    if len(engine.positions) < MAX_POSITIONS:
+                        engine.log(f"FALLBACK BUY {mint[:8]}")
+                        await buy(mint, alpha_score_value=10.0)
 
             engine.stats["signals"] += 1
             engine.log("LOOP RUNNING")
