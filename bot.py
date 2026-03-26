@@ -10,14 +10,18 @@ from jupiter import get_order, execute_order
 RPC = os.getenv("RPC", "")
 SOL = "So11111111111111111111111111111111111111112"
 
-MODE = os.getenv("MODE", "PAPER").upper()
+MODE = os.getenv("MODE", "REAL")
 
 MAX_POSITIONS = 3
 POSITION_SIZE = 0.002
 
-TAKE_PROFIT = 0.25
-STOP_LOSS = 0.1
-TRAILING = 0.12
+TAKE_PROFIT = 0.3
+STOP_LOSS = 0.12
+TRAILING = 0.15
+
+SMART_WALLETS = [
+    # 👉 之後可換成你追蹤的聰明錢
+]
 
 
 # ================= PRICE =================
@@ -38,14 +42,53 @@ async def get_price(mint):
         out = data.get("outAmount")
         if not out:
             return None
-        return (int(out) / 1e9) / 1_000_000
+        return (int(out)/1e9)/1_000_000
     except:
         return None
 
 
-# ================= ALPHA ENGINE =================
+# ================= SMART MONEY =================
 
-async def get_token_info(mint):
+async def get_wallet_tokens(wallet):
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(RPC, json={
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"getTokenAccountsByOwner",
+                "params":[
+                    wallet,
+                    {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding":"jsonParsed"}
+                ]
+            })
+        data = r.json()
+        tokens = []
+
+        for item in data["result"]["value"]:
+            info = item["account"]["data"]["parsed"]["info"]
+            mint = info["mint"]
+            amt = float(info["tokenAmount"]["uiAmount"] or 0)
+
+            if amt > 0:
+                tokens.append(mint)
+
+        return tokens
+    except:
+        return []
+
+
+async def smart_money_signal():
+    for w in SMART_WALLETS:
+        tokens = await get_wallet_tokens(w)
+        if tokens:
+            return random.choice(tokens)
+    return None
+
+
+# ================= RUG FILTER =================
+
+async def rug_filter(mint):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -57,72 +100,42 @@ async def get_token_info(mint):
                     "slippageBps": 100
                 }
             )
+
         data = r.json()
 
-        return {
-            "liquidity": data.get("otherAmountThreshold", 0),
-            "priceImpact": data.get("priceImpactPct", 1)
-        }
+        liquidity = data.get("otherAmountThreshold", 0)
+        impact = data.get("priceImpactPct", 1)
+
+        if liquidity < 100000:
+            return False
+
+        if impact > 0.1:
+            return False
+
+        return True
+
     except:
-        return None
-
-
-async def alpha_score(mint):
-    info = await get_token_info(mint)
-    if not info:
-        return 0
-
-    liquidity = info["liquidity"]
-    impact = info["priceImpact"]
-
-    score = 0
-
-    # liquidity
-    if liquidity > 1_000_000:
-        score += 40
-    elif liquidity > 100_000:
-        score += 20
-
-    # price impact（越低越好）
-    if impact < 0.01:
-        score += 30
-    elif impact < 0.05:
-        score += 10
-
-    # momentum（簡版）
-    price = await get_price(mint)
-    if price:
-        score += random.randint(5, 25)
-
-    return score
+        return False
 
 
 # ================= SNIPER =================
 
-async def scan_tokens():
-    return [
+async def scan_market():
+    test = [
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     ]
+    return random.choice(test)
 
 
-async def pick_best_token():
-    tokens = await scan_tokens()
+async def pick_token():
+    # 優先 smart money
+    sm = await smart_money_signal()
+    if sm:
+        engine.log("SMART MONEY SIGNAL")
+        return sm
 
-    best = None
-    best_score = 0
-
-    for t in tokens:
-        score = await alpha_score(t)
-        engine.log(f"{t[:6]} score {score}")
-
-        if score > best_score:
-            best = t
-            best_score = score
-
-    if best_score < 30:
-        return None
-
-    return best
+    # fallback 市場掃描
+    return await scan_market()
 
 
 # ================= BUY =================
@@ -132,6 +145,10 @@ async def buy(mint):
         return
 
     if any(p["token"] == mint for p in engine.positions):
+        return
+
+    if not await rug_filter(mint):
+        engine.log("RUG FILTER BLOCK")
         return
 
     kp = load_keypair()
@@ -152,10 +169,10 @@ async def buy(mint):
 
     async with httpx.AsyncClient() as client:
         await client.post(RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [signed, {"skipPreflight": True}]
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"sendTransaction",
+            "params":[signed, {"skipPreflight":True}]
         })
 
     token_amount = int(order["outAmount"]) / 1_000_000
@@ -196,10 +213,10 @@ async def sell(p):
 
     async with httpx.AsyncClient() as client:
         await client.post(RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [signed, {"skipPreflight": True}]
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"sendTransaction",
+            "params":[signed, {"skipPreflight":True}]
         })
 
     engine.positions = [x for x in engine.positions if x != p]
@@ -237,23 +254,23 @@ async def monitor():
             if dd >= TRAILING:
                 await sell(p)
 
-        await asyncio.sleep(6)
+        await asyncio.sleep(5)
 
 
 # ================= MAIN =================
 
 async def bot_loop():
-    engine.log("ALPHA ENGINE START")
+    engine.log("PHASE D START")
 
     asyncio.create_task(monitor())
 
     while True:
-        mint = await pick_best_token()
+        mint = await pick_token()
 
         if mint:
             await buy(mint)
 
         engine.stats["signals"] += 1
-        engine.last_signal = "alpha"
+        engine.last_signal = "phase_d"
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
