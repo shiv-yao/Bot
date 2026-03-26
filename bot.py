@@ -15,7 +15,9 @@ from db import (
     fetch_open_positions, fetch_recent_trades
 )
 from turboquant_adapter import turboquant_score
+from state import engine
 
+engine.logs.append("bot started")
 CONFIG = {
     "MODE": os.getenv("MODE", "PAPER"),
     "BUY_AMOUNT_SOL": float(os.getenv("BUY_AMOUNT_SOL", "0.002")),
