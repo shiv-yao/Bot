@@ -484,7 +484,7 @@ async def handle_mempool(event: dict):
         if len(mint) < 32 or len(mint) > 44:
             return
 
-        # 🔥 核心：只留「有流動性」token
+        # 只留有報價的 token
         price = await get_price(mint)
         if not price:
             return
@@ -495,7 +495,7 @@ async def handle_mempool(event: dict):
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
 
-        # 🔥 early sniper（讓你有交易流）
+        # 補回早期進場流量，不然永遠沒有樣本
         if len(engine.positions) < MAX_POSITIONS:
             if mint not in [p["token"] for p in engine.positions]:
                 import random
@@ -503,6 +503,9 @@ async def handle_mempool(event: dict):
                 if random.random() < 0.4:
                     engine.log(f"EARLY BUY {mint[:8]}")
                     asyncio.create_task(buy(mint, alpha_score_value=35.0))
+                else:
+                    engine.log(f"FAST BUY {mint[:8]}")
+                    asyncio.create_task(buy(mint, alpha_score_value=25.0))
 
     except Exception as e:
         engine.stats["errors"] += 1
