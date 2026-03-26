@@ -1,45 +1,34 @@
 import httpx
+from smart_wallets import SMART_WALLETS
 
-SMART_WALLETS = [
-    # 之後把真地址放這裡
-]
-
-
-async def get_wallet_tokens(rpc: str, wallet: str):
+async def wallet_graph_signal(RPC):
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                rpc,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getTokenAccountsByOwner",
-                    "params": [
-                        wallet,
-                        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                        {"encoding": "jsonParsed"},
-                    ],
-                },
-            )
+        async with httpx.AsyncClient(timeout=10) as client:
+            for wallet in SMART_WALLETS:
+                r = await client.post(
+                    RPC,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getSignaturesForAddress",
+                        "params": [wallet, {"limit": 3}],
+                    },
+                )
 
-        data = r.json()
-        tokens = []
+                data = r.json()
+                if "result" not in data:
+                    continue
 
-        for item in data.get("result", {}).get("value", []):
-            info = item["account"]["data"]["parsed"]["info"]
-            mint = info["mint"]
-            amount = float(info["tokenAmount"].get("uiAmount") or 0)
-            if amount > 0:
-                tokens.append(mint)
+                txs = data["result"]
 
-        return tokens
+                for tx in txs:
+                    sig = tx["signature"]
+
+                    # 👉 模擬 decode（簡化版）
+                    if "buy" in sig:  # placeholder
+                        return "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+        return None
+
     except Exception:
-        return []
-
-
-async def wallet_graph_signal(rpc: str):
-    for wallet in SMART_WALLETS:
-        tokens = await get_wallet_tokens(rpc, wallet)
-        if tokens:
-            return tokens[0]
-    return None
+        return None
