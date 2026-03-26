@@ -1,27 +1,26 @@
-import os
 import json
-from solana.rpc.async_api import AsyncClient
+import os
+from typing import Optional
+
+import base58
 from solders.keypair import Keypair
 
-RPCS = [
-    "https://api.mainnet-beta.solana.com",
-    "https://rpc.ankr.com/solana",
-]
-
-rpc_index = 0
-
-def get_rpc():
-    global rpc_index
-    url = RPCS[rpc_index % len(RPCS)]
-    rpc_index += 1
-    return AsyncClient(url)
-
-def load_keypair():
-    pk = os.getenv("PRIVATE_KEY")
-
-    if not pk:
-        print("⚠️ SAFE MODE（沒有私鑰）")
+def load_keypair() -> Optional[Keypair]:
+    raw = os.getenv("PRIVATE_KEY")
+    if not raw:
         return None
 
-    arr = json.loads(pk)
-    return Keypair.from_bytes(bytes(arr))
+    raw = raw.strip()
+
+    # JSON array format: [1,2,3,...]
+    if raw.startswith("["):
+        arr = json.loads(raw)
+        return Keypair.from_bytes(bytes(arr))
+
+    # comma-separated integers: 1,2,3,...
+    if "," in raw:
+        arr = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        return Keypair.from_bytes(bytes(arr))
+
+    # base58 format
+    return Keypair.from_bytes(base58.b58decode(raw))
