@@ -149,7 +149,7 @@ async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallet
             for w in wallets:
                 wallet_counter[w] += 1
 
-    ranked = [w for w, count in wallet_counter.most_common(max_wallets) if count >= 2]
+    ranked = [w for w, count in wallet_counter.most_common(max_wallets) if count >= 1]
     return ranked
 
 
