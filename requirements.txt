@@ -1,6 +1,3 @@
 fastapi
 uvicorn
 jinja2
-aiohttp
-solders
-base58
