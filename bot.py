@@ -2,12 +2,12 @@ import os
 import asyncio
 import httpx
 
-from insider_engine import insider_signal
 from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
 from mempool import mempool_stream
 from wallet_graph import wallet_graph_signal
+from insider_engine import insider_signal
 from alpha_engine import rank_candidates
 
 RPC = os.getenv("RPC", "").strip()
@@ -15,7 +15,7 @@ SOL = "So11111111111111111111111111111111111111112"
 
 MODE = os.getenv("MODE", "REAL").upper()
 
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
@@ -27,10 +27,9 @@ TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
 
-# Phase I
 ADD_ON_WIN = os.getenv("ADD_ON_WIN", "true").lower() == "true"
-ADD_TRIGGER_PCT = float(os.getenv("ADD_TRIGGER_PCT", "0.08"))      # 浮盈 8% 加倉
-ADD_SIZE_MULTIPLIER = float(os.getenv("ADD_SIZE_MULTIPLIER", "0.5"))  # 加倉 = 基礎倉位 50%
+ADD_TRIGGER_PCT = float(os.getenv("ADD_TRIGGER_PCT", "0.08"))
+ADD_SIZE_MULTIPLIER = float(os.getenv("ADD_SIZE_MULTIPLIER", "0.5"))
 MAX_ADDS_PER_POSITION = int(os.getenv("MAX_ADDS_PER_POSITION", "1"))
 
 CANDIDATES = set()
@@ -199,13 +198,6 @@ async def rug_filter(mint: str) -> bool:
 
 def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
-
-
-def get_position(mint: str):
-    for p in engine.positions:
-        if p["token"] == mint:
-            return p
-    return None
 
 
 def calc_position_size() -> float:
@@ -499,7 +491,7 @@ async def handle_mempool(event: dict):
 
 async def bot_loop():
     engine.mode = MODE
-    engine.log("PHASE I START")
+    engine.log("PHASE K START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -509,6 +501,19 @@ async def bot_loop():
             await sync_sol_balance()
             await sync_positions()
 
+            # 1. insider alpha
+            insider_mint = await insider_signal(RPC)
+            if insider_mint and not has_position(insider_mint):
+                engine.log(f"INSIDER HIT {insider_mint[:8]}")
+                await buy(insider_mint, alpha_score_value=1000.0)
+
+            # 2. smart money alpha
+            smart_money_mint = await wallet_graph_signal(RPC)
+            if smart_money_mint and not has_position(smart_money_mint):
+                engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
+                await buy(smart_money_mint, alpha_score_value=500.0)
+
+            # 3. alpha ranking from mempool universe
             ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
@@ -518,17 +523,8 @@ async def bot_loop():
                 engine.last_signal = f"alpha:{score:.2f}"
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
-                if score > 25:
+                if score > 30:
                     await buy(mint, alpha_score_value=score)
-                if score > 40:
-                engine.log(f"BREAKOUT BUY {mint[:8]}")
-                
-    await buy(mint, alpha_score_value=score)
-
-            smart_money_mint = await wallet_graph_signal(RPC)
-            if smart_money_mint and not has_position(smart_money_mint):
-                engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
-                await buy(smart_money_mint, alpha_score_value=999.0)
 
             engine.stats["signals"] += 1
             engine.log("LOOP RUNNING")
