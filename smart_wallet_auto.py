@@ -55,6 +55,7 @@ async def get_transaction(rpc: str, signature: str):
 
 def extract_candidate_wallets_from_tx(tx: dict):
     wallets = []
+
     try:
         account_keys = tx["transaction"]["message"]["accountKeys"]
 
@@ -75,14 +76,30 @@ def extract_candidate_wallets_from_tx(tx: dict):
             if len(pubkey) < 32 or len(pubkey) > 44:
                 continue
 
-            # 優先保留 signer / writable，這比亂抓所有 account 好很多
+            # 只要 signer 或 writable 就先收進來
             if signer or writable:
+                wallets.append(pubkey)
+
+        # 如果一個都沒抓到，就退一步：抓前幾個 account key
+        if not wallets:
+            for k in account_keys[:5]:
+                if isinstance(k, dict):
+                    pubkey = k.get("pubkey")
+                else:
+                    pubkey = k
+
+                if not pubkey:
+                    continue
+                if pubkey in BLACKLIST_WALLETS:
+                    continue
+                if len(pubkey) < 32 or len(pubkey) > 44:
+                    continue
+
                 wallets.append(pubkey)
 
     except Exception:
         pass
 
-    # 去重
     dedup = []
     seen = set()
     for w in wallets:
@@ -95,6 +112,7 @@ def extract_candidate_wallets_from_tx(tx: dict):
 
 def extract_mints_from_tx(tx: dict):
     mints = []
+
     try:
         meta = tx.get("meta") or {}
 
@@ -108,6 +126,7 @@ def extract_mints_from_tx(tx: dict):
                 if len(mint) < 32 or len(mint) > 44:
                     continue
                 mints.append(mint)
+
     except Exception:
         pass
 
@@ -117,20 +136,17 @@ def extract_mints_from_tx(tx: dict):
         if m not in seen:
             seen.add(m)
             dedup.append(m)
+
     return dedup
 
 
 async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallets: int = 10):
-    """
-    從 candidate mints 反查最近交易，抓 signer / writable wallet，
-    再依出現次數排序。
-    """
     wallet_counter = Counter()
 
-    sample_mints = list(candidate_mints)[:15]
+    sample_mints = list(candidate_mints)[:30]
 
     for mint in sample_mints:
-        sigs = await get_signatures_for_address(rpc, mint, limit=8)
+        sigs = await get_signatures_for_address(rpc, mint, limit=10)
 
         for s in sigs:
             sig = s.get("signature")
@@ -142,21 +158,21 @@ async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallet
                 continue
 
             tx_mints = extract_mints_from_tx(tx)
-            if mint not in tx_mints:
+
+            # 這裡放寬：只要該 tx 有 token mint，就納入
+            if not tx_mints:
                 continue
 
             wallets = extract_candidate_wallets_from_tx(tx)
             for w in wallets:
                 wallet_counter[w] += 1
 
-    ranked = [w for w, count in wallet_counter.most_common(max_wallets) if count >= 1]
+    # 放寬到出現一次也保留，先讓系統抓得到
+    ranked = [w for w, _ in wallet_counter.most_common(max_wallets)]
     return ranked
 
 
 async def smart_wallet_signal_from_auto(rpc: str, smart_wallets: list):
-    """
-    從自動抓到的 wallets 裡，找最近碰過的 mint。
-    """
     for wallet in smart_wallets:
         sigs = await get_signatures_for_address(rpc, wallet, limit=5)
 
