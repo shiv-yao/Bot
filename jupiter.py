@@ -6,6 +6,7 @@ from solders.transaction import VersionedTransaction
 QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
 SWAP_URL = "https://lite-api.jup.ag/swap/v1/swap"
 
+
 async def get_order(
     input_mint: str,
     output_mint: str,
@@ -31,6 +32,7 @@ async def get_order(
             return None
 
         return data
+
 
 async def execute_order(route, keypair: Keypair):
     async with httpx.AsyncClient(timeout=30) as client:
