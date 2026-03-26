@@ -1,7 +1,6 @@
 import asyncio
 import aiohttp
 import os
-import time
 import base64
 
 from solders.keypair import Keypair
@@ -14,11 +13,13 @@ CONFIG = {
     "MIN_FLOW": 1200,
     "MIN_SMART_SCORE": 0.6,
     "RUG_THRESHOLD": 0.7,
-    "PRIORITY_FEE": 150000
+    "PRIORITY_FEE": 150000,
+    "BUY_AMOUNT_SOL": 0.01
 }
 
 RPC = os.getenv("RPC")
 JITO = os.getenv("JITO_RPC")
+wallet = None
 
 if not RPC:
     raise Exception("RPC not set")
@@ -28,22 +29,17 @@ SOL = "So11111111111111111111111111111111111111112"
 
 # ===== SAFE WALLET INIT =====
 pk = os.getenv("PRIVATE_KEY")
-wallet = None
-
-if pk = os.getenv("PRIVATE_KEY")
-wallet = None
 
 if pk:
     try:
-        # 先嘗試逗號數字陣列格式
+        # 這版只接受逗號分隔的整數私鑰格式
+        # 例如: 12,34,56,78,...
         if "," in pk:
             private_key = list(map(int, pk.split(",")))
             wallet = Keypair.from_bytes(bytes(private_key))
+            print("✅ Wallet loaded")
         else:
-            # 再嘗試 base58 格式
-            wallet = Keypair.from_base58_string(pk)
-
-        print("✅ Wallet loaded")
+            raise Exception("PRIVATE_KEY must be comma-separated integers for this build")
     except Exception as e:
         raise Exception(f"PRIVATE_KEY invalid: {e}")
 else:
@@ -53,8 +49,8 @@ flow_cache = {}
 wallet_stats = {}
 
 # ===== Rug Filter =====
-def rug_score(flow, wallets, momentum):
-    score = 0
+def rug_score(flow: float, wallets: int, momentum: float) -> float:
+    score = 0.0
     if wallets < 3:
         score += 0.4
     if momentum < flow * 0.2:
@@ -64,22 +60,22 @@ def rug_score(flow, wallets, momentum):
     return score
 
 # ===== Smart Money =====
-def update_wallet(w, pnl):
-    s = wallet_stats.setdefault(w, {"pnl": 0, "trades": 0, "wins": 0})
+def update_wallet(w: str, pnl: float) -> None:
+    s = wallet_stats.setdefault(w, {"pnl": 0.0, "trades": 0, "wins": 0})
     s["pnl"] += pnl
     s["trades"] += 1
     if pnl > 0:
         s["wins"] += 1
 
-def smart_score(w):
+def smart_score(w: str) -> float:
     s = wallet_stats.get(w)
     if not s or s["trades"] < 5:
-        return 0
+        return 0.0
     return s["wins"] / s["trades"]
 
-# ===== AI =====
-def ai_score(flow, wallets, momentum):
-    score = 0
+# ===== Simple AI Score =====
+def ai_score(flow: float, wallets: int, momentum: float) -> float:
+    score = 0.0
     if flow > 2000:
         score += 0.4
     if wallets > 6:
@@ -88,8 +84,8 @@ def ai_score(flow, wallets, momentum):
         score += 0.3
     return score
 
-# ===== TRADE =====
-async def trade(session, mint):
+# ===== Trade =====
+async def trade(session: aiohttp.ClientSession, mint: str) -> bool:
     if wallet is None:
         print("⚠️ Skip trade: PRIVATE_KEY not set")
         return False
@@ -108,7 +104,7 @@ async def trade(session, mint):
             params={
                 "inputMint": SOL,
                 "outputMint": mint,
-                "amount": int(0.01 * 1e9),
+                "amount": int(CONFIG["BUY_AMOUNT_SOL"] * 1e9),
                 "slippageBps": 300
             }
         ) as r:
@@ -152,8 +148,8 @@ async def trade(session, mint):
         print("trade error:", e)
         return False
 
-# ===== PARSE =====
-async def parse_tx(session, sig):
+# ===== Parse Tx =====
+async def parse_tx(session: aiohttp.ClientSession, sig: str):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -184,7 +180,7 @@ async def parse_tx(session, sig):
 
     return None
 
-# ===== MAIN =====
+# ===== Main Bot Loop =====
 async def bot_loop():
     print("🚀 PROFIT BOT STARTED")
 
