@@ -485,7 +485,6 @@ async def handle_mempool(event: dict):
         if len(mint) < 32 or len(mint) > 44:
             return
 
-        # 只留有報價的 token
         price = await get_price(mint)
         if not price:
             return
@@ -496,7 +495,6 @@ async def handle_mempool(event: dict):
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
 
-        # 補回早期進場流量，不然永遠沒有樣本
         if len(engine.positions) < MAX_POSITIONS:
             if mint not in [p["token"] for p in engine.positions]:
                 import random
@@ -515,9 +513,10 @@ async def handle_mempool(event: dict):
 
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
+    global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("PHASE L START")
+    engine.log("PHASE M START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -528,40 +527,54 @@ async def bot_loop():
             await sync_positions()
 
             now = asyncio.get_event_loop().time()
+
+            # 1. auto smart wallet refresh
             if now - LAST_SMART_WALLET_REFRESH > 5:
                 AUTO_SMART_WALLETS = await auto_discover_smart_wallets(
                     RPC, CANDIDATES, max_wallets=8
                 )
                 LAST_SMART_WALLET_REFRESH = now
                 engine.log(
-                    f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:3]}"
+                    f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:5]}"
                 )
 
-            # 1. liquidity alpha
+            # 2. real smart wallet refresh
+            if now - LAST_REAL_REFRESH > 15:
+                REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
+                LAST_REAL_REFRESH = now
+                engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)} {REAL_SMART_WALLETS[:5]}")
+
+            # 3. liquidity alpha
             liq_mint = await liquidity_signal(RPC)
             if liq_mint and not has_position(liq_mint):
                 engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
                 await buy(liq_mint, alpha_score_value=1500.0)
 
-            # 2. insider alpha
+            # 4. insider alpha
             insider_mint = await insider_signal(RPC)
             if insider_mint and not has_position(insider_mint):
                 engine.log(f"INSIDER HIT {insider_mint[:8]}")
                 await buy(insider_mint, alpha_score_value=1000.0)
 
-            # 3. smart money alpha
+            # 5. smart money alpha
             smart_money_mint = await wallet_graph_signal(RPC)
             if smart_money_mint and not has_position(smart_money_mint):
                 engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
                 await buy(smart_money_mint, alpha_score_value=500.0)
 
-            # 4. auto smart wallet alpha
+            # 6. auto smart wallet alpha
             auto_smart_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS)
             if auto_smart_mint and not has_position(auto_smart_mint):
                 engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
                 await buy(auto_smart_mint, alpha_score_value=700.0)
 
-            # 5. alpha ranking from mempool universe
+            # 7. real smart wallet alpha
+            real_mint = await real_smart_signal(RPC, REAL_SMART_WALLETS, CANDIDATES)
+            if real_mint and not has_position(real_mint):
+                engine.log(f"REAL SMART HIT {real_mint[:8]}")
+                await buy(real_mint, alpha_score_value=900.0)
+
+            # 8. alpha ranking from mempool universe
             ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
@@ -571,7 +584,7 @@ async def bot_loop():
                 engine.last_signal = f"alpha:{score:.2f}"
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
-                if score > 22:
+                if score > 22 and not has_position(mint):
                     await buy(mint, alpha_score_value=score)
 
             engine.stats["signals"] += 1
