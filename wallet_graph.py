@@ -1,10 +1,9 @@
-import os
 import httpx
 
 SMART_WALLETS = [
-    # 之後把真地址填進來
-    # "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    # 之後把真地址放這裡
 ]
+
 
 async def get_wallet_tokens(rpc: str, wallet: str):
     try:
@@ -36,6 +35,7 @@ async def get_wallet_tokens(rpc: str, wallet: str):
         return tokens
     except Exception:
         return []
+
 
 async def wallet_graph_signal(rpc: str):
     for wallet in SMART_WALLETS:
