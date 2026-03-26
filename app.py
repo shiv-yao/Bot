@@ -1,7 +1,12 @@
 import os
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, HTMLResponse
+import asyncio
+from bot import bot_loop
 
+@app.on_event("startup")
+async def start_bot():
+    asyncio.create_task(bot_loop())
 app = FastAPI()
 
 @app.get("/health")
