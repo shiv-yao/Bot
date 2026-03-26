@@ -413,12 +413,21 @@ async def handle_mempool(event: dict):
         if not mint:
             return
 
-        # 這版基金級先不直接用 mempool 買，只記錄
-        engine.log(f"MEMPOOL CANDIDATE {mint[:8]}")
+        # 過濾垃圾
+        if len(mint) < 30:
+            return
+
+        CANDIDATES.add(mint)
+
+        # 控制池大小（基金級會控 universe）
+        if len(CANDIDATES) > 50:
+            CANDIDATES.pop()
+
+        engine.log(f"CANDIDATE ADD {mint[:8]}")
 
     except Exception as e:
         engine.stats["errors"] += 1
-        engine.log(f"SNIPER ERROR {e}")
+        engine.log(f"MEMPOOL ERR {e}")
 
 
 async def bot_loop():
