@@ -1,4 +1,3 @@
-import asyncio
 import json
 import websockets
 
@@ -6,13 +5,12 @@ RPC_WS = "wss://api.mainnet-beta.solana.com"
 
 async def mempool_stream(callback):
     async with websockets.connect(RPC_WS) as ws:
-
         sub = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "logsSubscribe",
             "params": [
-                {"mentions": ["Raydium", "Jupiter"]},
+                "all",
                 {"commitment": "processed"}
             ]
         }
@@ -24,12 +22,13 @@ async def mempool_stream(callback):
             data = json.loads(msg)
 
             if "params" in data:
-                logs = data["params"]["result"]["value"]["logs"]
+                value = data["params"]["result"]["value"]
+                logs = value.get("logs", [])
 
                 for log in logs:
                     if "swap" in log.lower():
-                        # 👉 簡化解析
                         await callback({
                             "type": "swap",
-                            "raw": log
+                            "raw": log,
                         })
+                        break
