@@ -30,10 +30,19 @@ SOL = "So11111111111111111111111111111111111111112"
 pk = os.getenv("PRIVATE_KEY")
 wallet = None
 
+if pk = os.getenv("PRIVATE_KEY")
+wallet = None
+
 if pk:
     try:
-        private_key = list(map(int, pk.split(",")))
-        wallet = Keypair.from_bytes(bytes(private_key))
+        # 先嘗試逗號數字陣列格式
+        if "," in pk:
+            private_key = list(map(int, pk.split(",")))
+            wallet = Keypair.from_bytes(bytes(private_key))
+        else:
+            # 再嘗試 base58 格式
+            wallet = Keypair.from_base58_string(pk)
+
         print("✅ Wallet loaded")
     except Exception as e:
         raise Exception(f"PRIVATE_KEY invalid: {e}")
