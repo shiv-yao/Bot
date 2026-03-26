@@ -527,11 +527,11 @@ async def bot_loop():
                 engine.log(f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)}")
 
             # 🔥 Phase L：流動性建立（最強 alpha）
-liq_mint = await liquidity_signal(RPC)
+                liq_mint = await liquidity_signal(RPC)
 
-if liq_mint and not has_position(liq_mint):
-    engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
-    await buy(liq_mint, alpha_score_value=1500.0)
+            if liq_mint and not has_position(liq_mint):
+               engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
+               await buy(liq_mint, alpha_score_value=1500.0)
 
             insider_mint = await insider_signal(RPC)
             if insider_mint and not has_position(insider_mint):
