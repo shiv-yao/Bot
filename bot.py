@@ -2,13 +2,14 @@ import asyncio
 from state import engine
 
 async def bot_loop():
-    engine.logs.append("🔥 BOT STARTED")
+    print("🚀 BOT LOOP STARTED")
+    engine.logs.append("🚀 BOT LOOP STARTED")
 
     while True:
-        engine.logs.append("⏱ LOOP RUNNING")
+        print("⏱ RUNNING LOOP")
+        engine.logs.append("⏱ RUNNING LOOP")
 
-        # 假裝交易（先確認有動）
-        engine.last_signal = "TEST SIGNAL"
-        engine.last_trade = "TEST TRADE"
+        engine.last_signal = "TEST"
+        engine.last_trade = "TEST"
 
         await asyncio.sleep(5)
