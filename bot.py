@@ -41,14 +41,14 @@ async def buy_once():
         engine.stats["errors"] += 1
 
 async def bot_loop():
-    executed = False
-
     while True:
-        await update_balance()
+        from wallet import load_keypair
 
-        # 👉 只做一次交易（測試用）
-        if not executed:
-            await buy_once()
-            executed = True
+        kp = load_keypair()
 
-        await asyncio.sleep(10)
+        if not kp:
+            engine.logs.append("❌ NO PRIVATE KEY")
+        else:
+            engine.logs.append(f"✅ WALLET: {kp.pubkey()}")
+
+        await asyncio.sleep(5)
