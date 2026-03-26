@@ -1,20 +1,42 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Trading Dashboard</title>
+  <title>Quant Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { font-family: Arial; background:#0d1117; color:#fff; padding:20px; }
+    body { background:#0d1117; color:#fff; font-family:sans-serif; padding:20px; }
     h1 { color:#58a6ff; }
-    .card { background:#161b22; padding:15px; margin:10px 0; border-radius:10px; }
+    .grid { display:grid; grid-template-columns: repeat(2,1fr); gap:20px; }
+    .card { background:#161b22; padding:15px; border-radius:10px; }
   </style>
 </head>
+
 <body>
 
-<h1>🚀 Trading Dashboard</h1>
+<h1>⚔️ Quant Trading Dashboard</h1>
 
-<div class="card">
-  <h3>SOL Balance</h3>
-  <div id="sol"></div>
+<div class="grid">
+
+  <div class="card">
+    <h3>SOL Balance</h3>
+    <div id="sol"></div>
+  </div>
+
+  <div class="card">
+    <h3>Win Rate</h3>
+    <div id="winrate"></div>
+  </div>
+
+  <div class="card">
+    <h3>Equity Curve</h3>
+    <canvas id="equityChart"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>Drawdown</h3>
+    <canvas id="ddChart"></canvas>
+  </div>
+
 </div>
 
 <div class="card">
@@ -23,21 +45,67 @@
 </div>
 
 <div class="card">
-  <h3>Logs</h3>
-  <pre id="logs"></pre>
+  <h3>Trade History</h3>
+  <pre id="trades"></pre>
 </div>
 
 <script>
+let equityChart, ddChart;
+
 async function load() {
   const res = await fetch('/data');
-  const data = await res.json();
+  const d = await res.json();
 
-  document.getElementById('sol').innerText = data.sol_balance;
-  document.getElementById('positions').innerText = JSON.stringify(data.positions, null, 2);
-  document.getElementById('logs').innerText = data.logs.slice(-10).join('\n');
+  document.getElementById('sol').innerText = d.sol_balance;
+  document.getElementById('positions').innerText = JSON.stringify(d.positions, null, 2);
+  document.getElementById('trades').innerText = JSON.stringify(d.trades?.slice(-10), null, 2);
+
+  // ===== 計算勝率 =====
+  const trades = d.trades || [];
+  const wins = trades.filter(t => t.pnl_pct > 0).length;
+  const winrate = trades.length ? (wins / trades.length * 100).toFixed(1) : 0;
+  document.getElementById('winrate').innerText = winrate + "%";
+
+  // ===== Equity Curve =====
+  let equity = 0;
+  let curve = [];
+  for (let t of trades) {
+    equity += (t.pnl || 0);
+    curve.push(equity);
+  }
+
+  let dd = [];
+  let peak = 0;
+  for (let v of curve) {
+    peak = Math.max(peak, v);
+    dd.push((v - peak));
+  }
+
+  renderChart("equityChart", curve, "Equity");
+  renderChart("ddChart", dd, "Drawdown");
 }
 
-setInterval(load, 2000);
+function renderChart(id, data, label) {
+  const ctx = document.getElementById(id).getContext("2d");
+
+  if (window[id]) {
+    window[id].destroy();
+  }
+
+  window[id] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map((_, i) => i),
+      datasets: [{
+        label: label,
+        data: data,
+        borderWidth: 2
+      }]
+    }
+  });
+}
+
+setInterval(load, 3000);
 load();
 </script>
 
