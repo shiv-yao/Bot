@@ -22,6 +22,9 @@ MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.10"))
 
+AUTO_SMART_WALLETS = []
+LAST_SMART_WALLET_REFRESH = 0
+
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
 STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
 TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
