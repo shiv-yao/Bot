@@ -485,7 +485,7 @@ async def handle_mempool(event: dict):
             return
 
         CANDIDATES.add(mint)
-        if len(CANDIDATES) > 100:
+        if len(CANDIDATES) > 150:
             CANDIDATES.pop()
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
