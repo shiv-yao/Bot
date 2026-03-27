@@ -762,15 +762,7 @@ async def handle_mempool(event: dict):
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
         engine.log(f"CANDIDATES SIZE {len(CANDIDATES)}")
-
-        if len(engine.positions) < MAX_POSITIONS:
-            if mint not in [p["token"] for p in engine.positions]:
-                if random.random() < 0.4:
-                    engine.log(f"EARLY BUY {mint[:8]}")
-                    asyncio.create_task(buy(mint, alpha_score_value=35.0))
-                else:
-                    engine.log(f"FAST BUY {mint[:8]}")
-                    asyncio.create_task(buy(mint, alpha_score_value=25.0))
+        engine.log(f"CANDIDATE READY {mint[:8]}")
 
     except Exception as e:
         engine.stats["errors"] += 1
