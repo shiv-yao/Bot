@@ -4,15 +4,10 @@ import random
 import httpx
 
 from alpha_boost_v3 import alpha_fusion
-
-from alpha_boost import (
-    wallet_graph_alpha,
-    insider_early_alpha,
-    smart_flow_alpha,
-    momentum_accel_alpha,
-)
 from paper_engine import PaperEngine
 from strategy_state import StrategyState
+from regime import REGIME, regime_risk_multiplier, regime_take_profit, regime_stop_loss
+
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
@@ -21,27 +16,25 @@ from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
 from mempool import mempool_stream
-from wallet_graph import wallet_graph_signal
 from insider_engine import insider_signal
 from alpha_engine import rank_candidates
 
 paper = PaperEngine()
 strategy_state = StrategyState()
-
 strategy_state.disable("fallback")
 
 RPC = os.getenv("RPC", "").strip()
 SOL = "So11111111111111111111111111111111111111112"
 
-MODE = os.getenv("MODE", "REAL").upper()
+MODE = os.getenv("MODE", "PAPER").upper()
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.0025"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.08"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.12"))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.04"))
+BASE_TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.12"))
+BASE_STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.04"))
 TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.06"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
@@ -61,7 +54,6 @@ CANDIDATES = set()
 def source_name(alpha_score_value: float, source_hint: str = None) -> str:
     if source_hint:
         return source_hint
-
     if alpha_score_value >= 1500:
         return "liquidity"
     if alpha_score_value >= 1000:
@@ -83,27 +75,20 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
 
 def strategy_cap_ratio(source: str) -> float:
     caps = {
-        "liquidity": 0.30,
-        "insider": 0.25,
-        "real_smart": 0.25,
-        "auto_smart": 0.18,
-        "smart_money": 0.18,
+        "liquidity": 0.20,
+        "insider": 0.18,
+        "real_smart": 0.18,
+        "auto_smart": 0.15,
+        "smart_money": 0.15,
         "fusion_liquidity": 0.15,
-        "fusion_momentum": 0.18,
-        "fusion_volume": 0.15,
-        "fusion_anti_rug": 0.12,
-        "fusion_fallback": 0.03,
-        "fast_buy": 0.10,
-        "early_buy": 0.08,
-        "fallback": 0.05,
+        "fusion_momentum": 0.12,
+        "fusion_volume": 0.10,
+        "fusion_anti_rug": 0.10,
+        "fast_buy": 0.05,
+        "early_buy": 0.04,
+        "fallback": 0.00,
     }
-    return caps.get(source, 0.10)
-
-
-def calc_position_size() -> float:
-    capital = max(engine.capital, 0.0)
-    raw = capital * RISK_PCT_PER_TRADE
-    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, raw))
+    return caps.get(source, 0.08)
 
 
 def allocated_exposure_for_source(source: str) -> float:
@@ -111,12 +96,10 @@ def allocated_exposure_for_source(source: str) -> float:
     for p in engine.positions:
         if p.get("source") != source:
             continue
-
         entry = float(p.get("entry_price", 0.0) or 0.0)
         amount = float(p.get("amount", 0.0) or 0.0)
         if entry > 0 and amount > 0:
             total += entry * amount
-
     return total
 
 
@@ -127,20 +110,13 @@ def weighted_position_size(source: str) -> float:
 
     base = capital * RISK_PCT_PER_TRADE
     w = strategy_state.weight(source)
-
     if w <= 0:
         return 0.0
 
     size = base * w
 
-    if source == "fallback":
-        size *= 0.3
-
     if source in ["early_buy", "fast_buy"]:
-        size *= 0.7
-
-    if w > 1.2:
-        size *= 1.2
+        size *= 0.5
 
     size = min(size, MAX_POSITION_SOL)
 
@@ -148,14 +124,7 @@ def weighted_position_size(source: str) -> float:
     source_cap = capital * cap_ratio
     current_exposure = allocated_exposure_for_source(source)
     remaining = max(0.0, source_cap - current_exposure)
-
     size = min(size, remaining)
-
-    if size < MIN_POSITION_SOL:
-        return 0.0
-
-    available = max(0.0, capital * 0.95)
-    size = min(size, available)
 
     if size < MIN_POSITION_SOL:
         return 0.0
@@ -163,17 +132,20 @@ def weighted_position_size(source: str) -> float:
     return size
 
 
+def dynamic_size(size: float, strength: float) -> float:
+    if strength > 0.04:
+        return min(size * 1.4, MAX_POSITION_SOL)
+    if strength > 0.02:
+        return min(size * 1.15, MAX_POSITION_SOL)
+    return max(size * 0.85, MIN_POSITION_SOL)
+
+
 async def rpc_post(method: str, params: list):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(
                 RPC,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params,
-                },
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             )
         return r.json()
     except Exception as e:
@@ -228,7 +200,6 @@ async def sync_positions():
         info = item["account"]["data"]["parsed"]["info"]
         mint = info["mint"]
         amount = float(info["tokenAmount"].get("uiAmount") or 0)
-
         if amount > 0:
             old = old_map.get(mint, {})
             old_entry = old.get("entry_price", 0.0)
@@ -262,15 +233,12 @@ async def get_price(mint: str):
                     "slippageBps": 100,
                 },
             )
-
         if r.status_code != 200:
             return None
-
         data = r.json()
         out_amount = data.get("outAmount")
         if not out_amount:
             return None
-
         out_sol = int(out_amount) / 1e9
         return out_sol / 1_000_000
     except Exception as e:
@@ -290,10 +258,8 @@ async def get_liquidity_and_impact(mint: str):
                     "slippageBps": 200,
                 },
             )
-
         if r.status_code != 200:
             return 0, 1
-
         data = r.json()
         out = int(data.get("outAmount", 0) or 0)
         impact = float(data.get("priceImpactPct", 1) or 1)
@@ -304,9 +270,9 @@ async def get_liquidity_and_impact(mint: str):
 
 async def momentum_confirm(mint: str):
     p1 = await get_price(mint)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.15)
     p2 = await get_price(mint)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.20)
     p3 = await get_price(mint)
 
     if not p1 or not p2 or not p3 or p1 <= 0 or p2 <= 0:
@@ -314,8 +280,9 @@ async def momentum_confirm(mint: str):
 
     m1 = (p2 - p1) / p1
     m2 = (p3 - p2) / p2
+    total = (p3 - p1) / p1
 
-    if m1 > 0.01 and m2 > 0.01:
+    if m1 > 0.005 and m2 > 0.005 and total > 0.012:
         return True, (m1 + m2)
 
     return False, 0.0
@@ -323,13 +290,10 @@ async def momentum_confirm(mint: str):
 
 async def fake_pump_filter(mint: str):
     liq, impact = await get_liquidity_and_impact(mint)
-
     if impact > 0.28:
         return False
-
     if liq < 80000:
         return False
-
     return True
 
 
@@ -357,45 +321,6 @@ async def should_enter_v4(mint: str, smart_wallets: list):
     return True, "ok", strength
 
 
-def dynamic_size(size: float, strength: float) -> float:
-    if strength > 0.04:
-        return min(size * 1.5, MAX_POSITION_SOL)
-    if strength > 0.02:
-        return min(size * 1.2, MAX_POSITION_SOL)
-    return max(size * 0.8, MIN_POSITION_SOL)
-
-
-async def send_signed_tx(signed_tx: str):
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                RPC,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        signed_tx,
-                        {
-                            "skipPreflight": True,
-                            "encoding": "base64",
-                        },
-                    ],
-                },
-            )
-
-        if r.status_code != 200:
-            return None, f"SEND TX FAILED: {r.text}"
-
-        data = r.json()
-        if "error" in data:
-            return None, f"RPC ERROR: {data['error']}"
-
-        return data, None
-    except Exception as e:
-        return None, f"SEND TX EXCEPTION: {e}"
-
-
 async def rug_filter(mint: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -408,17 +333,14 @@ async def rug_filter(mint: str) -> bool:
                     "slippageBps": 200,
                 },
             )
-
         data = r.json()
         out_amount = int(data.get("outAmount", 0) or 0)
         impact = float(data.get("priceImpactPct", 1) or 1)
 
         if out_amount == 0:
             return True
-
         if impact > 0.4:
             return False
-
         return True
     except Exception:
         return False
@@ -426,6 +348,28 @@ async def rug_filter(mint: str) -> bool:
 
 def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
+
+
+async def send_signed_tx(signed_tx: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                RPC,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "sendTransaction",
+                    "params": [signed_tx, {"skipPreflight": True, "encoding": "base64"}],
+                },
+            )
+        if r.status_code != 200:
+            return None, f"SEND TX FAILED: {r.text}"
+        data = r.json()
+        if "error" in data:
+            return None, f"RPC ERROR: {data['error']}"
+        return data, None
+    except Exception as e:
+        return None, f"SEND TX EXCEPTION: {e}"
 
 
 async def place_buy_order(mint: str, size_sol: float):
@@ -465,11 +409,8 @@ async def place_buy_order(mint: str, size_sol: float):
         pass
 
     entry = 0.0
-    try:
-        if token_amount > 0:
-            entry = size_sol / token_amount
-    except Exception:
-        pass
+    if token_amount > 0:
+        entry = size_sol / token_amount
 
     if entry <= 0:
         price_now = await get_price(mint)
@@ -482,12 +423,7 @@ async def place_buy_order(mint: str, size_sol: float):
     return sig_json, token_amount, entry
 
 
-async def buy(
-    mint: str,
-    alpha_score_value: float = 0.0,
-    source_hint: str = None,
-    size_override: float = None,
-):
+async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None, size_override: float = None):
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
@@ -501,7 +437,6 @@ async def buy(
         return
 
     src = source_name(alpha_score_value, source_hint)
-
     if not strategy_state.enabled(src):
         engine.log(f"STRATEGY DISABLED {src}")
         return
@@ -516,12 +451,7 @@ async def buy(
         if not price:
             return
 
-        paper.buy(
-            mint=mint,
-            price=price,
-            size=size,
-            source=src,
-        )
+        paper.buy(mint=mint, price=price, size=size, source=src)
         strategy_state.record_buy(src)
 
         engine.positions.append({
@@ -544,24 +474,12 @@ async def buy(
             "price": price,
             "size": size,
             "source": src,
-            "weight": strategy_state.weight(src),
-            "cap_ratio": strategy_cap_ratio(src),
         })
         engine.trade_history = engine.trade_history[-100:]
         engine.log(
-            f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} "
-            f"w={strategy_state.weight(src):.2f} cap={strategy_cap_ratio(src):.2f} size={size:.6f}"
+            f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} size={size:.6f}"
         )
         return
-
-    if MODE != "REAL":
-        engine.log("UNKNOWN MODE: buy skipped")
-        return
-
-    engine.log(
-        f"TRY BUY {mint[:8]} size={size:.6f} src={src} "
-        f"w={strategy_state.weight(src):.2f} cap={strategy_cap_ratio(src):.2f}"
-    )
 
     sig_json, token_amount, entry = await place_buy_order(mint, size)
     if not sig_json:
@@ -590,8 +508,6 @@ async def buy(
         "mint": mint,
         "result": sig_json,
         "source": src,
-        "weight": strategy_state.weight(src),
-        "cap_ratio": strategy_cap_ratio(src),
     })
     engine.trade_history = engine.trade_history[-100:]
     engine.log(f"BUY SUCCESS {mint[:8]}")
@@ -613,12 +529,7 @@ async def add_to_winner(position: dict):
         if not price:
             return
 
-        paper.buy(
-            mint=mint,
-            price=price,
-            size=add_size,
-            source=src,
-        )
+        paper.buy(mint=mint, price=price, size=add_size, source=src)
         strategy_state.record_buy(src)
 
         old_amount = position["amount"]
@@ -626,10 +537,7 @@ async def add_to_winner(position: dict):
         add_amount = add_size / price if price > 0 else 0.0
 
         new_amount = old_amount + add_amount
-        if new_amount > 0:
-            blended_entry = ((old_amount * old_entry) + (add_amount * price)) / new_amount
-        else:
-            blended_entry = old_entry
+        blended_entry = ((old_amount * old_entry) + (add_amount * price)) / new_amount if new_amount > 0 else old_entry
 
         position["amount"] = new_amount
         position["entry_price"] = blended_entry
@@ -639,50 +547,8 @@ async def add_to_winner(position: dict):
 
         engine.stats["adds"] += 1
         engine.last_trade = f"PAPER ADD {mint[:8]}"
-        engine.log(
-            f"🟡 PAPER ADD {mint[:8]} src={src} "
-            f"w={strategy_state.weight(src):.2f} size={add_size:.6f}"
-        )
+        engine.log(f"🟡 PAPER ADD {mint[:8]} src={src} size={add_size:.6f}")
         return
-
-    if MODE != "REAL":
-        return
-
-    engine.log(f"TRY ADD {mint[:8]} size={add_size:.6f}")
-
-    sig_json, add_token_amount, add_entry = await place_buy_order(mint, add_size)
-    if not sig_json:
-        engine.stats["errors"] += 1
-        engine.log("ADD FAILED")
-        return
-
-    strategy_state.record_buy(src)
-
-    old_amount = position["amount"]
-    old_entry = position["entry_price"]
-
-    new_amount = old_amount + add_token_amount
-    if new_amount > 0:
-        blended_entry = ((old_amount * old_entry) + (add_token_amount * add_entry)) / new_amount
-    else:
-        blended_entry = old_entry
-
-    position["amount"] = new_amount
-    position["entry_price"] = blended_entry
-    position["last_price"] = blended_entry
-    position["peak_price"] = max(position.get("peak_price", blended_entry), blended_entry)
-    position["adds"] = position.get("adds", 0) + 1
-
-    engine.stats["adds"] += 1
-    engine.last_trade = f"ADD {mint[:8]}"
-    engine.trade_history.append({
-        "side": "ADD",
-        "mint": mint,
-        "source": src,
-        "result": sig_json,
-    })
-    engine.trade_history = engine.trade_history[-100:]
-    engine.log(f"ADD SUCCESS {mint[:8]}")
 
 
 async def sell(position: dict):
@@ -697,12 +563,8 @@ async def sell(position: dict):
         final_source = source_from_engine or src
 
         strategy_state.record_sell(final_source, pnl)
-        strategy_state.maybe_disable(final_source)
 
-        engine.positions = [
-            p for p in engine.positions if p["token"] != position["token"]
-        ]
-
+        engine.positions = [p for p in engine.positions if p["token"] != position["token"]]
         engine.stats["sells"] += 1
         engine.last_trade = f"PAPER SELL {position['token'][:8]}"
         engine.trade_history.append({
@@ -716,70 +578,13 @@ async def sell(position: dict):
         engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f} src={final_source}")
         return
 
-    if MODE != "REAL":
-        engine.log("UNKNOWN MODE: sell skipped")
-        return
-
-    kp = load_keypair()
-    if not kp:
-        engine.log("SELL FAILED: no key")
-        return
-
-    mint = position["token"]
-    amount_atomic = int(position["amount"] * 1_000_000)
-
-    engine.log(f"TRY SELL {mint[:8]}")
-
-    order = await get_order(
-        input_mint=mint,
-        output_mint=SOL,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
-    )
-    if not order:
-        engine.stats["errors"] += 1
-        engine.log("SELL ORDER FAIL")
-        return
-
-    result = await execute_order(order, kp)
-    if not result:
-        engine.stats["errors"] += 1
-        engine.log("SELL EXEC FAIL")
-        return
-
-    signed_tx = result.get("signed_tx")
-    if not signed_tx:
-        engine.stats["errors"] += 1
-        engine.log("SELL NO SIGNED TX")
-        return
-
-    sig_json, err = await send_signed_tx(signed_tx)
-    if err:
-        engine.stats["errors"] += 1
-        engine.log(err)
-        return
-
-    pnl = position.get("pnl_pct", 0.0)
-    strategy_state.record_sell(src, pnl)
-    strategy_state.maybe_disable(src)
-
-    engine.positions = [p for p in engine.positions if p["token"] != mint]
-    engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {mint[:8]}"
-    engine.trade_history.append({
-        "side": "SELL",
-        "mint": mint,
-        "result": sig_json,
-        "source": src,
-        "pnl_pct": pnl,
-    })
-    engine.trade_history = engine.trade_history[-100:]
-    engine.log(f"SELL SUCCESS {mint[:8]}")
-
 
 async def monitor():
     while True:
         try:
+            take_profit = regime_take_profit(REGIME, BASE_TAKE_PROFIT)
+            stop_loss = regime_stop_loss(REGIME, BASE_STOP_LOSS)
+
             if ENABLE_AUTO_SELL:
                 for p in list(engine.positions):
                     price = await get_price(p["token"])
@@ -788,16 +593,7 @@ async def monitor():
 
                     entry = p.get("entry_price", 0.0)
                     if not entry or entry <= 0:
-                        price_now = await get_price(p["token"])
-                        if price_now and price_now > 0:
-                            p["entry_price"] = price_now
-                            p["last_price"] = price_now
-                            p["peak_price"] = max(p.get("peak_price", 0.0), price_now)
-                            entry = price_now
-                            engine.log(f"FIX ENTRY PRICE {p['token'][:8]} {entry}")
-                        else:
-                            engine.log("SKIP MONITOR: invalid entry_price")
-                            continue
+                        continue
 
                     p["last_price"] = price
                     p["peak_price"] = max(p.get("peak_price", price), price)
@@ -810,12 +606,12 @@ async def monitor():
                     if ADD_ON_WIN and pnl >= ADD_TRIGGER_PCT and p.get("adds", 0) < MAX_ADDS_PER_POSITION:
                         await add_to_winner(p)
 
-                    if pnl >= TAKE_PROFIT:
+                    if take_profit > 0 and pnl >= take_profit:
                         engine.log("TAKE PROFIT HIT")
                         await sell(p)
                         continue
 
-                    if pnl <= -STOP_LOSS:
+                    if pnl <= -stop_loss:
                         engine.log("STOP LOSS HIT")
                         await sell(p)
                         continue
@@ -860,15 +656,43 @@ async def handle_mempool(event: dict):
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
 
+
+async def detect_regime():
+    global REGIME
+
+    ups = 0
+    downs = 0
+
+    for mint in list(CANDIDATES)[-12:]:
+        p1 = await get_price(mint)
+        await asyncio.sleep(0.05)
+        p2 = await get_price(mint)
+
+        if not p1 or not p2:
+            continue
+
+        if p2 > p1:
+            ups += 1
+        else:
+            downs += 1
+
+    if ups >= 6 and ups > downs * 1.5:
+        REGIME = "bull"
+    elif downs >= 6 and downs > ups * 1.5:
+        REGIME = "trash"
+    else:
+        REGIME = "chop"
+
+    return REGIME
+
+
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V4 STABLE BOT LOADED")
+    engine.log("🚨 V8 SCAFFOLD BOT LOADED")
     engine.log("🛡️ NO FALLBACK MODE")
-
     engine.mode = MODE
-    engine.log("🔥 STABLE ALPHA V4 START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -880,67 +704,56 @@ async def bot_loop():
 
             now = asyncio.get_event_loop().time()
 
-            # ================= SMART WALLET =================
+            regime = await detect_regime()
+            engine.log(f"📊 REGIME {regime}")
+
             if now - LAST_SMART_WALLET_REFRESH > 5:
-                raw_wallets = await auto_discover_smart_wallets(
-                    RPC, CANDIDATES, max_wallets=20
-                )
-
-                if not raw_wallets:
-                    raw_wallets = [f"FALLBACK_{i}" for i in range(5)]
-
-                AUTO_SMART_WALLETS = await rank_wallets(raw_wallets)
+                raw_wallets = await auto_discover_smart_wallets(RPC, CANDIDATES, max_wallets=20)
+                AUTO_SMART_WALLETS = await rank_wallets(raw_wallets or [])
                 LAST_SMART_WALLET_REFRESH = now
-
-                engine.log(f"SMART RAW {len(raw_wallets)}")
+                engine.log(f"SMART RAW {len(raw_wallets or [])}")
                 engine.log(f"SMART RANKED {len(AUTO_SMART_WALLETS)}")
 
             if now - LAST_REAL_REFRESH > 15:
                 REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
-
-                if not REAL_SMART_WALLETS:
-                    REAL_SMART_WALLETS = [f"REAL_FB_{i}" for i in range(3)]
-
                 LAST_REAL_REFRESH = now
                 engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
 
             traded = False
 
-            # ================= 🔥 核心進場（唯一入口） =================
-            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+            if regime != "trash":
+                fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
 
-            if fusion_mint and not has_position(fusion_mint):
-                ok, reason, strength = await should_enter_v4(
-                    fusion_mint,
-                    AUTO_SMART_WALLETS
-                )
+                if fusion_mint and not has_position(fusion_mint):
+                    ok, reason, strength = await should_enter_v4(
+                        fusion_mint,
+                        AUTO_SMART_WALLETS
+                    )
 
-                if not ok:
-                    engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
-                else:
-                    if len(engine.positions) < MAX_POSITIONS:
+                    if not ok:
+                        engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
+                    else:
                         preview_size = weighted_position_size(fusion_source)
-                        final_size = dynamic_size(preview_size, strength)
+                        regime_mult = regime_risk_multiplier(regime)
+                        final_size = dynamic_size(preview_size * regime_mult, strength)
 
-                        engine.log(
-                            f"🧠 V4 ENTRY {fusion_source} {fusion_mint[:8]} "
-                            f"score={fusion_score:.2f} strength={strength:.4f} "
-                            f"size={final_size:.6f}"
-                        )
+                        if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
+                            engine.log(
+                                f"🧠 ENTRY {fusion_source} {fusion_mint[:8]} "
+                                f"score={fusion_score:.2f} regime={regime} "
+                                f"strength={strength:.4f} size={final_size:.6f}"
+                            )
+                            await buy(
+                                fusion_mint,
+                                fusion_score,
+                                source_hint=fusion_source,
+                                size_override=final_size,
+                            )
+                            traded = True
 
-                        await buy(
-                            fusion_mint,
-                            fusion_score,
-                            source_hint=fusion_source,
-                            size_override=final_size,
-                        )
-                        traded = True
-
-            # ================= 🚫 無 fallback（關鍵） =================
             if not traded:
-                engine.log("🚫 NO TRADE (all signals filtered)")
+                engine.log("🚫 NO TRADE (all signals filtered / bad regime)")
 
-            # ================= 統計 =================
             engine.stats["signals"] += 1
 
             total, by_source = paper.stats()
@@ -956,8 +769,7 @@ async def bot_loop():
                 engine.log(
                     f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} "
                     f"cap={strategy_cap_ratio(name):.2f} buys={s['buys']} sells={s['sells']} "
-                    f"wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f} "
-                    f"loss_streak={s['loss_streak']}"
+                    f"wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f}"
                 )
 
             engine.log("LOOP RUNNING")
