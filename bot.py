@@ -778,6 +778,8 @@ async def handle_mempool(event: dict):
 
 
 async def bot_loop():
+engine.log("🚨 V3 BOT LOOP LOADED")
+engine.log("🚨 alpha_fusion import OK")
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
