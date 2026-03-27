@@ -858,16 +858,15 @@ async def handle_mempool(event: dict):
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
 
-
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V4 BOT LOOP LOADED")
-    engine.log("🚨 alpha_fusion import OK")
+    engine.log("🚨 V4 STABLE BOT LOADED")
+    engine.log("🛡️ NO FALLBACK MODE")
 
     engine.mode = MODE
-    engine.log("🔥 PHASE ALLOCATOR + ALPHA V4 START")
+    engine.log("🔥 STABLE ALPHA V4 START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -905,7 +904,7 @@ async def bot_loop():
 
             traded = False
 
-            # ================= 🔥 ALPHA V4（核心） =================
+            # ================= 🔥 核心進場（唯一入口） =================
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
 
             if fusion_mint and not has_position(fusion_mint):
@@ -924,7 +923,7 @@ async def bot_loop():
                         engine.log(
                             f"🧠 V4 ENTRY {fusion_source} {fusion_mint[:8]} "
                             f"score={fusion_score:.2f} strength={strength:.4f} "
-                            f"base={preview_size:.6f} final={final_size:.6f}"
+                            f"size={final_size:.6f}"
                         )
 
                         await buy(
@@ -935,108 +934,11 @@ async def bot_loop():
                         )
                         traded = True
 
-            # ================= 舊 alpha 層（只有 fusion 沒出手才跑） =================
+            # ================= 🚫 無 fallback（關鍵） =================
             if not traded:
-                liq = await liquidity_signal(RPC)
-                if liq and not has_position(liq):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("liquidity"):
-                        engine.log(f"🔥 LIQ {liq[:8]}")
-                        await buy(liq, 1500)
-                        traded = True
+                engine.log("🚫 NO TRADE (all signals filtered)")
 
-            if not traded:
-                ins = await insider_signal(RPC)
-                if ins and not has_position(ins):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("insider"):
-                        engine.log(f"🔥 INSIDER {ins[:8]}")
-                        await buy(ins, 1000)
-                        traded = True
-
-            if not traded:
-                auto_mint = await smart_wallet_signal_from_auto(
-                    RPC, AUTO_SMART_WALLETS, CANDIDATES
-                )
-                if auto_mint and not has_position(auto_mint):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("auto_smart"):
-                        ok, reason, strength = await should_enter_v4(
-                            auto_mint,
-                            AUTO_SMART_WALLETS
-                        )
-
-                        if not ok:
-                            engine.log(f"❌ AUTO SMART FILTERED {auto_mint[:8]} reason={reason}")
-                        else:
-                            preview_size = weighted_position_size("auto_smart")
-                            final_size = dynamic_size(preview_size, strength)
-
-                            engine.log(
-                                f"🔥 AUTO SMART V4 {auto_mint[:8]} "
-                                f"strength={strength:.4f} "
-                                f"base={preview_size:.6f} final={final_size:.6f}"
-                            )
-
-                            await buy(
-                                auto_mint,
-                                700,
-                                source_hint="auto_smart",
-                                size_override=final_size,
-                            )
-                            traded = True
-
-            if not traded:
-                real_mint = await real_smart_signal(
-                    RPC, REAL_SMART_WALLETS, CANDIDATES
-                )
-                if real_mint and not has_position(real_mint):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("real_smart"):
-                        ok, reason, strength = await should_enter_v4(
-                            real_mint,
-                            REAL_SMART_WALLETS
-                        )
-
-                        if not ok:
-                            engine.log(f"❌ REAL SMART FILTERED {real_mint[:8]} reason={reason}")
-                        else:
-                            preview_size = weighted_position_size("real_smart")
-                            final_size = dynamic_size(preview_size, strength)
-
-                            engine.log(
-                                f"🔥 REAL SMART V4 {real_mint[:8]} "
-                                f"strength={strength:.4f} "
-                                f"base={preview_size:.6f} final={final_size:.6f}"
-                            )
-
-                            await buy(
-                                real_mint,
-                                900,
-                                source_hint="real_smart",
-                                size_override=final_size,
-                            )
-                            traded = True
-
-            if not traded:
-                ranked = await rank_candidates(CANDIDATES)
-                if ranked:
-                    best = ranked[0]
-                    mint = best["mint"]
-                    score = best["score"]
-
-                    rank_src = f"alpha_{round(score, 2)}"
-                    engine.log(f"BEST {mint[:8]} {score:.2f}")
-
-                    if score > 20 and not has_position(mint):
-                        if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled(rank_src):
-                            engine.log("🔥 RANK BUY")
-                            await buy(mint, score)
-                            traded = True
-
-            if not traded and CANDIDATES:
-                mint = random.choice(list(CANDIDATES))
-                if not has_position(mint):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("fallback"):
-                        engine.log(f"💣 FORCE BUY {mint[:8]}")
-                        await buy(mint, 10.0)
-
+            # ================= 統計 =================
             engine.stats["signals"] += 1
 
             total, by_source = paper.stats()
