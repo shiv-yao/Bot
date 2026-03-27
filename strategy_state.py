@@ -95,6 +95,13 @@ class StrategyState:
 
         if s["weight"] <= 0:
             s["enabled"] = False
+            
+        if s["loss_streak"] >= 3:
+            s["enabled"] = False
+
+        if s["enabled"] is False and s["total_pnl"] > 0:
+            s["enabled"] = True
+
 
     def enabled(self, source: str) -> bool:
         self.ensure(source)
