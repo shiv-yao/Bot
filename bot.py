@@ -778,8 +778,8 @@ async def handle_mempool(event: dict):
 
 
 async def bot_loop():
-engine.log("🚨 V3 BOT LOOP LOADED")
-engine.log("🚨 alpha_fusion import OK")
+    engine.log("🚨 V3 BOT LOOP LOADED")
+    engine.log("🚨 alpha_fusion import OK")
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
@@ -822,14 +822,19 @@ engine.log("🚨 alpha_fusion import OK")
             traded = False
 
             # ================= ALPHA V3（核心） =================
-            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
-            if fusion_mint and not has_position(fusion_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(
-                        f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
-                    )
-                    await buy(fusion_mint, fusion_score, source_hint=fusion_source)
-                    traded = True
+fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+
+if fusion_mint and not has_position(fusion_mint):
+    if len(engine.positions) < MAX_POSITIONS:
+        engine.log(
+            f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
+        )
+        await buy(fusion_mint, fusion_score, source_hint=fusion_source)
+        traded = True
+
+# 👉 這行很重要（直接阻止後面垃圾策略）
+if traded:
+    continue
                         # ================= ALPHA V3（核心） =================
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
             if fusion_mint and not has_position(fusion_mint):
