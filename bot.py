@@ -3,8 +3,6 @@ import asyncio
 import httpx
 
 from paper_engine import PaperEngine
-
-paper = PaperEngine()
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
@@ -16,6 +14,8 @@ from mempool import mempool_stream
 from wallet_graph import wallet_graph_signal
 from insider_engine import insider_signal
 from alpha_engine import rank_candidates
+
+paper = PaperEngine()
 
 RPC = os.getenv("RPC", "").strip()
 SOL = "So11111111111111111111111111111111111111112"
@@ -67,6 +67,11 @@ async def rpc_post(method: str, params: list):
 
 
 async def sync_sol_balance():
+    if MODE == "PAPER":
+        engine.sol_balance = paper.balance
+        engine.capital = paper.balance
+        return
+
     kp = load_keypair()
     if not kp:
         engine.log("SAFE MODE: no PRIVATE_KEY")
@@ -82,6 +87,9 @@ async def sync_sol_balance():
 
 
 async def sync_positions():
+    if MODE == "PAPER":
+        return
+
     kp = load_keypair()
     if not kp:
         return
@@ -107,7 +115,6 @@ async def sync_positions():
 
         if amount > 0:
             old = old_map.get(mint, {})
-
             old_entry = old.get("entry_price", 0.0)
             old_last = old.get("last_price", old_entry)
             old_peak = old.get("peak_price", old_entry)
@@ -278,10 +285,6 @@ async def place_buy_order(mint: str, size_sol: float):
 
 
 async def buy(mint: str, alpha_score_value: float = 0.0):
-    if MODE != "REAL":
-        engine.log("PAPER MODE: buy skipped")
-        return
-
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
@@ -292,6 +295,48 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
 
     if not await rug_filter(mint):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
+        return
+
+    if MODE == "PAPER":
+        price = await get_price(mint)
+        if not price:
+            return
+
+        size = calc_position_size()
+
+        paper.buy(
+            mint=mint,
+            price=price,
+            size=size,
+            source=f"alpha_{alpha_score_value}"
+        )
+
+        engine.positions.append({
+            "token": mint,
+            "amount": size / price if price > 0 else 0.0,
+            "entry_price": price,
+            "last_price": price,
+            "peak_price": price,
+            "pnl_pct": 0.0,
+            "alpha_score": alpha_score_value,
+            "adds": 0,
+        })
+
+        engine.stats["buys"] += 1
+        engine.last_trade = f"PAPER BUY {mint[:8]}"
+        engine.trade_history.append({
+            "side": "PAPER_BUY",
+            "mint": mint,
+            "price": price,
+            "size": size,
+            "source": f"alpha_{alpha_score_value}",
+        })
+        engine.trade_history = engine.trade_history[-50:]
+        engine.log(f"🟢 PAPER BUY {mint[:8]} {price}")
+        return
+
+    if MODE != "REAL":
+        engine.log("UNKNOWN MODE: buy skipped")
         return
 
     size = calc_position_size()
@@ -331,11 +376,44 @@ async def add_to_winner(position: dict):
     if position.get("adds", 0) >= MAX_ADDS_PER_POSITION:
         return
 
-    if MODE != "REAL":
-        return
-
     add_size = calc_position_size() * ADD_SIZE_MULTIPLIER
     if add_size <= 0:
+        return
+
+    if MODE == "PAPER":
+        price = await get_price(mint)
+        if not price:
+            return
+
+        paper.buy(
+            mint=mint,
+            price=price,
+            size=add_size,
+            source=f"add_{position.get('alpha_score', 0.0)}"
+        )
+
+        old_amount = position["amount"]
+        old_entry = position["entry_price"]
+        add_amount = add_size / price if price > 0 else 0.0
+
+        new_amount = old_amount + add_amount
+        if new_amount > 0:
+            blended_entry = ((old_amount * old_entry) + (add_amount * price)) / new_amount
+        else:
+            blended_entry = old_entry
+
+        position["amount"] = new_amount
+        position["entry_price"] = blended_entry
+        position["last_price"] = price
+        position["peak_price"] = max(position.get("peak_price", price), price)
+        position["adds"] = position.get("adds", 0) + 1
+
+        engine.stats["adds"] += 1
+        engine.last_trade = f"PAPER ADD {mint[:8]}"
+        engine.log(f"🟡 PAPER ADD {mint[:8]} size={add_size:.6f}")
+        return
+
+    if MODE != "REAL":
         return
 
     engine.log(f"TRY ADD {mint[:8]} size={add_size:.6f}")
@@ -373,8 +451,31 @@ async def add_to_winner(position: dict):
 
 
 async def sell(position: dict):
+    if MODE == "PAPER":
+        price = await get_price(position["token"])
+        if not price:
+            return
+
+        pnl = paper.sell(position["token"], price)
+
+        engine.positions = [
+            p for p in engine.positions if p["token"] != position["token"]
+        ]
+
+        engine.stats["sells"] += 1
+        engine.last_trade = f"PAPER SELL {position['token'][:8]}"
+        engine.trade_history.append({
+            "side": "PAPER_SELL",
+            "mint": position["token"],
+            "price": price,
+            "pnl": pnl,
+        })
+        engine.trade_history = engine.trade_history[-50:]
+        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.4f}")
+        return
+
     if MODE != "REAL":
-        engine.log("PAPER MODE: sell skipped")
+        engine.log("UNKNOWN MODE: sell skipped")
         return
 
     kp = load_keypair()
@@ -539,15 +640,12 @@ async def bot_loop():
 
             now = asyncio.get_event_loop().time()
 
-            # ================= SMART WALLET =================
-
             if now - LAST_SMART_WALLET_REFRESH > 5:
                 raw_wallets = await auto_discover_smart_wallets(
                     RPC, CANDIDATES, max_wallets=20
                 )
 
                 if not raw_wallets:
-                    # 🔥 fallback wallet
                     raw_wallets = [f"FALLBACK_{i}" for i in range(5)]
 
                 AUTO_SMART_WALLETS = await rank_wallets(raw_wallets)
@@ -560,17 +658,13 @@ async def bot_loop():
                 REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
 
                 if not REAL_SMART_WALLETS:
-                    # 🔥 fallback
                     REAL_SMART_WALLETS = [f"REAL_FB_{i}" for i in range(3)]
 
                 LAST_REAL_REFRESH = now
                 engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
 
-            # ================= ALPHA =================
-
             traded = False
 
-            # 1️⃣ liquidity
             liq = await liquidity_signal(RPC)
             if liq and not has_position(liq):
                 if len(engine.positions) < MAX_POSITIONS:
@@ -578,7 +672,6 @@ async def bot_loop():
                     await buy(liq, 1500)
                     traded = True
 
-            # 2️⃣ insider
             ins = await insider_signal(RPC)
             if ins and not has_position(ins):
                 if len(engine.positions) < MAX_POSITIONS:
@@ -586,7 +679,6 @@ async def bot_loop():
                     await buy(ins, 1000)
                     traded = True
 
-            # 3️⃣ smart wallet
             auto_mint = await smart_wallet_signal_from_auto(
                 RPC, AUTO_SMART_WALLETS, CANDIDATES
             )
@@ -597,7 +689,6 @@ async def bot_loop():
                     await buy(auto_mint, 700)
                     traded = True
 
-            # 4️⃣ real smart
             real_mint = await real_smart_signal(
                 RPC, REAL_SMART_WALLETS, CANDIDATES
             )
@@ -608,7 +699,6 @@ async def bot_loop():
                     await buy(real_mint, 900)
                     traded = True
 
-            # 5️⃣ ranking
             ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
@@ -623,8 +713,6 @@ async def bot_loop():
                         await buy(mint, score)
                         traded = True
 
-            # ================= 💣 強制 fallback =================
-
             if not traded and CANDIDATES:
                 import random
 
@@ -636,6 +724,12 @@ async def bot_loop():
                         await buy(mint, 10.0)
 
             engine.stats["signals"] += 1
+
+            total, by_source = paper.stats()
+            engine.log(f"💰 PAPER TOTAL PnL: {round(total, 4)} SOL")
+            for k, v in by_source.items():
+                engine.log(f"📊 {k} → {round(v, 4)} SOL")
+
             engine.log("LOOP RUNNING")
 
         except Exception as e:
@@ -643,10 +737,3 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
-        total, by_source = paper.stats()
-
-engine.log(f"💰 PAPER TOTAL PnL: {round(total, 4)} SOL")
-
-for k, v in by_source.items():
-    engine.log(f"📊 {k} → {round(v, 4)} SOL")
-        
