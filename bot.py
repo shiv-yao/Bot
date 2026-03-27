@@ -86,6 +86,13 @@ def strategy_cap_ratio(source: str) -> float:
         "real_smart": 0.25,
         "auto_smart": 0.18,
         "smart_money": 0.18,
+
+        "fusion_liquidity": 0.25,
+        "fusion_momentum": 0.18,
+        "fusion_volume": 0.15,
+        "fusion_anti_rug": 0.12,
+        "fusion_fallback": 0.03,
+
         "fast_buy": 0.10,
         "early_buy": 0.08,
         "fallback": 0.05,
@@ -813,12 +820,14 @@ async def bot_loop():
             traded = False
 
             # ================= ALPHA V3（核心） =================
-            fusion_mint, fusion_score = await alpha_fusion(CANDIDATES)
-            if fusion_mint and not has_position(fusion_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"🧠 ALPHA FUSION {fusion_mint[:8]} {fusion_score:.2f}")
-                    await buy(fusion_mint, fusion_score)
-                    traded = True
+            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+if fusion_mint and not has_position(fusion_mint):
+    if len(engine.positions) < MAX_POSITIONS:
+        engine.log(
+            f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
+        )
+        await buy(fusion_mint, fusion_score, source_hint=fusion_source)
+        traded = True
 
             # ================= 舊 alpha 層 =================
 
