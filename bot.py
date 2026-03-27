@@ -19,7 +19,7 @@ SOL = "So11111111111111111111111111111111111111112"
 
 MODE = os.getenv("MODE", "REAL").upper()
 
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
@@ -104,13 +104,17 @@ async def sync_positions():
 
         if amount > 0:
             old = old_map.get(mint, {})
-            entry = old.get("entry_price", 0.0)
+
+            old_entry = old.get("entry_price", 0.0)
+            old_last = old.get("last_price", old_entry)
+            old_peak = old.get("peak_price", old_entry)
+
             new_positions.append({
                 "token": mint,
                 "amount": amount,
-                "entry_price": entry,
-                "last_price": old.get("last_price", entry),
-                "peak_price": old.get("peak_price", entry),
+                "entry_price": old_entry if old_entry > 0 else 0.0,
+                "last_price": old_last if old_last > 0 else old_entry,
+                "peak_price": old_peak if old_peak > 0 else old_entry,
                 "pnl_pct": old.get("pnl_pct", 0.0),
                 "alpha_score": old.get("alpha_score", 0.0),
                 "adds": old.get("adds", 0),
@@ -497,6 +501,7 @@ async def handle_mempool(event: dict):
             CANDIDATES.pop()
 
         engine.log(f"CANDIDATE ADD {mint[:8]}")
+        engine.log(f"CANDIDATES SIZE {len(CANDIDATES)}")
 
         if len(engine.positions) < MAX_POSITIONS:
             if mint not in [p["token"] for p in engine.positions]:
@@ -512,6 +517,7 @@ async def handle_mempool(event: dict):
     except Exception as e:
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
+
 
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
@@ -598,13 +604,12 @@ async def bot_loop():
                 engine.last_signal = f"alpha:{score:.2f}"
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
-                # 🔥 Phase N：只有有 smart wallets 時才讓 ranking 買
                 if score > 25 and not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS:
                         if len(AUTO_SMART_WALLETS) > 0 or len(REAL_SMART_WALLETS) > 0:
                             await buy(mint, alpha_score_value=score)
 
-            # 9. fallback alpha（保底進場，避免完全沒交易）
+            # 9. fallback alpha（保底進場）
             if CANDIDATES:
                 import random
 
@@ -622,4 +627,3 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
-
