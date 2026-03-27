@@ -79,7 +79,7 @@ async def liquidity_alpha(candidates: set):
             best = mint
             best_score = score
 
-    if best and best_score > 500000:
+    if best and best_score > 50000:
         return best, 1500
 
     return None, 0
