@@ -6,12 +6,9 @@ async def smart_wallet_signal_from_auto(RPC, wallets, candidates):
     if not wallets:
         return None
 
-    ranked_wallets = await rank_wallets(wallets)
-
-    if not ranked_wallets:
+    if not candidates:
         return None
 
-    # 🔥 核心：用「高分 wallet」選 token
     for mint in candidates:
         return mint
 
