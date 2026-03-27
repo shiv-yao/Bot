@@ -3,6 +3,8 @@ import asyncio
 import random
 import httpx
 
+from alpha_boost_v3 import alpha_fusion
+
 from alpha_boost import (
     wallet_graph_alpha,
     insider_early_alpha,
