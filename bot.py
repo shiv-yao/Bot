@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 import httpx
 
 from paper_engine import PaperEngine
@@ -67,17 +68,81 @@ def source_name(alpha_score_value: float) -> str:
     return f"alpha_{round(alpha_score_value, 2)}"
 
 
+def strategy_cap_ratio(source: str) -> float:
+    caps = {
+        "liquidity": 0.30,
+        "insider": 0.25,
+        "real_smart": 0.25,
+        "auto_smart": 0.18,
+        "smart_money": 0.18,
+        "fast_buy": 0.10,
+        "early_buy": 0.08,
+        "fallback": 0.05,
+    }
+    return caps.get(source, 0.10)
+
+
+def calc_position_size() -> float:
+    capital = max(engine.capital, 0.0)
+    raw = capital * RISK_PCT_PER_TRADE
+    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, raw))
+
+
+def allocated_exposure_for_source(source: str) -> float:
+    total = 0.0
+    for p in engine.positions:
+        if p.get("source") != source:
+            continue
+
+        entry = float(p.get("entry_price", 0.0) or 0.0)
+        amount = float(p.get("amount", 0.0) or 0.0)
+        if entry > 0 and amount > 0:
+            total += entry * amount
+
+    return total
+
+
 def weighted_position_size(source: str) -> float:
     capital = max(engine.capital, 0.0)
-    base = capital * RISK_PCT_PER_TRADE
-    base = max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, base))
+    if capital <= 0:
+        return 0.0
 
+    base = capital * RISK_PCT_PER_TRADE
     w = strategy_state.weight(source)
+
     if w <= 0:
         return 0.0
 
-    sized = base * w
-    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, sized))
+    size = base * w
+
+    if source == "fallback":
+        size *= 0.3
+
+    if source in ["early_buy", "fast_buy"]:
+        size *= 0.7
+
+    if w > 1.2:
+        size *= 1.2
+
+    size = min(size, MAX_POSITION_SOL)
+
+    cap_ratio = strategy_cap_ratio(source)
+    source_cap = capital * cap_ratio
+    current_exposure = allocated_exposure_for_source(source)
+    remaining = max(0.0, source_cap - current_exposure)
+
+    size = min(size, remaining)
+
+    if size < MIN_POSITION_SOL:
+        return 0.0
+
+    available = max(0.0, capital * 0.95)
+    size = min(size, available)
+
+    if size < MIN_POSITION_SOL:
+        return 0.0
+
+    return size
 
 
 async def rpc_post(method: str, params: list):
@@ -326,6 +391,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         return
 
     src = source_name(alpha_score_value)
+
     if not strategy_state.enabled(src):
         engine.log(f"STRATEGY DISABLED {src}")
         return
@@ -369,16 +435,23 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
             "size": size,
             "source": src,
             "weight": strategy_state.weight(src),
+            "cap_ratio": strategy_cap_ratio(src),
         })
         engine.trade_history = engine.trade_history[-100:]
-        engine.log(f"🟢 PAPER BUY {mint[:8]} {price} src={src} w={strategy_state.weight(src):.2f} size={size:.6f}")
+        engine.log(
+            f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} "
+            f"w={strategy_state.weight(src):.2f} cap={strategy_cap_ratio(src):.2f} size={size:.6f}"
+        )
         return
 
     if MODE != "REAL":
         engine.log("UNKNOWN MODE: buy skipped")
         return
 
-    engine.log(f"TRY BUY {mint[:8]} size={size:.6f} src={src} w={strategy_state.weight(src):.2f}")
+    engine.log(
+        f"TRY BUY {mint[:8]} size={size:.6f} src={src} "
+        f"w={strategy_state.weight(src):.2f} cap={strategy_cap_ratio(src):.2f}"
+    )
 
     sig_json, token_amount, entry = await place_buy_order(mint, size)
     if not sig_json:
@@ -408,6 +481,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         "result": sig_json,
         "source": src,
         "weight": strategy_state.weight(src),
+        "cap_ratio": strategy_cap_ratio(src),
     })
     engine.trade_history = engine.trade_history[-100:]
     engine.log(f"BUY SUCCESS {mint[:8]}")
@@ -455,7 +529,10 @@ async def add_to_winner(position: dict):
 
         engine.stats["adds"] += 1
         engine.last_trade = f"PAPER ADD {mint[:8]}"
-        engine.log(f"🟡 PAPER ADD {mint[:8]} src={src} size={add_size:.6f}")
+        engine.log(
+            f"🟡 PAPER ADD {mint[:8]} src={src} "
+            f"w={strategy_state.weight(src):.2f} size={add_size:.6f}"
+        )
         return
 
     if MODE != "REAL":
@@ -670,8 +747,6 @@ async def handle_mempool(event: dict):
 
         if len(engine.positions) < MAX_POSITIONS:
             if mint not in [p["token"] for p in engine.positions]:
-                import random
-
                 if random.random() < 0.4:
                     engine.log(f"EARLY BUY {mint[:8]}")
                     asyncio.create_task(buy(mint, alpha_score_value=35.0))
@@ -689,7 +764,7 @@ async def bot_loop():
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("🔥 PHASE AUTO-WEIGHT FINAL START")
+    engine.log("🔥 PHASE ALLOCATOR FINAL START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -774,8 +849,6 @@ async def bot_loop():
                         traded = True
 
             if not traded and CANDIDATES:
-                import random
-
                 mint = random.choice(list(CANDIDATES))
                 if not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("fallback"):
@@ -789,12 +862,16 @@ async def bot_loop():
 
             for k, v in by_source.items():
                 engine.log(
-                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} total={v['total_pnl']:.9f} avg={v['avg_pnl']:.9f}"
+                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} "
+                    f"total={v['total_pnl']:.9f} avg={v['avg_pnl']:.9f}"
                 )
 
             for name, s in strategy_state.summary().items():
                 engine.log(
-                    f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} buys={s['buys']} sells={s['sells']} wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f} loss_streak={s['loss_streak']}"
+                    f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} "
+                    f"cap={strategy_cap_ratio(name):.2f} buys={s['buys']} sells={s['sells']} "
+                    f"wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f} "
+                    f"loss_streak={s['loss_streak']}"
                 )
 
             engine.log("LOOP RUNNING")
