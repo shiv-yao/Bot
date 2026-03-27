@@ -524,7 +524,7 @@ async def bot_loop():
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("PHASE N START")
+    engine.log("🔥 PHASE N FALLBACK START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -536,88 +536,101 @@ async def bot_loop():
 
             now = asyncio.get_event_loop().time()
 
-            # 1. auto smart wallet refresh（raw -> ranked）
+            # ================= SMART WALLET =================
+
             if now - LAST_SMART_WALLET_REFRESH > 5:
                 raw_wallets = await auto_discover_smart_wallets(
                     RPC, CANDIDATES, max_wallets=20
                 )
+
+                if not raw_wallets:
+                    # 🔥 fallback wallet
+                    raw_wallets = [f"FALLBACK_{i}" for i in range(5)]
+
                 AUTO_SMART_WALLETS = await rank_wallets(raw_wallets)
                 LAST_SMART_WALLET_REFRESH = now
 
-                engine.log(f"SMART WALLET RAW {len(raw_wallets)}")
-                engine.log(
-                    f"SMART WALLET RANKED {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:5]}"
-                )
+                engine.log(f"SMART RAW {len(raw_wallets)}")
+                engine.log(f"SMART RANKED {len(AUTO_SMART_WALLETS)}")
 
-            # 2. real smart wallet refresh
             if now - LAST_REAL_REFRESH > 15:
                 REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
+
+                if not REAL_SMART_WALLETS:
+                    # 🔥 fallback
+                    REAL_SMART_WALLETS = [f"REAL_FB_{i}" for i in range(3)]
+
                 LAST_REAL_REFRESH = now
-                engine.log(
-                    f"REAL SMART {len(REAL_SMART_WALLETS)} {REAL_SMART_WALLETS[:5]}"
-                )
+                engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
 
-            # 3. liquidity alpha
-            liq_mint = await liquidity_signal(RPC)
-            if liq_mint and not has_position(liq_mint):
+            # ================= ALPHA =================
+
+            traded = False
+
+            # 1️⃣ liquidity
+            liq = await liquidity_signal(RPC)
+            if liq and not has_position(liq):
                 if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"LIQUIDITY ADD {liq_mint[:8]}")
-                    await buy(liq_mint, alpha_score_value=1500.0)
+                    engine.log(f"🔥 LIQ {liq[:8]}")
+                    await buy(liq, 1500)
+                    traded = True
 
-            # 4. insider alpha
-            insider_mint = await insider_signal(RPC)
-            if insider_mint and not has_position(insider_mint):
+            # 2️⃣ insider
+            ins = await insider_signal(RPC)
+            if ins and not has_position(ins):
                 if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"INSIDER HIT {insider_mint[:8]}")
-                    await buy(insider_mint, alpha_score_value=1000.0)
+                    engine.log(f"🔥 INSIDER {ins[:8]}")
+                    await buy(ins, 1000)
+                    traded = True
 
-            # 5. smart money alpha
-            smart_money_mint = await wallet_graph_signal(RPC)
-            if smart_money_mint and not has_position(smart_money_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
-                    await buy(smart_money_mint, alpha_score_value=500.0)
-
-            # 6. ranked auto smart wallet alpha
-            auto_smart_mint = await smart_wallet_signal_from_auto(
+            # 3️⃣ smart wallet
+            auto_mint = await smart_wallet_signal_from_auto(
                 RPC, AUTO_SMART_WALLETS, CANDIDATES
             )
-            if auto_smart_mint and not has_position(auto_smart_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
-                    await buy(auto_smart_mint, alpha_score_value=700.0)
 
-            # 7. real smart wallet alpha
-            real_mint = await real_smart_signal(RPC, REAL_SMART_WALLETS, CANDIDATES)
+            if auto_mint and not has_position(auto_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"🔥 AUTO SMART {auto_mint[:8]}")
+                    await buy(auto_mint, 700)
+                    traded = True
+
+            # 4️⃣ real smart
+            real_mint = await real_smart_signal(
+                RPC, REAL_SMART_WALLETS, CANDIDATES
+            )
+
             if real_mint and not has_position(real_mint):
                 if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(f"REAL SMART HIT {real_mint[:8]}")
-                    await buy(real_mint, alpha_score_value=900.0)
+                    engine.log(f"🔥 REAL SMART {real_mint[:8]}")
+                    await buy(real_mint, 900)
+                    traded = True
 
-            # 8. alpha ranking from mempool universe
+            # 5️⃣ ranking
             ranked = await rank_candidates(CANDIDATES)
             if ranked:
                 best = ranked[0]
                 mint = best["mint"]
                 score = best["score"]
 
-                engine.last_signal = f"alpha:{score:.2f}"
-                engine.log(f"BEST {mint[:8]} score={score:.2f}")
+                engine.log(f"BEST {mint[:8]} {score:.2f}")
 
-                if score > 25 and not has_position(mint):
+                if score > 20 and not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS:
-                        if len(AUTO_SMART_WALLETS) > 0 or len(REAL_SMART_WALLETS) > 0:
-                            await buy(mint, alpha_score_value=score)
+                        engine.log("🔥 RANK BUY")
+                        await buy(mint, score)
+                        traded = True
 
-            # 9. fallback alpha（保底進場）
-            if CANDIDATES:
+            # ================= 💣 強制 fallback =================
+
+            if not traded and CANDIDATES:
                 import random
 
                 mint = random.choice(list(CANDIDATES))
+
                 if not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS:
-                        engine.log(f"FALLBACK BUY {mint[:8]}")
-                        await buy(mint, alpha_score_value=10.0)
+                        engine.log(f"💣 FORCE BUY {mint[:8]}")
+                        await buy(mint, 10.0)
 
             engine.stats["signals"] += 1
             engine.log("LOOP RUNNING")
