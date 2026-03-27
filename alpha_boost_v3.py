@@ -1,6 +1,6 @@
 import asyncio
 import httpx
-import time
+import random
 
 SOL = "So11111111111111111111111111111111111111112"
 
@@ -29,7 +29,7 @@ async def get_price(mint: str):
             return None
 
         return int(out) / 1e9 / 1_000_000
-    except:
+    except Exception:
         return None
 
 
@@ -56,12 +56,13 @@ async def get_liquidity_and_impact(mint: str):
         impact = float(data.get("priceImpactPct", 1) or 1)
 
         return out, impact
-    except:
+    except Exception:
         return 0, 1
 
 
 # ================================
 # 1️⃣ 流動性 Alpha（真）
+# impact 放寬：0.25 -> 0.35
 # ================================
 async def liquidity_alpha(candidates: set):
     best = None
@@ -75,7 +76,7 @@ async def liquidity_alpha(candidates: set):
 
         score = liq * (1 - impact)
 
-        if impact < 0.25 and score > best_score:
+        if impact < 0.35 and score > best_score:
             best = mint
             best_score = score
 
@@ -87,6 +88,7 @@ async def liquidity_alpha(candidates: set):
 
 # ================================
 # 2️⃣ Momentum Alpha（真）
+# momentum 放寬：0.04 -> 0.02
 # ================================
 async def momentum_alpha(candidates: set):
     for mint in list(candidates)[:20]:
@@ -94,19 +96,19 @@ async def momentum_alpha(candidates: set):
         await asyncio.sleep(0.05)
         p2 = await get_price(mint)
 
-        if not p1 or not p2:
+        if not p1 or not p2 or p1 <= 0:
             continue
 
         change = (p2 - p1) / p1
 
-        if change > 0.04:
+        if change > 0.02:
             return mint, 900 + change * 5000
 
     return None, 0
 
 
 # ================================
-# 3️⃣ Volume Spike Alpha（假流量過濾）
+# 3️⃣ Volume Spike Alpha
 # ================================
 async def volume_spike_alpha(candidates: set):
     best = None
@@ -134,21 +136,18 @@ async def volume_spike_alpha(candidates: set):
 
 
 # ================================
-# 4️⃣ Rug Filter Alpha（關鍵）
+# 4️⃣ Rug Filter Alpha
 # ================================
 async def anti_rug_alpha(candidates: set):
     for mint in list(candidates)[:20]:
         liq, impact = await get_liquidity_and_impact(mint)
 
-        # ❌ 無流動性
         if liq == 0:
             continue
 
-        # ❌ 價格衝擊太大 → rug
         if impact > 0.4:
             continue
 
-        # ❌ 流動性太低
         if liq < 50000:
             continue
 
@@ -159,6 +158,7 @@ async def anti_rug_alpha(candidates: set):
 
 # ================================
 # ⭐ Alpha Fusion（核心）
+# 加 fallback，避免完全沒訊號
 # ================================
 async def alpha_fusion(candidates: set):
     tasks = [
@@ -178,4 +178,11 @@ async def alpha_fusion(candidates: set):
             best_mint = mint
             best_score = score
 
-    return best_mint, best_score
+    if best_mint:
+        return best_mint, best_score
+
+    if candidates:
+        mint = random.choice(list(candidates))
+        return mint, 400
+
+    return None, 0
