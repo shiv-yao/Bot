@@ -1,6 +1,0 @@
-SMART_WALLETS = {
-    # 先放幾個（之後可以自動學習）
-    "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",  
-    "87rRdssFiTJKY4MGARa4G5vQ31hmR7MxSmhzeaJ5AAxJ",  
-  "J6TDXvarvpBdPXTaTU8eJbtso1PUCYKGkVtMKUUY8iEa",
-}
