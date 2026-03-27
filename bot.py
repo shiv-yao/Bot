@@ -198,7 +198,7 @@ async def rug_filter(mint: str) -> bool:
         if out_amount == 0:
             return True
 
-        if impact > 0.6:
+        if impact > 0.4:
             return False
 
         return True
