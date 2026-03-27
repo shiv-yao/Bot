@@ -172,17 +172,26 @@ async def alpha_fusion(candidates: set):
 
     best_mint = None
     best_score = 0
+    best_source = None
 
-    for mint, score in results:
+    sources = [
+        "fusion_liquidity",
+        "fusion_momentum",
+        "fusion_volume",
+        "fusion_anti_rug",
+    ]
+
+    for i, (mint, score) in enumerate(results):
         if mint and score > best_score:
             best_mint = mint
             best_score = score
+            best_source = sources[i]
 
     if best_mint:
-        return best_mint, best_score
+        return best_mint, best_score, best_source
 
     if candidates:
         mint = random.choice(list(candidates))
-        return mint, 400
+        return mint, 400, "fusion_fallback"
 
-    return None, 0
+    return None, 0, None
