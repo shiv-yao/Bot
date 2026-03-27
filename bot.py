@@ -3,6 +3,12 @@ import asyncio
 import random
 import httpx
 
+from alpha_boost import (
+    wallet_graph_alpha,
+    insider_early_alpha,
+    smart_flow_alpha,
+    momentum_accel_alpha,
+)
 from paper_engine import PaperEngine
 from strategy_state import StrategyState
 from smart_wallet_ranker import rank_wallets
@@ -764,7 +770,7 @@ async def bot_loop():
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("🔥 PHASE ALLOCATOR FINAL START")
+    engine.log("🔥 PHASE ALLOCATOR + ALPHA FUSION START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -800,6 +806,38 @@ async def bot_loop():
                 engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
 
             traded = False
+
+            # ===== ALPHA FUSION（核心） =====
+
+            wg_mint, wg_score = await wallet_graph_alpha(CANDIDATES)
+            if wg_mint and not has_position(wg_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"🧠 WALLET GRAPH {wg_mint[:8]} {wg_score:.2f}")
+                    await buy(wg_mint, wg_score)
+                    traded = True
+
+            ins_mint, ins_score = await insider_early_alpha(CANDIDATES)
+            if ins_mint and not has_position(ins_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"🧠 INSIDER EARLY {ins_mint[:8]} {ins_score:.2f}")
+                    await buy(ins_mint, ins_score)
+                    traded = True
+
+            flow_mint, flow_score = await smart_flow_alpha(CANDIDATES)
+            if flow_mint and not has_position(flow_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"🧠 SMART FLOW {flow_mint[:8]} {flow_score:.2f}")
+                    await buy(flow_mint, flow_score)
+                    traded = True
+
+            mom_mint, mom_score = await momentum_accel_alpha(CANDIDATES)
+            if mom_mint and not has_position(mom_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(f"🧠 MOMENTUM {mom_mint[:8]} {mom_score:.2f}")
+                    await buy(mom_mint, mom_score)
+                    traded = True
+
+            # ===== 舊 alpha 層 =====
 
             liq = await liquidity_signal(RPC)
             if liq and not has_position(liq):
