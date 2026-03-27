@@ -67,6 +67,19 @@ def source_name(alpha_score_value: float) -> str:
     return f"alpha_{round(alpha_score_value, 2)}"
 
 
+def weighted_position_size(source: str) -> float:
+    capital = max(engine.capital, 0.0)
+    base = capital * RISK_PCT_PER_TRADE
+    base = max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, base))
+
+    w = strategy_state.weight(source)
+    if w <= 0:
+        return 0.0
+
+    sized = base * w
+    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, sized))
+
+
 async def rpc_post(method: str, params: list):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -245,12 +258,6 @@ def has_position(mint: str) -> bool:
     return any(p["token"] == mint for p in engine.positions)
 
 
-def calc_position_size() -> float:
-    capital = max(engine.capital, 0.0)
-    raw = capital * RISK_PCT_PER_TRADE
-    return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, raw))
-
-
 async def place_buy_order(mint: str, size_sol: float):
     kp = load_keypair()
     if not kp:
@@ -323,12 +330,15 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         engine.log(f"STRATEGY DISABLED {src}")
         return
 
+    size = weighted_position_size(src)
+    if size <= 0:
+        engine.log(f"BUY BLOCKED: ZERO SIZE {src}")
+        return
+
     if MODE == "PAPER":
         price = await get_price(mint)
         if not price:
             return
-
-        size = calc_position_size()
 
         paper.buy(
             mint=mint,
@@ -358,17 +368,17 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
             "price": price,
             "size": size,
             "source": src,
+            "weight": strategy_state.weight(src),
         })
         engine.trade_history = engine.trade_history[-100:]
-        engine.log(f"🟢 PAPER BUY {mint[:8]} {price}")
+        engine.log(f"🟢 PAPER BUY {mint[:8]} {price} src={src} w={strategy_state.weight(src):.2f} size={size:.6f}")
         return
 
     if MODE != "REAL":
         engine.log("UNKNOWN MODE: buy skipped")
         return
 
-    size = calc_position_size()
-    engine.log(f"TRY BUY {mint[:8]} size={size:.6f}")
+    engine.log(f"TRY BUY {mint[:8]} size={size:.6f} src={src} w={strategy_state.weight(src):.2f}")
 
     sig_json, token_amount, entry = await place_buy_order(mint, size)
     if not sig_json:
@@ -397,6 +407,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         "mint": mint,
         "result": sig_json,
         "source": src,
+        "weight": strategy_state.weight(src),
     })
     engine.trade_history = engine.trade_history[-100:]
     engine.log(f"BUY SUCCESS {mint[:8]}")
@@ -409,7 +420,7 @@ async def add_to_winner(position: dict):
     if position.get("adds", 0) >= MAX_ADDS_PER_POSITION:
         return
 
-    add_size = calc_position_size() * ADD_SIZE_MULTIPLIER
+    add_size = weighted_position_size(src) * ADD_SIZE_MULTIPLIER
     if add_size <= 0:
         return
 
@@ -444,7 +455,7 @@ async def add_to_winner(position: dict):
 
         engine.stats["adds"] += 1
         engine.last_trade = f"PAPER ADD {mint[:8]}"
-        engine.log(f"🟡 PAPER ADD {mint[:8]} size={add_size:.6f}")
+        engine.log(f"🟡 PAPER ADD {mint[:8]} src={src} size={add_size:.6f}")
         return
 
     if MODE != "REAL":
@@ -515,7 +526,7 @@ async def sell(position: dict):
             "source": final_source,
         })
         engine.trade_history = engine.trade_history[-100:]
-        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f}")
+        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f} src={final_source}")
         return
 
     if MODE != "REAL":
@@ -678,7 +689,7 @@ async def bot_loop():
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("🔥 PHASE STRATEGY ACCOUNTING START")
+    engine.log("🔥 PHASE AUTO-WEIGHT FINAL START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -753,9 +764,9 @@ async def bot_loop():
                 mint = best["mint"]
                 score = best["score"]
 
+                rank_src = f"alpha_{round(score, 2)}"
                 engine.log(f"BEST {mint[:8]} {score:.2f}")
 
-                rank_src = f"alpha_{round(score, 2)}"
                 if score > 20 and not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled(rank_src):
                         engine.log("🔥 RANK BUY")
@@ -774,16 +785,16 @@ async def bot_loop():
             engine.stats["signals"] += 1
 
             total, by_source = paper.stats()
-            engine.log(f"💰 PAPER TOTAL PnL: {round(total, 6)} SOL")
+            engine.log(f"💰 PAPER TOTAL PnL: {total:.9f} SOL")
 
             for k, v in by_source.items():
                 engine.log(
-                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} total={round(v['total_pnl'], 6)} avg={round(v['avg_pnl'], 6)}"
+                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} total={v['total_pnl']:.9f} avg={v['avg_pnl']:.9f}"
                 )
 
             for name, s in strategy_state.summary().items():
                 engine.log(
-                    f"🧠 STRAT {name} enabled={s['enabled']} buys={s['buys']} sells={s['sells']} wins={s['wins']} losses={s['losses']} total={round(s['total_pnl'], 6)} loss_streak={s['loss_streak']}"
+                    f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} buys={s['buys']} sells={s['sells']} wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f} loss_streak={s['loss_streak']}"
                 )
 
             engine.log("LOOP RUNNING")
