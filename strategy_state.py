@@ -104,5 +104,13 @@ class StrategyState:
         self.ensure(source)
         return self.stats[source]["weight"]
 
+    def disable(self, source: str):
+        self.ensure(source)
+        self.stats[source]["enabled"] = False
+
+    def enable(self, source: str):
+        self.ensure(source)
+        self.stats[source]["enabled"] = True
+
     def summary(self):
         return self.stats
