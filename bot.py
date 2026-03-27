@@ -2,6 +2,9 @@ import os
 import asyncio
 import httpx
 
+from paper_engine import PaperEngine
+
+paper = PaperEngine()
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
