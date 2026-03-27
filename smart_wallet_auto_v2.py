@@ -25,8 +25,13 @@ async def get_signatures_for_address(rpc: str, address: str, limit: int = 10):
                     "params": [address, {"limit": limit}],
                 },
             )
+
+        if r.status_code != 200:
+            return []
+
         data = r.json()
-        return data.get("result", [])
+        result = data.get("result", [])
+        return result if isinstance(result, list) else []
     except Exception:
         return []
 
@@ -49,6 +54,10 @@ async def get_transaction(rpc: str, signature: str):
                     ],
                 },
             )
+
+        if r.status_code != 200:
+            return None
+
         data = r.json()
         return data.get("result")
     except Exception:
@@ -78,9 +87,11 @@ def extract_candidate_wallets_from_tx(tx: dict):
             if len(pubkey) < 32 or len(pubkey) > 44:
                 continue
 
+            # 優先收 signer / writable
             if signer or writable:
                 wallets.append(pubkey)
 
+        # 如果一個都沒抓到，退一步抓前幾個 account key
         if not wallets:
             for k in account_keys[:5]:
                 if isinstance(k, dict):
@@ -141,9 +152,14 @@ def extract_mints_from_tx(tx: dict):
 
 
 async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallets: int = 10):
+    """
+    從最新 candidates 的交易中抽常出現 wallet。
+    """
     wallet_counter = Counter()
 
-    # 用最新候選，不要用舊的
+    if not candidate_mints:
+        return []
+
     sample_mints = list(candidate_mints)[-80:]
 
     for mint in sample_mints:
@@ -171,13 +187,17 @@ async def auto_discover_smart_wallets(rpc: str, candidate_mints: set, max_wallet
 
 
 async def smart_wallet_signal_from_auto(rpc: str, smart_wallets: list, candidates: set):
+    """
+    只回傳 'smart wallet 最近碰過，而且也在 candidates 裡' 的 mint。
+    沒找到就回傳 None，不再亂 fallback。
+    """
     if not smart_wallets:
         return None
 
     if not candidates:
         return None
 
-    for wallet in smart_wallets:
+    for wallet in smart_wallets[:10]:
         sigs = await get_signatures_for_address(rpc, wallet, limit=5)
 
         for s in sigs:
