@@ -2,6 +2,22 @@ import httpx
 from collections import Counter
 from smart_wallet_ranker import rank_wallets
 
+import random
+
+async def auto_discover_smart_wallets(RPC, candidate_mints, max_wallets=5):
+    wallets = []
+
+    for mint in list(candidate_mints)[-50:]:
+        fake_wallet = "WALLET_" + mint[:6]
+        score = random.uniform(0, 1)
+
+        if score > 0.7:
+            wallets.append((fake_wallet, score))
+
+    wallets.sort(key=lambda x: x[1], reverse=True)
+    return [w[0] for w in wallets[:max_wallets]]
+
+
 async def smart_wallet_signal_from_auto(RPC, wallets, candidates):
     if not wallets:
         return None
