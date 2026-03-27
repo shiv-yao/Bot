@@ -56,7 +56,10 @@ LAST_REAL_REFRESH = 0.0
 CANDIDATES = set()
 
 
-def source_name(alpha_score_value: float) -> str:
+def source_name(alpha_score_value: float, source_hint: str = None) -> str:
+    if source_hint:
+        return source_hint
+
     if alpha_score_value >= 1500:
         return "liquidity"
     if alpha_score_value >= 1000:
@@ -385,7 +388,7 @@ async def place_buy_order(mint: str, size_sol: float):
     return sig_json, token_amount, entry
 
 
-async def buy(mint: str, alpha_score_value: float = 0.0):
+async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None):
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
@@ -398,7 +401,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
         return
 
-    src = source_name(alpha_score_value)
+    src = source_name(alpha_score_value, source_hint)
 
     if not strategy_state.enabled(src):
         engine.log(f"STRATEGY DISABLED {src}")
