@@ -54,7 +54,7 @@ def data():
         "trade_history": list(engine.trade_history)[-100:],
         "bot_ok": engine.bot_ok,
         "bot_error": engine.bot_error,
-    })
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
