@@ -69,18 +69,17 @@ class StrategyState:
 
         s["weight"] = max(0.0, min(weight, 2.0))
 
-    def maybe_disable(self, source: str, max_loss_streak: int = 2, min_total_pnl: float = -0.0005):
-        self.ensure(source)
-        s = self.stats[source]
+    def maybe_disable(self, source: str, max_loss_streak: int = 3, min_total_pnl: float = -0.0005):
+    self.ensure(source)
+    s = self.stats[source]
 
-        if s["loss_streak"] >= max_loss_streak and s["total_pnl"] < 0:
-            s["enabled"] = False
+    # 只有「連虧很多 + 總PnL也負」才真的關掉
+    if s["loss_streak"] >= max_loss_streak and s["total_pnl"] < 0:
+        s["enabled"] = False
 
-        if s["sells"] >= 2 and s["total_pnl"] <= min_total_pnl:
-            s["enabled"] = False
-
-        if s["weight"] <= 0:
-            s["enabled"] = False
+    # 做過至少 3 筆以上還是明顯虧損，才關
+    if s["sells"] >= 3 and s["total_pnl"] <= min_total_pnl:
+        s["enabled"] = False
 
     def enabled(self, source: str) -> bool:
         self.ensure(source)
