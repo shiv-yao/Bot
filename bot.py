@@ -643,3 +643,10 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
+        total, by_source = paper.stats()
+
+engine.log(f"💰 PAPER TOTAL PnL: {round(total, 4)} SOL")
+
+for k, v in by_source.items():
+    engine.log(f"📊 {k} → {round(v, 4)} SOL")
+        
