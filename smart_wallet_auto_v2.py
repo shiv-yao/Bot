@@ -177,7 +177,6 @@ async def smart_wallet_signal_from_auto(rpc: str, smart_wallets: list, candidate
     if not candidates:
         return None
 
-    # 先從 smart wallets 反查最近碰過的 mint
     for wallet in smart_wallets:
         sigs = await get_signatures_for_address(rpc, wallet, limit=5)
 
@@ -194,9 +193,5 @@ async def smart_wallet_signal_from_auto(rpc: str, smart_wallets: list, candidate
             for mint in mints:
                 if mint != SOL_MINT and mint in candidates:
                     return mint
-
-    # 反查不到時，退回 candidates 中任一個
-    for mint in candidates:
-        return mint
 
     return None
