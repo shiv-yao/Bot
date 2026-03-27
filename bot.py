@@ -5,7 +5,7 @@ import httpx
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
-from smart_wallet_auto import auto_discover_smart_wallets, smart_wallet_signal_from_auto
+from smart_wallet_auto_v2 import auto_discover_smart_wallets, smart_wallet_signal_from_auto
 from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
