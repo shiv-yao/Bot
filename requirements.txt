@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-httpx
-solders
-base58
-websockets
