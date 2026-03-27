@@ -3,6 +3,7 @@ import asyncio
 import httpx
 
 from paper_engine import PaperEngine
+from strategy_state import StrategyState
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
@@ -16,6 +17,7 @@ from insider_engine import insider_signal
 from alpha_engine import rank_candidates
 
 paper = PaperEngine()
+strategy_state = StrategyState()
 
 RPC = os.getenv("RPC", "").strip()
 SOL = "So11111111111111111111111111111111111111112"
@@ -23,28 +25,46 @@ SOL = "So11111111111111111111111111111111111111112"
 MODE = os.getenv("MODE", "REAL").upper()
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
-POSITION_SIZE = float(os.getenv("POSITION_SIZE_SOL", "0.002"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
 MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.10"))
-
-AUTO_SMART_WALLETS = []
-LAST_SMART_WALLET_REFRESH = 0.0
-REAL_SMART_WALLETS = []
-LAST_REAL_REFRESH = 0.0
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
 STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
 TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
-
 ADD_ON_WIN = os.getenv("ADD_ON_WIN", "true").lower() == "true"
 ADD_TRIGGER_PCT = float(os.getenv("ADD_TRIGGER_PCT", "0.08"))
 ADD_SIZE_MULTIPLIER = float(os.getenv("ADD_SIZE_MULTIPLIER", "0.5"))
 MAX_ADDS_PER_POSITION = int(os.getenv("MAX_ADDS_PER_POSITION", "1"))
 
+AUTO_SMART_WALLETS = []
+LAST_SMART_WALLET_REFRESH = 0.0
+REAL_SMART_WALLETS = []
+LAST_REAL_REFRESH = 0.0
+
 CANDIDATES = set()
+
+
+def source_name(alpha_score_value: float) -> str:
+    if alpha_score_value >= 1500:
+        return "liquidity"
+    if alpha_score_value >= 1000:
+        return "insider"
+    if alpha_score_value >= 900:
+        return "real_smart"
+    if alpha_score_value >= 700:
+        return "auto_smart"
+    if alpha_score_value >= 500:
+        return "smart_money"
+    if alpha_score_value == 35:
+        return "early_buy"
+    if alpha_score_value == 25:
+        return "fast_buy"
+    if alpha_score_value == 10:
+        return "fallback"
+    return f"alpha_{round(alpha_score_value, 2)}"
 
 
 async def rpc_post(method: str, params: list):
@@ -128,6 +148,7 @@ async def sync_positions():
                 "pnl_pct": old.get("pnl_pct", 0.0),
                 "alpha_score": old.get("alpha_score", 0.0),
                 "adds": old.get("adds", 0),
+                "source": old.get("source", "unknown"),
             })
 
     engine.positions = new_positions
@@ -297,6 +318,11 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
         return
 
+    src = source_name(alpha_score_value)
+    if not strategy_state.enabled(src):
+        engine.log(f"STRATEGY DISABLED {src}")
+        return
+
     if MODE == "PAPER":
         price = await get_price(mint)
         if not price:
@@ -308,8 +334,9 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
             mint=mint,
             price=price,
             size=size,
-            source=f"alpha_{alpha_score_value}"
+            source=src,
         )
+        strategy_state.record_buy(src)
 
         engine.positions.append({
             "token": mint,
@@ -320,6 +347,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
             "pnl_pct": 0.0,
             "alpha_score": alpha_score_value,
             "adds": 0,
+            "source": src,
         })
 
         engine.stats["buys"] += 1
@@ -329,9 +357,9 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
             "mint": mint,
             "price": price,
             "size": size,
-            "source": f"alpha_{alpha_score_value}",
+            "source": src,
         })
-        engine.trade_history = engine.trade_history[-50:]
+        engine.trade_history = engine.trade_history[-100:]
         engine.log(f"🟢 PAPER BUY {mint[:8]} {price}")
         return
 
@@ -348,6 +376,8 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         engine.log(str(entry) if isinstance(entry, str) else "BUY FAILED")
         return
 
+    strategy_state.record_buy(src)
+
     engine.positions.append({
         "token": mint,
         "amount": token_amount,
@@ -357,6 +387,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         "pnl_pct": 0.0,
         "alpha_score": alpha_score_value,
         "adds": 0,
+        "source": src,
     })
 
     engine.stats["buys"] += 1
@@ -365,13 +396,15 @@ async def buy(mint: str, alpha_score_value: float = 0.0):
         "side": "BUY",
         "mint": mint,
         "result": sig_json,
+        "source": src,
     })
-    engine.trade_history = engine.trade_history[-50:]
+    engine.trade_history = engine.trade_history[-100:]
     engine.log(f"BUY SUCCESS {mint[:8]}")
 
 
 async def add_to_winner(position: dict):
     mint = position["token"]
+    src = position.get("source", "unknown")
 
     if position.get("adds", 0) >= MAX_ADDS_PER_POSITION:
         return
@@ -389,8 +422,9 @@ async def add_to_winner(position: dict):
             mint=mint,
             price=price,
             size=add_size,
-            source=f"add_{position.get('alpha_score', 0.0)}"
+            source=src,
         )
+        strategy_state.record_buy(src)
 
         old_amount = position["amount"]
         old_entry = position["entry_price"]
@@ -424,6 +458,8 @@ async def add_to_winner(position: dict):
         engine.log("ADD FAILED")
         return
 
+    strategy_state.record_buy(src)
+
     old_amount = position["amount"]
     old_entry = position["entry_price"]
 
@@ -444,19 +480,26 @@ async def add_to_winner(position: dict):
     engine.trade_history.append({
         "side": "ADD",
         "mint": mint,
+        "source": src,
         "result": sig_json,
     })
-    engine.trade_history = engine.trade_history[-50:]
+    engine.trade_history = engine.trade_history[-100:]
     engine.log(f"ADD SUCCESS {mint[:8]}")
 
 
 async def sell(position: dict):
+    src = position.get("source", "unknown")
+
     if MODE == "PAPER":
         price = await get_price(position["token"])
         if not price:
             return
 
-        pnl = paper.sell(position["token"], price)
+        pnl, source_from_engine = paper.sell(position["token"], price)
+        final_source = source_from_engine or src
+
+        strategy_state.record_sell(final_source, pnl)
+        strategy_state.maybe_disable(final_source)
 
         engine.positions = [
             p for p in engine.positions if p["token"] != position["token"]
@@ -469,9 +512,10 @@ async def sell(position: dict):
             "mint": position["token"],
             "price": price,
             "pnl": pnl,
+            "source": final_source,
         })
-        engine.trade_history = engine.trade_history[-50:]
-        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.4f}")
+        engine.trade_history = engine.trade_history[-100:]
+        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f}")
         return
 
     if MODE != "REAL":
@@ -517,6 +561,10 @@ async def sell(position: dict):
         engine.log(err)
         return
 
+    pnl = position.get("pnl_pct", 0.0)
+    strategy_state.record_sell(src, pnl)
+    strategy_state.maybe_disable(src)
+
     engine.positions = [p for p in engine.positions if p["token"] != mint]
     engine.stats["sells"] += 1
     engine.last_trade = f"SELL {mint[:8]}"
@@ -524,8 +572,10 @@ async def sell(position: dict):
         "side": "SELL",
         "mint": mint,
         "result": sig_json,
+        "source": src,
+        "pnl_pct": pnl,
     })
-    engine.trade_history = engine.trade_history[-50:]
+    engine.trade_history = engine.trade_history[-100:]
     engine.log(f"SELL SUCCESS {mint[:8]}")
 
 
@@ -628,7 +678,7 @@ async def bot_loop():
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("🔥 PHASE N FALLBACK START")
+    engine.log("🔥 PHASE STRATEGY ACCOUNTING START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -667,14 +717,14 @@ async def bot_loop():
 
             liq = await liquidity_signal(RPC)
             if liq and not has_position(liq):
-                if len(engine.positions) < MAX_POSITIONS:
+                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("liquidity"):
                     engine.log(f"🔥 LIQ {liq[:8]}")
                     await buy(liq, 1500)
                     traded = True
 
             ins = await insider_signal(RPC)
             if ins and not has_position(ins):
-                if len(engine.positions) < MAX_POSITIONS:
+                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("insider"):
                     engine.log(f"🔥 INSIDER {ins[:8]}")
                     await buy(ins, 1000)
                     traded = True
@@ -682,9 +732,8 @@ async def bot_loop():
             auto_mint = await smart_wallet_signal_from_auto(
                 RPC, AUTO_SMART_WALLETS, CANDIDATES
             )
-
             if auto_mint and not has_position(auto_mint):
-                if len(engine.positions) < MAX_POSITIONS:
+                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("auto_smart"):
                     engine.log(f"🔥 AUTO SMART {auto_mint[:8]}")
                     await buy(auto_mint, 700)
                     traded = True
@@ -692,9 +741,8 @@ async def bot_loop():
             real_mint = await real_smart_signal(
                 RPC, REAL_SMART_WALLETS, CANDIDATES
             )
-
             if real_mint and not has_position(real_mint):
-                if len(engine.positions) < MAX_POSITIONS:
+                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("real_smart"):
                     engine.log(f"🔥 REAL SMART {real_mint[:8]}")
                     await buy(real_mint, 900)
                     traded = True
@@ -707,8 +755,9 @@ async def bot_loop():
 
                 engine.log(f"BEST {mint[:8]} {score:.2f}")
 
+                rank_src = f"alpha_{round(score, 2)}"
                 if score > 20 and not has_position(mint):
-                    if len(engine.positions) < MAX_POSITIONS:
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled(rank_src):
                         engine.log("🔥 RANK BUY")
                         await buy(mint, score)
                         traded = True
@@ -717,18 +766,25 @@ async def bot_loop():
                 import random
 
                 mint = random.choice(list(CANDIDATES))
-
                 if not has_position(mint):
-                    if len(engine.positions) < MAX_POSITIONS:
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("fallback"):
                         engine.log(f"💣 FORCE BUY {mint[:8]}")
                         await buy(mint, 10.0)
 
             engine.stats["signals"] += 1
 
             total, by_source = paper.stats()
-            engine.log(f"💰 PAPER TOTAL PnL: {round(total, 4)} SOL")
+            engine.log(f"💰 PAPER TOTAL PnL: {round(total, 6)} SOL")
+
             for k, v in by_source.items():
-                engine.log(f"📊 {k} → {round(v, 4)} SOL")
+                engine.log(
+                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} total={round(v['total_pnl'], 6)} avg={round(v['avg_pnl'], 6)}"
+                )
+
+            for name, s in strategy_state.summary().items():
+                engine.log(
+                    f"🧠 STRAT {name} enabled={s['enabled']} buys={s['buys']} sells={s['sells']} wins={s['wins']} losses={s['losses']} total={round(s['total_pnl'], 6)} loss_streak={s['loss_streak']}"
+                )
 
             engine.log("LOOP RUNNING")
 
