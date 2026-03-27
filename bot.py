@@ -6,10 +6,10 @@ import httpx
 from alpha_boost_v3 import alpha_fusion
 from paper_engine import PaperEngine
 from strategy_state import StrategyState
-from regime import REGIME, regime_risk_multiplier, regime_take_profit, regime_stop_loss
+from regime import regime_risk_multiplier, regime_take_profit, regime_stop_loss
 
 from smart_wallet_ranker import rank_wallets
-from smart_wallet_real import real_smart_wallets, real_smart_signal
+from smart_wallet_real import real_smart_wallets
 from liquidity_engine import liquidity_signal
 from smart_wallet_auto_v2 import auto_discover_smart_wallets, smart_wallet_signal_from_auto
 from state import engine
@@ -70,6 +70,8 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
         return "fast_buy"
     if alpha_score_value == 10:
         return "fallback"
+    if alpha_score_value == 20:
+        return "v6_safe"
     return f"alpha_{round(alpha_score_value, 2)}"
 
 
@@ -86,6 +88,7 @@ def strategy_cap_ratio(source: str) -> float:
         "fusion_anti_rug": 0.10,
         "fast_buy": 0.05,
         "early_buy": 0.04,
+        "v6_safe": 0.04,
         "fallback": 0.00,
     }
     return caps.get(source, 0.08)
@@ -118,6 +121,9 @@ def weighted_position_size(source: str) -> float:
     if source in ["early_buy", "fast_buy"]:
         size *= 0.5
 
+    if source == "v6_safe":
+        size *= 0.6
+
     size = min(size, MAX_POSITION_SOL)
 
     cap_ratio = strategy_cap_ratio(source)
@@ -132,12 +138,20 @@ def weighted_position_size(source: str) -> float:
     return size
 
 
-def dynamic_size(size: float, strength: float) -> float:
+def dynamic_size_v6(size: float, strength: float, regime: str) -> float:
+    if regime == "trend":
+        size *= 1.3
+    elif regime == "chop":
+        size *= 0.6
+
     if strength > 0.04:
-        return min(size * 1.4, MAX_POSITION_SOL)
-    if strength > 0.02:
-        return min(size * 1.15, MAX_POSITION_SOL)
-    return max(size * 0.85, MIN_POSITION_SOL)
+        size *= 1.4
+    elif strength > 0.02:
+        size *= 1.2
+    else:
+        size *= 0.8
+
+    return max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
 
 
 async def rpc_post(method: str, params: list):
@@ -282,17 +296,17 @@ async def momentum_confirm(mint: str):
     m2 = (p3 - p2) / p2
     total = (p3 - p1) / p1
 
-    if m1 > 0.005 and m2 > 0.005 and total > 0.012:
-        return True, (m1 + m2)
+    if m1 > 0.003 and total > 0.006:
+        return True, max(m1 + m2, total)
 
-    return False, 0.0
+    return False, max(total, 0.0)
 
 
 async def fake_pump_filter(mint: str):
     liq, impact = await get_liquidity_and_impact(mint)
-    if impact > 0.28:
+    if impact > 0.40:
         return False
-    if liq < 80000:
+    if liq < 30000:
         return False
     return True
 
@@ -305,10 +319,10 @@ async def smart_money_confirm(mint: str, smart_wallets: list):
         return False
 
 
-async def should_enter_v4(mint: str, smart_wallets: list):
+async def should_enter_v6(mint: str, smart_wallets: list):
     ok_momo, strength = await momentum_confirm(mint)
     if not ok_momo:
-        return False, "no_momentum", 0.0
+        return True, "weak_momentum", strength * 0.5
 
     ok_fake = await fake_pump_filter(mint)
     if not ok_fake:
@@ -316,9 +330,9 @@ async def should_enter_v4(mint: str, smart_wallets: list):
 
     ok_smart = await smart_money_confirm(mint, smart_wallets)
     if not ok_smart:
-        return False, "no_smart_money", 0.0
+        return True, "no_smart", max(strength * 0.7, 0.005)
 
-    return True, "ok", strength
+    return True, "strong", strength
 
 
 async def rug_filter(mint: str) -> bool:
@@ -423,7 +437,12 @@ async def place_buy_order(mint: str, size_sol: float):
     return sig_json, token_amount, entry
 
 
-async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None, size_override: float = None):
+async def buy(
+    mint: str,
+    alpha_score_value: float = 0.0,
+    source_hint: str = None,
+    size_override: float = None,
+):
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
@@ -579,11 +598,37 @@ async def sell(position: dict):
         return
 
 
+async def detect_regime_v6():
+    if len(engine.trade_history) < 5:
+        return "neutral"
+
+    wins = 0
+    total = 0
+
+    for t in engine.trade_history[-10:]:
+        pnl = t.get("pnl_pct", t.get("pnl", 0))
+        if pnl > 0:
+            wins += 1
+        total += 1
+
+    if total == 0:
+        return "neutral"
+
+    winrate = wins / total
+
+    if winrate > 0.6:
+        return "trend"
+    if winrate < 0.4:
+        return "chop"
+    return "neutral"
+
+
 async def monitor():
     while True:
         try:
-            take_profit = regime_take_profit(REGIME, BASE_TAKE_PROFIT)
-            stop_loss = regime_stop_loss(REGIME, BASE_STOP_LOSS)
+            regime = await detect_regime_v6()
+            take_profit = regime_take_profit(regime, BASE_TAKE_PROFIT)
+            stop_loss = regime_stop_loss(regime, BASE_STOP_LOSS)
 
             if ENABLE_AUTO_SELL:
                 for p in list(engine.positions):
@@ -657,40 +702,11 @@ async def handle_mempool(event: dict):
         engine.log(f"MEMPOOL ERR {e}")
 
 
-async def detect_regime():
-    global REGIME
-
-    ups = 0
-    downs = 0
-
-    for mint in list(CANDIDATES)[-12:]:
-        p1 = await get_price(mint)
-        await asyncio.sleep(0.05)
-        p2 = await get_price(mint)
-
-        if not p1 or not p2:
-            continue
-
-        if p2 > p1:
-            ups += 1
-        else:
-            downs += 1
-
-    if ups >= 6 and ups > downs * 1.5:
-        REGIME = "bull"
-    elif downs >= 6 and downs > ups * 1.5:
-        REGIME = "trash"
-    else:
-        REGIME = "chop"
-
-    return REGIME
-
-
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V8 SCAFFOLD BOT LOADED")
+    engine.log("🚨 V6 STABLE ENTRY BOT LOADED")
     engine.log("🛡️ NO FALLBACK MODE")
     engine.mode = MODE
 
@@ -703,12 +719,13 @@ async def bot_loop():
             await sync_positions()
 
             now = asyncio.get_event_loop().time()
-
-            regime = await detect_regime()
+            regime = await detect_regime_v6()
             engine.log(f"📊 REGIME {regime}")
 
             if now - LAST_SMART_WALLET_REFRESH > 5:
-                raw_wallets = await auto_discover_smart_wallets(RPC, CANDIDATES, max_wallets=20)
+                raw_wallets = await auto_discover_smart_wallets(
+                    RPC, CANDIDATES, max_wallets=20
+                )
                 AUTO_SMART_WALLETS = await rank_wallets(raw_wallets or [])
                 LAST_SMART_WALLET_REFRESH = now
                 engine.log(f"SMART RAW {len(raw_wallets or [])}")
@@ -721,38 +738,54 @@ async def bot_loop():
 
             traded = False
 
-            if regime != "trash":
-                fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
 
-                if fusion_mint and not has_position(fusion_mint):
-                    ok, reason, strength = await should_enter_v4(
-                        fusion_mint,
-                        AUTO_SMART_WALLETS
+            if fusion_mint and not has_position(fusion_mint):
+                ok, reason, strength = await should_enter_v6(
+                    fusion_mint,
+                    AUTO_SMART_WALLETS
+                )
+
+                if not ok:
+                    engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
+                else:
+                    preview_size = weighted_position_size(fusion_source or "fusion_momentum")
+                    regime_mult = regime_risk_multiplier(regime)
+                    final_size = dynamic_size_v6(preview_size * regime_mult, strength, regime)
+
+                    if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
+                        engine.log(
+                            f"🧠 V6 ENTRY {fusion_source} {fusion_mint[:8]} "
+                            f"{reason} strength={strength:.4f} regime={regime} "
+                            f"size={final_size:.6f}"
+                        )
+                        await buy(
+                            fusion_mint,
+                            fusion_score,
+                            source_hint=fusion_source,
+                            size_override=final_size,
+                        )
+                        traded = True
+
+            if not traded and len(engine.positions) == 0:
+                ranked = await rank_candidates(CANDIDATES)
+                if ranked:
+                    mint = ranked[0]["mint"]
+                    engine.log(f"⚡ V6 SAFE ENTRY {mint[:8]}")
+
+                    size = max(MIN_POSITION_SOL * 1.2, 0.0012)
+                    size = min(size, MAX_POSITION_SOL)
+
+                    await buy(
+                        mint,
+                        20.0,
+                        source_hint="v6_safe",
+                        size_override=size,
                     )
-
-                    if not ok:
-                        engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
-                    else:
-                        preview_size = weighted_position_size(fusion_source)
-                        regime_mult = regime_risk_multiplier(regime)
-                        final_size = dynamic_size(preview_size * regime_mult, strength)
-
-                        if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
-                            engine.log(
-                                f"🧠 ENTRY {fusion_source} {fusion_mint[:8]} "
-                                f"score={fusion_score:.2f} regime={regime} "
-                                f"strength={strength:.4f} size={final_size:.6f}"
-                            )
-                            await buy(
-                                fusion_mint,
-                                fusion_score,
-                                source_hint=fusion_source,
-                                size_override=final_size,
-                            )
-                            traded = True
+                    traded = True
 
             if not traded:
-                engine.log("🚫 NO TRADE (all signals filtered / bad regime)")
+                engine.log("🚫 NO TRADE (v6 filtered)")
 
             engine.stats["signals"] += 1
 
