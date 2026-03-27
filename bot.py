@@ -767,8 +767,6 @@ async def handle_mempool(event: dict):
     except Exception as e:
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
-
-
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
@@ -817,7 +815,6 @@ async def bot_loop():
 
             # ================= 🔥 ALPHA V3（核心） =================
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
-
             if fusion_mint and not has_position(fusion_mint):
                 if len(engine.positions) < MAX_POSITIONS:
                     engine.log(
@@ -826,67 +823,58 @@ async def bot_loop():
                     await buy(fusion_mint, fusion_score, source_hint=fusion_source)
                     traded = True
 
-            # 👉 阻止 fallback 蓋掉 fusion（超重要）
-            if traded:
-                continue
-                        # ================= ALPHA V3（核心） =================
-            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
-            if fusion_mint and not has_position(fusion_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(
-                        f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
-                    )
-                    await buy(fusion_mint, fusion_score, source_hint=fusion_source)
-                    traded = True
-
-            # ================= 舊 alpha 層 =================
-
-            liq = await liquidity_signal(RPC)
-            if liq and not has_position(liq):
-                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("liquidity"):
-                    engine.log(f"🔥 LIQ {liq[:8]}")
-                    await buy(liq, 1500)
-                    traded = True
-
-            ins = await insider_signal(RPC)
-            if ins and not has_position(ins):
-                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("insider"):
-                    engine.log(f"🔥 INSIDER {ins[:8]}")
-                    await buy(ins, 1000)
-                    traded = True
-
-            auto_mint = await smart_wallet_signal_from_auto(
-                RPC, AUTO_SMART_WALLETS, CANDIDATES
-            )
-            if auto_mint and not has_position(auto_mint):
-                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("auto_smart"):
-                    engine.log(f"🔥 AUTO SMART {auto_mint[:8]}")
-                    await buy(auto_mint, 700)
-                    traded = True
-
-            real_mint = await real_smart_signal(
-                RPC, REAL_SMART_WALLETS, CANDIDATES
-            )
-            if real_mint and not has_position(real_mint):
-                if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("real_smart"):
-                    engine.log(f"🔥 REAL SMART {real_mint[:8]}")
-                    await buy(real_mint, 900)
-                    traded = True
-
-            ranked = await rank_candidates(CANDIDATES)
-            if ranked:
-                best = ranked[0]
-                mint = best["mint"]
-                score = best["score"]
-
-                rank_src = f"alpha_{round(score, 2)}"
-                engine.log(f"BEST {mint[:8]} {score:.2f}")
-
-                if score > 20 and not has_position(mint):
-                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled(rank_src):
-                        engine.log("🔥 RANK BUY")
-                        await buy(mint, score)
+            # ================= 舊 alpha 層（只有 fusion 沒出手才跑） =================
+            if not traded:
+                liq = await liquidity_signal(RPC)
+                if liq and not has_position(liq):
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("liquidity"):
+                        engine.log(f"🔥 LIQ {liq[:8]}")
+                        await buy(liq, 1500)
                         traded = True
+
+            if not traded:
+                ins = await insider_signal(RPC)
+                if ins and not has_position(ins):
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("insider"):
+                        engine.log(f"🔥 INSIDER {ins[:8]}")
+                        await buy(ins, 1000)
+                        traded = True
+
+            if not traded:
+                auto_mint = await smart_wallet_signal_from_auto(
+                    RPC, AUTO_SMART_WALLETS, CANDIDATES
+                )
+                if auto_mint and not has_position(auto_mint):
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("auto_smart"):
+                        engine.log(f"🔥 AUTO SMART {auto_mint[:8]}")
+                        await buy(auto_mint, 700)
+                        traded = True
+
+            if not traded:
+                real_mint = await real_smart_signal(
+                    RPC, REAL_SMART_WALLETS, CANDIDATES
+                )
+                if real_mint and not has_position(real_mint):
+                    if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("real_smart"):
+                        engine.log(f"🔥 REAL SMART {real_mint[:8]}")
+                        await buy(real_mint, 900)
+                        traded = True
+
+            if not traded:
+                ranked = await rank_candidates(CANDIDATES)
+                if ranked:
+                    best = ranked[0]
+                    mint = best["mint"]
+                    score = best["score"]
+
+                    rank_src = f"alpha_{round(score, 2)}"
+                    engine.log(f"BEST {mint[:8]} {score:.2f}")
+
+                    if score > 20 and not has_position(mint):
+                        if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled(rank_src):
+                            engine.log("🔥 RANK BUY")
+                            await buy(mint, score)
+                            traded = True
 
             if not traded and CANDIDATES:
                 mint = random.choice(list(CANDIDATES))
@@ -921,3 +909,5 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
+
+
