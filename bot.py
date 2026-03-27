@@ -952,25 +952,67 @@ async def bot_loop():
                         await buy(ins, 1000)
                         traded = True
 
-            if not traded:
+                        if not traded:
                 auto_mint = await smart_wallet_signal_from_auto(
                     RPC, AUTO_SMART_WALLETS, CANDIDATES
                 )
                 if auto_mint and not has_position(auto_mint):
                     if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("auto_smart"):
-                        engine.log(f"🔥 AUTO SMART {auto_mint[:8]}")
-                        await buy(auto_mint, 700)
-                        traded = True
+                        ok, reason, strength = await should_enter_v4(
+                            auto_mint,
+                            AUTO_SMART_WALLETS
+                        )
 
-            if not traded:
+                        if not ok:
+                            engine.log(f"❌ AUTO SMART FILTERED {auto_mint[:8]} reason={reason}")
+                        else:
+                            preview_size = weighted_position_size("auto_smart")
+                            final_size = dynamic_size(preview_size, strength)
+
+                            engine.log(
+                                f"🔥 AUTO SMART V4 {auto_mint[:8]} "
+                                f"strength={strength:.4f} "
+                                f"base={preview_size:.6f} final={final_size:.6f}"
+                            )
+
+                            await buy(
+                                auto_mint,
+                                700,
+                                source_hint="auto_smart",
+                                size_override=final_size,
+                            )
+                            traded = True
+
+                        if not traded:
                 real_mint = await real_smart_signal(
                     RPC, REAL_SMART_WALLETS, CANDIDATES
                 )
                 if real_mint and not has_position(real_mint):
                     if len(engine.positions) < MAX_POSITIONS and strategy_state.enabled("real_smart"):
-                        engine.log(f"🔥 REAL SMART {real_mint[:8]}")
-                        await buy(real_mint, 900)
-                        traded = True
+                        ok, reason, strength = await should_enter_v4(
+                            real_mint,
+                            REAL_SMART_WALLETS
+                        )
+
+                        if not ok:
+                            engine.log(f"❌ REAL SMART FILTERED {real_mint[:8]} reason={reason}")
+                        else:
+                            preview_size = weighted_position_size("real_smart")
+                            final_size = dynamic_size(preview_size, strength)
+
+                            engine.log(
+                                f"🔥 REAL SMART V4 {real_mint[:8]} "
+                                f"strength={strength:.4f} "
+                                f"base={preview_size:.6f} final={final_size:.6f}"
+                            )
+
+                            await buy(
+                                real_mint,
+                                900,
+                                source_hint="real_smart",
+                                size_override=final_size,
+                            )
+                            traded = True
 
             if not traded:
                 ranked = await rank_candidates(CANDIDATES)
