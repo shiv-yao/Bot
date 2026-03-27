@@ -1,11 +1,14 @@
 import os
 import asyncio
+import random
 import httpx
 
 from alpha_boost_v3 import alpha_fusion
 from paper_engine import PaperEngine
 from strategy_state import StrategyState
 from regime import regime_risk_multiplier, regime_take_profit, regime_stop_loss
+
+from strategy_evolution import get_weight, record_trade
 
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets
@@ -84,47 +87,7 @@ class AutoAllocator:
         return "normal"
 
 
-class PortfolioBrain:
-    def __init__(self):
-        self.stats = {}
-
-    def update(self, source: str, pnl: float):
-        s = self.stats.setdefault(source, {
-            "pnl": 0.0,
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-        })
-
-        s["pnl"] += pnl
-        s["trades"] += 1
-
-        if pnl > 0:
-            s["wins"] += 1
-        else:
-            s["losses"] += 1
-
-    def score(self, source: str):
-        s = self.stats.get(source)
-        if not s or s["trades"] == 0:
-            return 1.0
-
-        winrate = s["wins"] / max(1, s["trades"])
-        avg_pnl = s["pnl"] / max(1, s["trades"])
-
-        return max(0.1, (winrate * 2.0 + avg_pnl * 5.0))
-
-    def weight(self, source: str):
-        if not self.stats:
-            return 1.0
-
-        scores = {k: self.score(k) for k in self.stats}
-        total = sum(scores.values()) or 1.0
-        return scores.get(source, 1.0) / total
-
-
-allocator = AutoAllocator()
-portfolio = PortfolioBrain()
+allocator_runtime = AutoAllocator()
 
 
 def source_name(alpha_score_value: float, source_hint: str = None) -> str:
@@ -145,7 +108,7 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
     if alpha_score_value == 25:
         return "fast_buy"
     if alpha_score_value == 20:
-        return "v11_safe"
+        return "v14_safe"
     if alpha_score_value == 10:
         return "fallback"
     return f"alpha_{round(alpha_score_value, 2)}"
@@ -164,7 +127,7 @@ def strategy_cap_ratio(source: str) -> float:
         "fusion_anti_rug": 0.10,
         "fast_buy": 0.05,
         "early_buy": 0.04,
-        "v11_safe": 0.04,
+        "v14_safe": 0.04,
         "fallback": 0.00,
     }
     return caps.get(source, 0.08)
@@ -188,16 +151,18 @@ def weighted_position_size(source: str) -> float:
         return 0.0
 
     base = capital * RISK_PCT_PER_TRADE
-    w = strategy_state.weight(source)
-    if w <= 0:
+    strategy_weight = strategy_state.weight(source)
+    evolution_weight = get_weight(source)
+
+    if strategy_weight <= 0:
         return 0.0
 
-    size = base * w
+    size = base * strategy_weight * evolution_weight
 
     if source in ["early_buy", "fast_buy"]:
         size *= 0.5
 
-    if source == "v11_safe":
+    if source == "v14_safe":
         size *= 0.6
 
     size = min(size, MAX_POSITION_SOL)
@@ -214,7 +179,7 @@ def weighted_position_size(source: str) -> float:
     return size
 
 
-def dynamic_size_v11(size: float, strength: float, regime: str) -> float:
+def dynamic_size_v14(size: float, strength: float, regime: str) -> float:
     if regime == "trend":
         size *= 1.3
     elif regime == "chop":
@@ -395,7 +360,7 @@ async def smart_money_confirm(mint: str, smart_wallets: list):
         return False
 
 
-async def should_enter_v9(mint: str, smart_wallets: list):
+async def should_enter_v14(mint: str, smart_wallets: list):
     ok_momo, strength = await momentum_confirm(mint)
 
     if strength < 0.002:
@@ -663,8 +628,8 @@ async def sell(position: dict):
         final_source = source_from_engine or src
 
         strategy_state.record_sell(final_source, pnl)
-        allocator.update(pnl)
-        portfolio.update(final_source, pnl)
+        allocator_runtime.update(pnl)
+        record_trade(final_source, pnl)
 
         engine.positions = [p for p in engine.positions if p["token"] != position["token"]]
         engine.stats["sells"] += 1
@@ -675,13 +640,14 @@ async def sell(position: dict):
             "price": price,
             "pnl": pnl,
             "source": final_source,
+            "pnl_pct": position.get("pnl_pct", 0.0),
         })
         engine.trade_history = engine.trade_history[-100:]
         engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f} src={final_source}")
         return
 
 
-async def detect_regime_v11():
+async def detect_regime_v14():
     if len(engine.trade_history) < 5:
         return "neutral"
 
@@ -709,7 +675,7 @@ async def detect_regime_v11():
 async def monitor():
     while True:
         try:
-            regime = await detect_regime_v11()
+            regime = await detect_regime_v14()
             take_profit = regime_take_profit(regime, BASE_TAKE_PROFIT)
             stop_loss = regime_stop_loss(regime, BASE_STOP_LOSS)
 
@@ -789,7 +755,7 @@ async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V11 HEDGE FUND BRAIN LOADED")
+    engine.log("🚨 V14 FUND BRAIN LOADED")
     engine.log("🛡️ NO FALLBACK MODE")
     engine.mode = MODE
 
@@ -802,7 +768,7 @@ async def bot_loop():
             await sync_positions()
 
             now = asyncio.get_event_loop().time()
-            regime = await detect_regime_v11()
+            regime = await detect_regime_v14()
             engine.log(f"📊 REGIME {regime}")
 
             if now - LAST_SMART_WALLET_REFRESH > 5:
@@ -824,7 +790,7 @@ async def bot_loop():
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
 
             if fusion_mint and not has_position(fusion_mint):
-                ok, reason, strength = await should_enter_v9(
+                ok, reason, strength = await should_enter_v14(
                     fusion_mint,
                     AUTO_SMART_WALLETS
                 )
@@ -835,14 +801,14 @@ async def bot_loop():
                     src = fusion_source or "fusion_momentum"
                     preview_size = weighted_position_size(src)
                     regime_mult = regime_risk_multiplier(regime)
-                    base_size = dynamic_size_v11(preview_size * regime_mult, strength, regime)
+                    base_size = dynamic_size_v14(preview_size * regime_mult, strength, regime)
 
-                    alloc_mult = allocator.size_multiplier()
-                    portfolio_weight = portfolio.weight(src)
+                    alloc_mult = allocator_runtime.size_multiplier()
+                    portfolio_weight = get_weight(src)
 
                     final_size = base_size * alloc_mult * portfolio_weight
 
-                    mode = allocator.risk_mode()
+                    mode = allocator_runtime.risk_mode()
                     if mode == "defensive":
                         final_size *= 0.6
                     elif mode == "aggressive":
@@ -865,7 +831,7 @@ async def bot_loop():
 
                     if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
                         engine.log(
-                            f"🧠 V11 ENTRY {src} {fusion_mint[:8]} "
+                            f"🧠 V14 ENTRY {src} {fusion_mint[:8]} "
                             f"{reason} strength={strength:.4f} regime={regime} "
                             f"alloc={alloc_mult:.2f} port={portfolio_weight:.3f} "
                             f"size={final_size:.6f}"
@@ -882,7 +848,7 @@ async def bot_loop():
                 ranked = await rank_candidates(CANDIDATES)
                 if ranked:
                     mint = ranked[0]["mint"]
-                    engine.log(f"⚡ V11 SAFE ENTRY {mint[:8]}")
+                    engine.log(f"⚡ V14 SAFE ENTRY {mint[:8]}")
 
                     size = max(MIN_POSITION_SOL * 1.3, 0.0015)
                     size = min(size, MAX_POSITION_SOL)
@@ -890,19 +856,32 @@ async def bot_loop():
                     await buy(
                         mint,
                         20.0,
-                        source_hint="v11_safe",
+                        source_hint="v14_safe",
+                        size_override=size,
+                    )
+                    traded = True
+
+            if not traded and len(engine.positions) == 0 and CANDIDATES:
+                mint = random.choice(list(CANDIDATES))
+                if not has_position(mint):
+                    size = MIN_POSITION_SOL * 1.2
+                    engine.log(f"⚡ V14 SEED ENTRY {mint[:8]}")
+                    await buy(
+                        mint,
+                        20.0,
+                        source_hint="v14_seed",
                         size_override=size,
                     )
                     traded = True
 
             for name, s in strategy_state.summary().items():
-                w = portfolio.weight(name)
+                w = get_weight(name)
                 if s["loss_streak"] >= 3 or w < 0.05:
                     strategy_state.disable(name)
                     engine.log(f"💀 KILLED {name} weight={w:.3f}")
 
             if not traded:
-                engine.log("🚫 NO TRADE (v11 filtered)")
+                engine.log("🚫 NO TRADE (v14 filtered)")
 
             engine.stats["signals"] += 1
 
@@ -918,6 +897,7 @@ async def bot_loop():
             for name, s in strategy_state.summary().items():
                 engine.log(
                     f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} "
+                    f"evo={get_weight(name):.3f} "
                     f"cap={strategy_cap_ratio(name):.2f} buys={s['buys']} sells={s['sells']} "
                     f"wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f}"
                 )
