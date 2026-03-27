@@ -28,6 +28,8 @@ from alpha_engine import rank_candidates
 paper = PaperEngine()
 strategy_state = StrategyState()
 
+strategy_state.disable("fallback")
+
 RPC = os.getenv("RPC", "").strip()
 SOL = "So11111111111111111111111111111111111111112"
 
