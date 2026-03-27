@@ -4,6 +4,7 @@ from smart_wallet_ranker import rank_wallets
 
 import random
 
+
 async def auto_discover_smart_wallets(RPC, candidate_mints, max_wallets=5):
     wallets = []
 
