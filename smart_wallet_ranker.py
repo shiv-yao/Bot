@@ -1,26 +1,14 @@
-print("SMART_WALLET_RANKER_LOADED")
-
-import os
 import httpx
 
 CACHE = {}
 
-HELIUS = "https://api.helius.xyz/v0"
-API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
-
 
 async def get_wallet_txs(wallet: str):
-    if not wallet:
-        return []
-
-    if not API_KEY:
-        return []
-
     try:
-        url = f"{HELIUS}/addresses/{wallet}/transactions?api-key={API_KEY}"
-
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
+            r = await client.get(
+                f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+            )
 
         if r.status_code != 200:
             return []
@@ -41,13 +29,13 @@ def calc_wallet_score(txs):
 
     for tx in txs:
         try:
-            val = tx.get("nativeTransfers", [])
-            if not val:
+            native_transfers = tx.get("nativeTransfers", [])
+            if not native_transfers:
                 continue
 
-            trades += 1
+            amount = sum(float(v.get("amount", 0) or 0) for v in native_transfers)
 
-            amount = sum(float(v.get("amount", 0) or 0) for v in val)
+            trades += 1
 
             if amount > 0:
                 pnl += amount
@@ -62,15 +50,14 @@ def calc_wallet_score(txs):
         return 0.0
 
     winrate = wins / trades
-    score = pnl * 0.7 + winrate * 100.0
+
+    # 簡化版分數
+    score = (pnl * 0.7) + (winrate * 100.0)
     return score
 
 
 async def rank_wallets(wallets):
     scored = []
-
-    if not wallets:
-        return []
 
     for w in wallets:
         if not w:
@@ -87,4 +74,6 @@ async def rank_wallets(wallets):
         scored.append((w, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+
+    # 只保留正分 wallet，最多 10 個
     return [w for w, s in scored if s > 0][:10]
