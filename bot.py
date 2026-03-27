@@ -1,6 +1,5 @@
 import os
 import asyncio
-import random
 import httpx
 
 from alpha_boost_v3 import alpha_fusion
@@ -10,13 +9,11 @@ from regime import regime_risk_multiplier, regime_take_profit, regime_stop_loss
 
 from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets
-from liquidity_engine import liquidity_signal
 from smart_wallet_auto_v2 import auto_discover_smart_wallets, smart_wallet_signal_from_auto
 from state import engine
 from wallet import load_keypair
 from jupiter import get_order, execute_order
 from mempool import mempool_stream
-from insider_engine import insider_signal
 from alpha_engine import rank_candidates
 
 paper = PaperEngine()
@@ -68,10 +65,10 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
         return "early_buy"
     if alpha_score_value == 25:
         return "fast_buy"
+    if alpha_score_value == 20:
+        return "v8_safe"
     if alpha_score_value == 10:
         return "fallback"
-    if alpha_score_value == 20:
-        return "v6_safe"
     return f"alpha_{round(alpha_score_value, 2)}"
 
 
@@ -88,7 +85,7 @@ def strategy_cap_ratio(source: str) -> float:
         "fusion_anti_rug": 0.10,
         "fast_buy": 0.05,
         "early_buy": 0.04,
-        "v6_safe": 0.04,
+        "v8_safe": 0.04,
         "fallback": 0.00,
     }
     return caps.get(source, 0.08)
@@ -121,7 +118,7 @@ def weighted_position_size(source: str) -> float:
     if source in ["early_buy", "fast_buy"]:
         size *= 0.5
 
-    if source == "v6_safe":
+    if source == "v8_safe":
         size *= 0.6
 
     size = min(size, MAX_POSITION_SOL)
@@ -138,7 +135,7 @@ def weighted_position_size(source: str) -> float:
     return size
 
 
-def dynamic_size_v6(size: float, strength: float, regime: str) -> float:
+def dynamic_size_v8(size: float, strength: float, regime: str) -> float:
     if regime == "trend":
         size *= 1.3
     elif regime == "chop":
@@ -319,7 +316,7 @@ async def smart_money_confirm(mint: str, smart_wallets: list):
         return False
 
 
-async def should_enter_v6(mint: str, smart_wallets: list):
+async def should_enter_v8(mint: str, smart_wallets: list):
     ok_momo, strength = await momentum_confirm(mint)
     if not ok_momo:
         return True, "weak_momentum", strength * 0.5
@@ -495,9 +492,7 @@ async def buy(
             "source": src,
         })
         engine.trade_history = engine.trade_history[-100:]
-        engine.log(
-            f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} size={size:.6f}"
-        )
+        engine.log(f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} size={size:.6f}")
         return
 
     sig_json, token_amount, entry = await place_buy_order(mint, size)
@@ -598,7 +593,7 @@ async def sell(position: dict):
         return
 
 
-async def detect_regime_v6():
+async def detect_regime_v8():
     if len(engine.trade_history) < 5:
         return "neutral"
 
@@ -626,7 +621,7 @@ async def detect_regime_v6():
 async def monitor():
     while True:
         try:
-            regime = await detect_regime_v6()
+            regime = await detect_regime_v8()
             take_profit = regime_take_profit(regime, BASE_TAKE_PROFIT)
             stop_loss = regime_stop_loss(regime, BASE_STOP_LOSS)
 
@@ -706,7 +701,7 @@ async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V6 STABLE ENTRY BOT LOADED")
+    engine.log("🚨 V8 STABLE ENTRY BOT LOADED")
     engine.log("🛡️ NO FALLBACK MODE")
     engine.mode = MODE
 
@@ -719,7 +714,7 @@ async def bot_loop():
             await sync_positions()
 
             now = asyncio.get_event_loop().time()
-            regime = await detect_regime_v6()
+            regime = await detect_regime_v8()
             engine.log(f"📊 REGIME {regime}")
 
             if now - LAST_SMART_WALLET_REFRESH > 5:
@@ -741,7 +736,7 @@ async def bot_loop():
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
 
             if fusion_mint and not has_position(fusion_mint):
-                ok, reason, strength = await should_enter_v6(
+                ok, reason, strength = await should_enter_v8(
                     fusion_mint,
                     AUTO_SMART_WALLETS
                 )
@@ -751,11 +746,11 @@ async def bot_loop():
                 else:
                     preview_size = weighted_position_size(fusion_source or "fusion_momentum")
                     regime_mult = regime_risk_multiplier(regime)
-                    final_size = dynamic_size_v6(preview_size * regime_mult, strength, regime)
+                    final_size = dynamic_size_v8(preview_size * regime_mult, strength, regime)
 
                     if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
                         engine.log(
-                            f"🧠 V6 ENTRY {fusion_source} {fusion_mint[:8]} "
+                            f"🧠 V8 ENTRY {fusion_source} {fusion_mint[:8]} "
                             f"{reason} strength={strength:.4f} regime={regime} "
                             f"size={final_size:.6f}"
                         )
@@ -771,21 +766,21 @@ async def bot_loop():
                 ranked = await rank_candidates(CANDIDATES)
                 if ranked:
                     mint = ranked[0]["mint"]
-                    engine.log(f"⚡ V6 SAFE ENTRY {mint[:8]}")
+                    engine.log(f"⚡ V8 SAFE ENTRY {mint[:8]}")
 
-                    size = max(MIN_POSITION_SOL * 1.2, 0.0012)
+                    size = max(MIN_POSITION_SOL * 1.3, 0.0015)
                     size = min(size, MAX_POSITION_SOL)
 
                     await buy(
                         mint,
                         20.0,
-                        source_hint="v6_safe",
+                        source_hint="v8_safe",
                         size_override=size,
                     )
                     traded = True
 
             if not traded:
-                engine.log("🚫 NO TRADE (v6 filtered)")
+                engine.log("🚫 NO TRADE (v8 filtered)")
 
             engine.stats["signals"] += 1
 
