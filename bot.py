@@ -820,6 +820,14 @@ async def bot_loop():
             traded = False
 
             # ================= ALPHA V3（核心） =================
+            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+            if fusion_mint and not has_position(fusion_mint):
+                if len(engine.positions) < MAX_POSITIONS:
+                    engine.log(
+                        f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
+                    )
+                    await buy(fusion_mint, fusion_score, source_hint=fusion_source)
+                    traded = True
                         # ================= ALPHA V3（核心） =================
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
             if fusion_mint and not has_position(fusion_mint):
