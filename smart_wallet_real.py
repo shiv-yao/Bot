@@ -1,21 +1,34 @@
+print("SMART_WALLET_REAL_LOADED")
+
+import os
 import httpx
 
-# 🔥 用 Helius API（免費就夠用）
 HELIUS = "https://api.helius.xyz/v0"
+API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
-API_KEY = ""  # 👉 你之後可以放 key（先空也能跑）
 
 async def get_signatures(mint: str):
+    if not mint:
+        return []
+
+    if not API_KEY:
+        return []
+
     try:
         url = f"{HELIUS}/addresses/{mint}/transactions?api-key={API_KEY}"
+
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
+
         if r.status_code != 200:
             return []
 
         data = r.json()
-        return data[:20]  # 前20筆
-    except:
+        if not isinstance(data, list):
+            return []
+
+        return data[:20]
+    except Exception:
         return []
 
 
@@ -24,10 +37,14 @@ async def extract_wallets_from_tx(tx_list):
 
     for tx in tx_list:
         try:
-            for acc in tx.get("accounts", []):
-                if len(acc) > 30:
+            accounts = tx.get("accounts", [])
+            if not isinstance(accounts, list):
+                continue
+
+            for acc in accounts:
+                if isinstance(acc, str) and len(acc) > 30:
                     wallets.add(acc)
-        except:
+        except Exception:
             continue
 
     return list(wallets)
@@ -36,7 +53,10 @@ async def extract_wallets_from_tx(tx_list):
 async def real_smart_wallets(RPC, candidates):
     wallets = set()
 
-    for mint in list(candidates)[:10]:  # 限制量
+    if not candidates:
+        return []
+
+    for mint in list(candidates)[:10]:
         txs = await get_signatures(mint)
         ws = await extract_wallets_from_tx(txs)
 
@@ -50,7 +70,9 @@ async def real_smart_signal(RPC, wallets, candidates):
     if not wallets:
         return None
 
-    # 🔥 簡化版：隨機挑一個候選（之後可升級成 wallet tracking）
+    if not candidates:
+        return None
+
     for mint in candidates:
         return mint
 
