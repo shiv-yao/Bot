@@ -35,12 +35,12 @@ MODE = os.getenv("MODE", "REAL").upper()
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 MIN_POSITION_SOL = float(os.getenv("MIN_POSITION_SOL", "0.001"))
-MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.003"))
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.10"))
+MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.0025"))
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.08"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.08"))
-TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.10"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.12"))
+STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.04"))
+TRAILING = float(os.getenv("TRAILING_STOP_PCT", "0.06"))
 
 ENABLE_AUTO_SELL = os.getenv("ENABLE_AUTO_SELL", "true").lower() == "true"
 ADD_ON_WIN = os.getenv("ADD_ON_WIN", "true").lower() == "true"
@@ -86,13 +86,11 @@ def strategy_cap_ratio(source: str) -> float:
         "real_smart": 0.25,
         "auto_smart": 0.18,
         "smart_money": 0.18,
-
-        "fusion_liquidity": 0.25,
+        "fusion_liquidity": 0.15,
         "fusion_momentum": 0.18,
         "fusion_volume": 0.15,
         "fusion_anti_rug": 0.12,
         "fusion_fallback": 0.03,
-
         "fast_buy": 0.10,
         "early_buy": 0.08,
         "fallback": 0.05,
@@ -278,6 +276,93 @@ async def get_price(mint: str):
         return None
 
 
+async def get_liquidity_and_impact(mint: str):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": SOL,
+                    "outputMint": mint,
+                    "amount": "10000000",
+                    "slippageBps": 200,
+                },
+            )
+
+        if r.status_code != 200:
+            return 0, 1
+
+        data = r.json()
+        out = int(data.get("outAmount", 0) or 0)
+        impact = float(data.get("priceImpactPct", 1) or 1)
+        return out, impact
+    except Exception:
+        return 0, 1
+
+
+async def momentum_confirm(mint: str):
+    p1 = await get_price(mint)
+    await asyncio.sleep(0.2)
+    p2 = await get_price(mint)
+    await asyncio.sleep(0.3)
+    p3 = await get_price(mint)
+
+    if not p1 or not p2 or not p3 or p1 <= 0 or p2 <= 0:
+        return False, 0.0
+
+    m1 = (p2 - p1) / p1
+    m2 = (p3 - p2) / p2
+
+    if m1 > 0.01 and m2 > 0.01:
+        return True, (m1 + m2)
+
+    return False, 0.0
+
+
+async def fake_pump_filter(mint: str):
+    liq, impact = await get_liquidity_and_impact(mint)
+
+    if impact > 0.28:
+        return False
+
+    if liq < 80000:
+        return False
+
+    return True
+
+
+async def smart_money_confirm(mint: str, smart_wallets: list):
+    try:
+        signal = await smart_wallet_signal_from_auto(RPC, smart_wallets, {mint})
+        return signal == mint
+    except Exception:
+        return False
+
+
+async def should_enter_v4(mint: str, smart_wallets: list):
+    ok_momo, strength = await momentum_confirm(mint)
+    if not ok_momo:
+        return False, "no_momentum", 0.0
+
+    ok_fake = await fake_pump_filter(mint)
+    if not ok_fake:
+        return False, "fake_pump", 0.0
+
+    ok_smart = await smart_money_confirm(mint, smart_wallets)
+    if not ok_smart:
+        return False, "no_smart_money", 0.0
+
+    return True, "ok", strength
+
+
+def dynamic_size(size: float, strength: float) -> float:
+    if strength > 0.04:
+        return min(size * 1.5, MAX_POSITION_SOL)
+    if strength > 0.02:
+        return min(size * 1.2, MAX_POSITION_SOL)
+    return max(size * 0.8, MIN_POSITION_SOL)
+
+
 async def send_signed_tx(signed_tx: str):
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -395,7 +480,12 @@ async def place_buy_order(mint: str, size_sol: float):
     return sig_json, token_amount, entry
 
 
-async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None):
+async def buy(
+    mint: str,
+    alpha_score_value: float = 0.0,
+    source_hint: str = None,
+    size_override: float = None,
+):
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
         return
@@ -414,7 +504,7 @@ async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None
         engine.log(f"STRATEGY DISABLED {src}")
         return
 
-    size = weighted_position_size(src)
+    size = size_override if size_override is not None else weighted_position_size(src)
     if size <= 0:
         engine.log(f"BUY BLOCKED: ZERO SIZE {src}")
         return
@@ -767,15 +857,17 @@ async def handle_mempool(event: dict):
     except Exception as e:
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
+
+
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
-    engine.log("🚨 V3 BOT LOOP LOADED")
+    engine.log("🚨 V4 BOT LOOP LOADED")
     engine.log("🚨 alpha_fusion import OK")
 
     engine.mode = MODE
-    engine.log("🔥 PHASE ALLOCATOR + ALPHA V3 START")
+    engine.log("🔥 PHASE ALLOCATOR + ALPHA V4 START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -813,15 +905,35 @@ async def bot_loop():
 
             traded = False
 
-            # ================= 🔥 ALPHA V3（核心） =================
+            # ================= 🔥 ALPHA V4（核心） =================
             fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
+
             if fusion_mint and not has_position(fusion_mint):
-                if len(engine.positions) < MAX_POSITIONS:
-                    engine.log(
-                        f"🧠 ALPHA FUSION {fusion_source} {fusion_mint[:8]} {fusion_score:.2f}"
-                    )
-                    await buy(fusion_mint, fusion_score, source_hint=fusion_source)
-                    traded = True
+                ok, reason, strength = await should_enter_v4(
+                    fusion_mint,
+                    AUTO_SMART_WALLETS
+                )
+
+                if not ok:
+                    engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
+                else:
+                    if len(engine.positions) < MAX_POSITIONS:
+                        preview_size = weighted_position_size(fusion_source)
+                        final_size = dynamic_size(preview_size, strength)
+
+                        engine.log(
+                            f"🧠 V4 ENTRY {fusion_source} {fusion_mint[:8]} "
+                            f"score={fusion_score:.2f} strength={strength:.4f} "
+                            f"base={preview_size:.6f} final={final_size:.6f}"
+                        )
+
+                        await buy(
+                            fusion_mint,
+                            fusion_score,
+                            source_hint=fusion_source,
+                            size_override=final_size,
+                        )
+                        traded = True
 
             # ================= 舊 alpha 層（只有 fusion 沒出手才跑） =================
             if not traded:
@@ -909,5 +1021,3 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
-
-
