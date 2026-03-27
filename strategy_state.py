@@ -53,10 +53,13 @@ class StrategyState:
         weight = 1.0
 
         if sells >= 2 and wins >= 2 and total > 0:
+            weight = 1.25
+
+        if sells >= 3 and wins >= 2 and total > 0.0003:
             weight = 1.5
 
-        if sells >= 3 and wins >= 3 and total > 0.0005:
-            weight = 2.0
+        if sells >= 4 and wins >= 3 and total > 0.0008:
+            weight = 1.8
 
         if loss_streak >= 1 and total < 0:
             weight = 0.75
@@ -67,9 +70,11 @@ class StrategyState:
         if loss_streak >= 3 and total < 0:
             weight = 0.0
 
-        # fallback 預設不要給太大倉位
         if source == "fallback":
-            weight = min(weight, 0.5)
+            weight = min(weight, 0.30)
+
+        if source in ["early_buy", "fast_buy"]:
+            weight = min(weight, 0.70)
 
         s["weight"] = max(0.0, min(weight, 2.0))
 
@@ -82,12 +87,13 @@ class StrategyState:
         self.ensure(source)
         s = self.stats[source]
 
-        # 只有「連虧很多 + 總PnL也負」才真的關掉
         if s["loss_streak"] >= max_loss_streak and s["total_pnl"] < 0:
             s["enabled"] = False
 
-        # 做過至少 3 筆以上還是明顯虧損，才關
         if s["sells"] >= 3 and s["total_pnl"] <= min_total_pnl:
+            s["enabled"] = False
+
+        if s["weight"] <= 0:
             s["enabled"] = False
 
     def enabled(self, source: str) -> bool:
@@ -97,14 +103,6 @@ class StrategyState:
     def weight(self, source: str) -> float:
         self.ensure(source)
         return self.stats[source]["weight"]
-
-    def disable(self, source: str):
-        self.ensure(source)
-        self.stats[source]["enabled"] = False
-
-    def enable(self, source: str):
-        self.ensure(source)
-        self.stats[source]["enabled"] = True
 
     def summary(self):
         return self.stats
