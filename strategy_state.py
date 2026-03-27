@@ -64,7 +64,7 @@ class StrategyState:
         if loss_streak >= 2 and total < 0:
             weight = 0.5
 
-        if loss_streak >= 3:
+        if loss_streak >= 3 and total < 0:weight = 0.0:
             weight = 0.0
 
         s["weight"] = max(0.0, min(weight, 2.0))
