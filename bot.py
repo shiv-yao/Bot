@@ -2,6 +2,7 @@ import os
 import asyncio
 import httpx
 
+from smart_wallet_ranker import rank_wallets
 from smart_wallet_real import real_smart_wallets, real_smart_signal
 from liquidity_engine import liquidity_signal
 from smart_wallet_auto import auto_discover_smart_wallets, smart_wallet_signal_from_auto
@@ -512,13 +513,12 @@ async def handle_mempool(event: dict):
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
 
-
 async def bot_loop():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
 
     engine.mode = MODE
-    engine.log("PHASE M START")
+    engine.log("PHASE N START")
 
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
@@ -530,14 +530,17 @@ async def bot_loop():
 
             now = asyncio.get_event_loop().time()
 
-            # 1. auto smart wallet refresh
+            # 1. auto smart wallet refresh（raw -> ranked）
             if now - LAST_SMART_WALLET_REFRESH > 5:
-                AUTO_SMART_WALLETS = await auto_discover_smart_wallets(
-                    RPC, CANDIDATES, max_wallets=8
+                raw_wallets = await auto_discover_smart_wallets(
+                    RPC, CANDIDATES, max_wallets=20
                 )
+                AUTO_SMART_WALLETS = await rank_wallets(raw_wallets)
                 LAST_SMART_WALLET_REFRESH = now
+
+                engine.log(f"SMART WALLET RAW {len(raw_wallets)}")
                 engine.log(
-                    f"AUTO SMART WALLETS {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:5]}"
+                    f"SMART WALLET RANKED {len(AUTO_SMART_WALLETS)} {AUTO_SMART_WALLETS[:5]}"
                 )
 
             # 2. real smart wallet refresh
@@ -569,8 +572,10 @@ async def bot_loop():
                     engine.log(f"SMART MONEY HIT {smart_money_mint[:8]}")
                     await buy(smart_money_mint, alpha_score_value=500.0)
 
-            # 6. auto smart wallet alpha
-            auto_smart_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS)
+            # 6. ranked auto smart wallet alpha
+            auto_smart_mint = await smart_wallet_signal_from_auto(
+                RPC, AUTO_SMART_WALLETS, CANDIDATES
+            )
             if auto_smart_mint and not has_position(auto_smart_mint):
                 if len(engine.positions) < MAX_POSITIONS:
                     engine.log(f"AUTO SMART HIT {auto_smart_mint[:8]}")
@@ -593,11 +598,13 @@ async def bot_loop():
                 engine.last_signal = f"alpha:{score:.2f}"
                 engine.log(f"BEST {mint[:8]} score={score:.2f}")
 
-                if score > 22 and not has_position(mint):
+                # 🔥 Phase N：只有有 smart wallets 時才讓 ranking 買
+                if score > 25 and not has_position(mint):
                     if len(engine.positions) < MAX_POSITIONS:
-                        await buy(mint, alpha_score_value=score)
+                        if len(AUTO_SMART_WALLETS) > 0 or len(REAL_SMART_WALLETS) > 0:
+                            await buy(mint, alpha_score_value=score)
 
-            # 9. fallback alpha（保底進場）
+            # 9. fallback alpha（保底進場，避免完全沒交易）
             if CANDIDATES:
                 import random
 
@@ -615,3 +622,4 @@ async def bot_loop():
             engine.log(f"LOOP ERROR {e}")
 
         await asyncio.sleep(4)
+
