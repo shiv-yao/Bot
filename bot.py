@@ -2,6 +2,9 @@ import os
 import asyncio
 import random
 import time
+from collections import defaultdict, deque
+from typing import Dict, List, Optional, Tuple
+
 import httpx
 
 from alpha_boost_v3 import alpha_fusion
@@ -17,6 +20,7 @@ from wallet import load_keypair
 from jupiter import get_order, execute_order
 from mempool import mempool_stream
 from alpha_engine import rank_candidates
+
 
 paper = PaperEngine()
 strategy_state = StrategyState()
@@ -42,60 +46,87 @@ ADD_TRIGGER_PCT = float(os.getenv("ADD_TRIGGER_PCT", "0.08"))
 ADD_SIZE_MULTIPLIER = float(os.getenv("ADD_SIZE_MULTIPLIER", "0.5"))
 MAX_ADDS_PER_POSITION = int(os.getenv("MAX_ADDS_PER_POSITION", "1"))
 
-AUTO_SMART_WALLETS = []
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "0.08"))
+PARTIAL_TP_FRACTION = float(os.getenv("PARTIAL_TP_FRACTION", "0.40"))
+BREAK_EVEN_TRIGGER_PCT = float(os.getenv("BREAK_EVEN_TRIGGER_PCT", "0.05"))
+BREAK_EVEN_BUFFER_PCT = float(os.getenv("BREAK_EVEN_BUFFER_PCT", "0.003"))
+TIME_STOP_SEC = int(os.getenv("TIME_STOP_SEC", "1800"))
+
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "300"))
+CANDIDATE_TTL_SEC = int(os.getenv("CANDIDATE_TTL_SEC", "900"))
+SOURCE_COOLDOWN_SEC = int(os.getenv("SOURCE_COOLDOWN_SEC", "60"))
+TOKEN_COOLDOWN_SEC = int(os.getenv("TOKEN_COOLDOWN_SEC", "90"))
+MAX_PORTFOLIO_EXPOSURE = float(os.getenv("MAX_PORTFOLIO_EXPOSURE", "0.75"))
+MAX_DAILY_LOSS_SOL = float(os.getenv("MAX_DAILY_LOSS_SOL", "0.10"))
+MIN_SMART_WALLET_REFRESH = int(os.getenv("MIN_SMART_WALLET_REFRESH", "5"))
+MIN_REAL_SMART_REFRESH = int(os.getenv("MIN_REAL_SMART_REFRESH", "15"))
+LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "4"))
+MONITOR_SLEEP_SEC = float(os.getenv("MONITOR_SLEEP_SEC", "5"))
+
+AUTO_SMART_WALLETS: List[str] = []
 LAST_SMART_WALLET_REFRESH = 0.0
-REAL_SMART_WALLETS = []
+REAL_SMART_WALLETS: List[str] = []
 LAST_REAL_REFRESH = 0.0
 
 CANDIDATES = set()
+CANDIDATE_META: Dict[str, Dict] = {}
+SOURCE_LAST_TRADE_AT: Dict[str, float] = defaultdict(float)
+TOKEN_LAST_TRADE_AT: Dict[str, float] = defaultdict(float)
+FAILED_ROUTE_COUNTS: Dict[str, int] = defaultdict(int)
 
 
-# =========================================================
-# V14/V15 Strategy Evolution
-# =========================================================
+def now_ts() -> float:
+    return time.time()
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(v, hi))
+
+
 class StrategyEvolution:
     def __init__(self):
-        self.performance = {}
+        self.performance: Dict[str, deque] = {}
 
     def update(self, strategy: str, pnl: float):
-        self.performance.setdefault(strategy, []).append(float(pnl))
-        self.performance[strategy] = self.performance[strategy][-40:]
+        dq = self.performance.setdefault(strategy, deque(maxlen=60))
+        dq.append(float(pnl))
 
     def weight(self, strategy: str) -> float:
         if not self.performance:
-            return 0.05
+            return 0.20
 
         scores = {}
         for strat, pnls in self.performance.items():
             if not pnls:
                 continue
-            avg = sum(pnls) / len(pnls)
-            win = sum(1 for x in pnls if x > 0) / len(pnls)
-            downside = abs(sum(x for x in pnls if x < 0)) / max(1, len(pnls))
-            score = avg * 0.65 + win * 0.30 - downside * 0.10
-            scores[strat] = max(score, 0.01)
+            arr = list(pnls)
+            avg = sum(arr) / len(arr)
+            win = sum(1 for x in arr if x > 0) / len(arr)
+            downside = abs(sum(x for x in arr if x < 0)) / max(1, len(arr))
+            recent = sum(arr[-10:]) / max(1, min(10, len(arr)))
+            score = avg * 0.50 + win * 0.25 + recent * 0.20 - downside * 0.10
+            scores[strat] = max(score, 0.03)
 
         total = sum(scores.values()) or 1.0
-        return scores.get(strategy, 0.05) / total
+        return scores.get(strategy, 0.20) / total
 
     def stats(self):
-        return self.performance
+        return {k: list(v) for k, v in self.performance.items()}
 
 
 evolution = StrategyEvolution()
 
 
-# =========================================================
-# V14 Runtime Allocator
-# =========================================================
 class AutoAllocator:
     def __init__(self):
         self.global_win = 0
         self.global_loss = 0
         self.consecutive_wins = 0
         self.consecutive_losses = 0
+        self.recent_realized = deque(maxlen=30)
 
     def update(self, pnl: float):
+        self.recent_realized.append(float(pnl))
         if pnl > 0:
             self.global_win += 1
             self.consecutive_wins += 1
@@ -105,18 +136,18 @@ class AutoAllocator:
             self.consecutive_losses += 1
             self.consecutive_wins = 0
 
-    def size_multiplier(self):
+    def size_multiplier(self) -> float:
         if self.consecutive_wins >= 4:
-            return 1.5
+            return 1.45
         if self.consecutive_wins >= 2:
-            return 1.2
+            return 1.18
         if self.consecutive_losses >= 4:
-            return 0.4
+            return 0.35
         if self.consecutive_losses >= 2:
-            return 0.7
+            return 0.65
         return 1.0
 
-    def risk_mode(self):
+    def risk_mode(self) -> str:
         if self.consecutive_losses >= 4:
             return "hard_defensive"
         if self.consecutive_losses >= 2:
@@ -129,9 +160,6 @@ class AutoAllocator:
 allocator_runtime = AutoAllocator()
 
 
-# =========================================================
-# V16 Portfolio Manager
-# =========================================================
 class PortfolioManager:
     def source_exposure_ratio(self, source: str) -> float:
         capital = max(engine.capital, 1e-9)
@@ -155,31 +183,51 @@ class PortfolioManager:
                 exposure += entry * amount
         return exposure / capital
 
+    def can_add_more(self) -> bool:
+        return self.total_exposure_ratio() < MAX_PORTFOLIO_EXPOSURE
+
 
 portfolio = PortfolioManager()
 
 
-# =========================================================
-# V17 Risk Engine
-# =========================================================
 class RiskEngine:
     def __init__(self):
         self.equity_peak = 0.0
         self.cooldown_until = 0.0
         self.max_drawdown = float(os.getenv("MAX_DRAWDOWN_RATIO", "0.20"))
+        self.session_day = time.strftime("%Y-%m-%d")
+        self.daily_realized_pnl = 0.0
+
+    def _roll_day(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self.session_day:
+            self.session_day = today
+            self.daily_realized_pnl = 0.0
 
     def update(self, equity: float):
+        self._roll_day()
         self.equity_peak = max(self.equity_peak, equity)
+
+    def record_realized(self, pnl_sol: float):
+        self._roll_day()
+        self.daily_realized_pnl += float(pnl_sol)
 
     def drawdown(self, equity: float) -> float:
         if self.equity_peak <= 0:
             return 0.0
         return max(0.0, (self.equity_peak - equity) / self.equity_peak)
 
-    def allow_trade(self, equity: float) -> bool:
+    def allow_trade(self, equity: float) -> Tuple[bool, str]:
+        self._roll_day()
         if time.time() < self.cooldown_until:
-            return False
-        return self.drawdown(equity) < self.max_drawdown
+            return False, "cooldown"
+        if self.drawdown(equity) >= self.max_drawdown:
+            return False, "max_drawdown"
+        if self.daily_realized_pnl <= -abs(MAX_DAILY_LOSS_SOL):
+            return False, "daily_loss"
+        if not portfolio.can_add_more():
+            return False, "portfolio_exposure"
+        return True, "ok"
 
     def trigger_cooldown(self, seconds: int = 120):
         self.cooldown_until = time.time() + seconds
@@ -188,9 +236,35 @@ class RiskEngine:
 risk_engine = RiskEngine()
 
 
-# =========================================================
-# Helpers
-# =========================================================
+def candidate_cleanup():
+    cutoff = now_ts() - CANDIDATE_TTL_SEC
+    stale = [m for m, meta in CANDIDATE_META.items() if meta.get("last_seen", 0) < cutoff]
+    for mint in stale:
+        CANDIDATE_META.pop(mint, None)
+        CANDIDATES.discard(mint)
+
+    if len(CANDIDATE_META) > MAX_CANDIDATES:
+        ordered = sorted(CANDIDATE_META.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+        keep = {m for m, _ in ordered[:MAX_CANDIDATES]}
+        for mint in list(CANDIDATE_META.keys()):
+            if mint not in keep:
+                CANDIDATE_META.pop(mint, None)
+                CANDIDATES.discard(mint)
+
+
+def active_candidates(limit: Optional[int] = None) -> List[str]:
+    candidate_cleanup()
+    ordered = sorted(CANDIDATE_META.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+    mints = [mint for mint, _ in ordered]
+    return mints[:limit] if limit else mints
+
+
+def register_trade_cooldown(source: str, mint: str):
+    t = now_ts()
+    SOURCE_LAST_TRADE_AT[source] = t
+    TOKEN_LAST_TRADE_AT[mint] = t
+
+
 def source_name(alpha_score_value: float, source_hint: str = None) -> str:
     if source_hint:
         return source_hint
@@ -209,9 +283,9 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
     if alpha_score_value == 25:
         return "fast_buy"
     if alpha_score_value == 20:
-        return "v19_safe"
+        return "v25_safe"
     if alpha_score_value == 15:
-        return "v19_seed"
+        return "v25_seed"
     if alpha_score_value == 10:
         return "fallback"
     return f"alpha_{round(alpha_score_value, 2)}"
@@ -219,19 +293,19 @@ def source_name(alpha_score_value: float, source_hint: str = None) -> str:
 
 def strategy_cap_ratio(source: str) -> float:
     caps = {
-        "liquidity": 0.20,
+        "liquidity": 0.22,
         "insider": 0.18,
         "real_smart": 0.18,
-        "auto_smart": 0.15,
-        "smart_money": 0.15,
-        "fusion_liquidity": 0.15,
-        "fusion_momentum": 0.12,
-        "fusion_volume": 0.10,
+        "auto_smart": 0.16,
+        "smart_money": 0.16,
+        "fusion_liquidity": 0.18,
+        "fusion_momentum": 0.14,
+        "fusion_volume": 0.12,
         "fusion_anti_rug": 0.10,
         "fast_buy": 0.05,
         "early_buy": 0.04,
-        "v19_safe": 0.05,
-        "v19_seed": 0.03,
+        "v25_safe": 0.05,
+        "v25_seed": 0.03,
         "fallback": 0.00,
     }
     return caps.get(source, 0.08)
@@ -266,7 +340,7 @@ def weighted_position_size(source: str) -> float:
     if source in ["early_buy", "fast_buy"]:
         size *= 0.5
 
-    if source in ["v19_safe", "v19_seed"]:
+    if source in ["v25_safe", "v25_seed"]:
         size *= 0.6
 
     size = min(size, MAX_POSITION_SOL)
@@ -277,17 +351,13 @@ def weighted_position_size(source: str) -> float:
     remaining = max(0.0, source_cap - current_exposure)
     size = min(size, remaining)
 
-    # V16 total portfolio exposure cap
-    if portfolio.total_exposure_ratio() > 0.70:
+    if portfolio.total_exposure_ratio() > MAX_PORTFOLIO_EXPOSURE:
         size *= 0.5
 
-    if size < MIN_POSITION_SOL:
-        return 0.0
-
-    return size
+    return 0.0 if size < MIN_POSITION_SOL else size
 
 
-def dynamic_size_v19(size: float, strength: float, regime: str, quality: float) -> float:
+def dynamic_size_v25(size: float, strength: float, regime: str, quality: float) -> float:
     if regime == "trend":
         size *= 1.35
     elif regime == "chop":
@@ -299,23 +369,26 @@ def dynamic_size_v19(size: float, strength: float, regime: str, quality: float) 
         size *= 1.45
     elif strength > 0.02:
         size *= 1.20
+    elif strength > 0.008:
+        size *= 0.95
     else:
-        size *= 0.80
+        size *= 0.75
 
     if quality > 120:
         size *= 1.20
     elif quality < 60:
         size *= 0.60
 
-    return max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
+    return clamp(size, 0.0, MAX_POSITION_SOL)
 
 
-def score_alpha(strength: float, liq: int, impact: float, smart_hit: bool) -> float:
+def score_alpha(strength: float, liq: int, impact: float, smart_hit: bool, rank_score: float = 0.0) -> float:
     liq_score = min(liq / 100000, 3.0) * 25.0
     momentum_score = max(0.0, strength) * 3000.0
     impact_penalty = max(0.0, impact - 0.10) * 120.0
     smart_bonus = 35.0 if smart_hit else 0.0
-    return liq_score + momentum_score + smart_bonus - impact_penalty
+    rank_bonus = min(rank_score, 100.0) * 0.30
+    return liq_score + momentum_score + smart_bonus + rank_bonus - impact_penalty
 
 
 def classify_alpha(score: float) -> str:
@@ -328,10 +401,26 @@ def classify_alpha(score: float) -> str:
 
 def regime_strategy_gate(regime: str, level: str, source: str) -> bool:
     if regime == "trash":
-        return source in ["v19_safe", "v19_seed"]
+        return source in ["v25_safe", "v25_seed"]
     if regime == "chop" and level == "weak":
         return False
     return True
+
+
+def token_on_cooldown(mint: str) -> bool:
+    return now_ts() - TOKEN_LAST_TRADE_AT.get(mint, 0.0) < TOKEN_COOLDOWN_SEC
+
+
+def source_on_cooldown(source: str) -> bool:
+    return now_ts() - SOURCE_LAST_TRADE_AT.get(source, 0.0) < SOURCE_COOLDOWN_SEC
+
+
+def estimate_realized_pnl_sol(position: dict, price: float, fraction: float = 1.0) -> float:
+    amount = float(position.get("amount", 0.0) or 0.0) * fraction
+    entry = float(position.get("entry_price", 0.0) or 0.0)
+    if amount <= 0 or entry <= 0 or price <= 0:
+        return 0.0
+    return (price - entry) * amount
 
 
 async def rpc_post(method: str, params: list):
@@ -412,6 +501,10 @@ async def sync_positions():
                 "alpha_score": old.get("alpha_score", 0.0),
                 "adds": old.get("adds", 0),
                 "source": old.get("source", "unknown"),
+                "partial_taken": old.get("partial_taken", False),
+                "break_even_armed": old.get("break_even_armed", False),
+                "opened_at": old.get("opened_at", now_ts()),
+                "last_sell_reason": old.get("last_sell_reason"),
             })
 
     engine.positions = new_positions
@@ -486,11 +579,7 @@ async def momentum_confirm(mint: str):
 
 async def fake_pump_filter(mint: str):
     liq, impact = await get_liquidity_and_impact(mint)
-    if impact > 0.40:
-        return False
-    if liq < 30000:
-        return False
-    return True
+    return impact <= 0.40 and liq >= 30000
 
 
 async def liquidity_trap_filter(mint: str):
@@ -510,7 +599,7 @@ async def smart_money_confirm(mint: str, smart_wallets: list):
         return False
 
 
-async def should_enter_v19(mint: str, smart_wallets: list):
+async def should_enter_v25(mint: str, smart_wallets: list, rank_score: float = 0.0):
     ok_momo, strength = await momentum_confirm(mint)
 
     ok_fake = await fake_pump_filter(mint)
@@ -522,14 +611,12 @@ async def should_enter_v19(mint: str, smart_wallets: list):
         return False, "liquidity_trap", 0.0, liq, impact, False, 0.0, "weak"
 
     smart_hit = await smart_money_confirm(mint, smart_wallets)
-    alpha_score = score_alpha(strength, liq, impact, smart_hit)
+    alpha_score = score_alpha(strength, liq, impact, smart_hit, rank_score)
     level = classify_alpha(alpha_score)
 
-    if strength < 0.001:
+    if strength < 0.0008 and alpha_score < 70:
         return False, "too_weak", strength, liq, impact, smart_hit, alpha_score, level
-
-    # V19 salvage: 無 smart hit 也可以用更小倉測試
-    if not ok_momo and alpha_score < 55:
+    if not ok_momo and alpha_score < 58:
         return False, "no_edge", strength, liq, impact, smart_hit, alpha_score, level
 
     return True, "ok", strength, liq, impact, smart_hit, alpha_score, level
@@ -550,12 +637,9 @@ async def rug_filter(mint: str) -> bool:
         data = r.json()
         out_amount = int(data.get("outAmount", 0) or 0)
         impact = float(data.get("priceImpactPct", 1) or 1)
-
         if out_amount == 0:
             return True
-        if impact > 0.4:
-            return False
-        return True
+        return impact <= 0.4
     except Exception:
         return False
 
@@ -593,13 +677,7 @@ async def place_buy_order(mint: str, size_sol: float):
         return None, None, None
 
     amount_atomic = int(size_sol * 1e9)
-
-    order = await get_order(
-        input_mint=SOL,
-        output_mint=mint,
-        amount_atomic=amount_atomic,
-        taker=str(kp.pubkey()),
-    )
+    order = await get_order(input_mint=SOL, output_mint=mint, amount_atomic=amount_atomic, taker=str(kp.pubkey()))
     if not order:
         return None, None, "BUY ORDER FAIL"
 
@@ -622,57 +700,73 @@ async def place_buy_order(mint: str, size_sol: float):
     except Exception:
         pass
 
-    entry = 0.0
-    if token_amount > 0:
-        entry = size_sol / token_amount
-
+    entry = size_sol / token_amount if token_amount > 0 else 0.0
     if entry <= 0:
         price_now = await get_price(mint)
         if price_now and price_now > 0:
             entry = price_now
-
     if entry <= 0:
         entry = 1e-9
-
     return sig_json, token_amount, entry
 
 
-async def buy(
-    mint: str,
-    alpha_score_value: float = 0.0,
-    source_hint: str = None,
-    size_override: float = None,
-):
+async def place_sell_order(mint: str, amount_token: float):
+    kp = load_keypair()
+    if not kp:
+        return None, "SELL FAILED: no key"
+
+    amount_atomic = int(max(0.0, amount_token) * 1_000_000)
+    if amount_atomic <= 0:
+        return None, "SELL FAILED: zero amount"
+
+    order = await get_order(input_mint=mint, output_mint=SOL, amount_atomic=amount_atomic, taker=str(kp.pubkey()))
+    if not order:
+        return None, "SELL ORDER FAIL"
+
+    result = await execute_order(order, kp)
+    if not result:
+        return None, "SELL EXEC FAIL"
+
+    signed_tx = result.get("signed_tx")
+    if not signed_tx:
+        return None, "SELL NO SIGNED TX"
+
+    return await send_signed_tx(signed_tx)
+
+
+async def buy(mint: str, alpha_score_value: float = 0.0, source_hint: str = None, size_override: float = None):
     if len(engine.positions) >= MAX_POSITIONS:
         engine.log("BUY BLOCKED: MAX_POSITIONS")
-        return
-
+        return False
     if has_position(mint):
         engine.log(f"BUY BLOCKED: ALREADY HAVE {mint[:8]}")
-        return
-
+        return False
+    if token_on_cooldown(mint):
+        engine.log(f"BUY BLOCKED: TOKEN COOLDOWN {mint[:8]}")
+        return False
     if not await rug_filter(mint):
         engine.log(f"BUY BLOCKED: RUG FILTER {mint[:8]}")
-        return
+        return False
 
     src = source_name(alpha_score_value, source_hint)
+    if source_on_cooldown(src):
+        engine.log(f"BUY BLOCKED: SOURCE COOLDOWN {src}")
+        return False
     if not strategy_state.enabled(src):
         engine.log(f"STRATEGY DISABLED {src}")
-        return
+        return False
 
     size = size_override if size_override is not None else weighted_position_size(src)
     if size <= 0:
         engine.log(f"BUY BLOCKED: ZERO SIZE {src}")
-        return
+        return False
 
     if MODE == "PAPER":
         price = await get_price(mint)
         if not price:
-            return
-
+            return False
         paper.buy(mint=mint, price=price, size=size, source=src)
         strategy_state.record_buy(src)
-
         engine.positions.append({
             "token": mint,
             "amount": size / price if price > 0 else 0.0,
@@ -683,31 +777,26 @@ async def buy(
             "alpha_score": alpha_score_value,
             "adds": 0,
             "source": src,
+            "partial_taken": False,
+            "break_even_armed": False,
+            "opened_at": now_ts(),
         })
-
         engine.stats["buys"] += 1
         engine.last_trade = f"PAPER BUY {mint[:8]}"
-        engine.trade_history.append({
-            "side": "PAPER_BUY",
-            "mint": mint,
-            "price": price,
-            "size": size,
-            "source": src,
-        })
-        engine.trade_history = engine.trade_history[-100:]
-        engine.log(
-            f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} size={size:.6f}"
-        )
-        return
+        engine.trade_history.append({"side": "PAPER_BUY", "mint": mint, "price": price, "size": size, "source": src, "alpha_score": alpha_score_value})
+        engine.trade_history = engine.trade_history[-200:]
+        register_trade_cooldown(src, mint)
+        engine.log(f"🟢 PAPER BUY {mint[:8]} price={price:.12g} src={src} size={size:.6f}")
+        return True
 
     sig_json, token_amount, entry = await place_buy_order(mint, size)
     if not sig_json:
         engine.stats["errors"] += 1
+        FAILED_ROUTE_COUNTS[src] += 1
         engine.log(str(entry) if isinstance(entry, str) else "BUY FAILED")
-        return
+        return False
 
     strategy_state.record_buy(src)
-
     engine.positions.append({
         "token": mint,
         "amount": token_amount,
@@ -718,24 +807,23 @@ async def buy(
         "alpha_score": alpha_score_value,
         "adds": 0,
         "source": src,
+        "partial_taken": False,
+        "break_even_armed": False,
+        "opened_at": now_ts(),
+        "entry_result": sig_json,
     })
-
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:8]}"
-    engine.trade_history.append({
-        "side": "BUY",
-        "mint": mint,
-        "result": sig_json,
-        "source": src,
-    })
-    engine.trade_history = engine.trade_history[-100:]
+    engine.trade_history.append({"side": "BUY", "mint": mint, "result": sig_json, "source": src, "alpha_score": alpha_score_value})
+    engine.trade_history = engine.trade_history[-200:]
+    register_trade_cooldown(src, mint)
     engine.log(f"BUY SUCCESS {mint[:8]}")
+    return True
 
 
 async def add_to_winner(position: dict):
     mint = position["token"]
     src = position.get("source", "unknown")
-
     if position.get("adds", 0) >= MAX_ADDS_PER_POSITION:
         return
 
@@ -747,185 +835,343 @@ async def add_to_winner(position: dict):
         price = await get_price(mint)
         if not price:
             return
-
         paper.buy(mint=mint, price=price, size=add_size, source=src)
         strategy_state.record_buy(src)
-
         old_amount = position["amount"]
         old_entry = position["entry_price"]
         add_amount = add_size / price if price > 0 else 0.0
-
         new_amount = old_amount + add_amount
         blended_entry = ((old_amount * old_entry) + (add_amount * price)) / new_amount if new_amount > 0 else old_entry
-
         position["amount"] = new_amount
         position["entry_price"] = blended_entry
         position["last_price"] = price
         position["peak_price"] = max(position.get("peak_price", price), price)
         position["adds"] = position.get("adds", 0) + 1
-
         engine.stats["adds"] += 1
         engine.last_trade = f"PAPER ADD {mint[:8]}"
+        register_trade_cooldown(src, mint)
         engine.log(f"🟡 PAPER ADD {mint[:8]} src={src} size={add_size:.6f}")
         return
 
+    sig_json, add_token_amount, add_entry = await place_buy_order(mint, add_size)
+    if not sig_json:
+        engine.stats["errors"] += 1
+        engine.log("ADD FAILED")
+        return
+    strategy_state.record_buy(src)
+    old_amount = position["amount"]
+    old_entry = position["entry_price"]
+    new_amount = old_amount + add_token_amount
+    blended_entry = ((old_amount * old_entry) + (add_token_amount * add_entry)) / new_amount if new_amount > 0 else old_entry
+    position["amount"] = new_amount
+    position["entry_price"] = blended_entry
+    position["last_price"] = add_entry
+    position["peak_price"] = max(position.get("peak_price", add_entry), add_entry)
+    position["adds"] = position.get("adds", 0) + 1
+    engine.stats["adds"] += 1
+    engine.last_trade = f"ADD {mint[:8]}"
+    engine.trade_history.append({"side": "ADD", "mint": mint, "result": sig_json, "source": src})
+    engine.trade_history = engine.trade_history[-200:]
+    register_trade_cooldown(src, mint)
+    engine.log(f"ADD SUCCESS {mint[:8]}")
 
-async def sell(position: dict):
+
+async def sell_fraction(position: dict, fraction: float = 1.0, reason: str = "exit"):
+    fraction = clamp(fraction, 0.0, 1.0)
+    if fraction <= 0:
+        return False
+
     src = position.get("source", "unknown")
+    mint = position["token"]
+    price = await get_price(mint)
+    if not price:
+        return False
+
+    realized_pnl_sol = estimate_realized_pnl_sol(position, price, fraction)
 
     if MODE == "PAPER":
-        price = await get_price(position["token"])
-        if not price:
-            return
+        if fraction < 0.999:
+            position["partial_taken"] = True
+            position["break_even_armed"] = True
+            position["last_sell_reason"] = reason
+            engine.log(f"🟠 PAPER VIRTUAL PARTIAL {mint[:8]} reason={reason} frac={fraction:.2f}")
+            return True
 
-        pnl, source_from_engine = paper.sell(position["token"], price)
+        pnl, source_from_engine = paper.sell(mint, price)
         final_source = source_from_engine or src
-
         strategy_state.record_sell(final_source, pnl)
         allocator_runtime.update(pnl)
         evolution.update(final_source, pnl)
-
-        if pnl < 0:
-            dd = risk_engine.drawdown(engine.capital)
-            if dd > 0.10:
-                risk_engine.trigger_cooldown(90)
-
-        engine.positions = [p for p in engine.positions if p["token"] != position["token"]]
+        risk_engine.record_realized(pnl)
+        if pnl < 0 and risk_engine.drawdown(engine.capital) > 0.10:
+            risk_engine.trigger_cooldown(90)
+        engine.positions = [p for p in engine.positions if p["token"] != mint]
         engine.stats["sells"] += 1
-        engine.last_trade = f"PAPER SELL {position['token'][:8]}"
-        engine.trade_history.append({
-            "side": "PAPER_SELL",
-            "mint": position["token"],
-            "price": price,
-            "pnl": pnl,
-            "source": final_source,
-            "pnl_pct": position.get("pnl_pct", 0.0),
-        })
-        engine.trade_history = engine.trade_history[-100:]
-        engine.log(f"🔴 PAPER SELL {position['token'][:8]} PnL={pnl:.6f} src={final_source}")
-        return
+        engine.last_trade = f"PAPER SELL {mint[:8]}"
+        engine.trade_history.append({"side": "PAPER_SELL", "mint": mint, "price": price, "pnl": pnl, "source": final_source, "pnl_pct": position.get("pnl_pct", 0.0), "reason": reason})
+        engine.trade_history = engine.trade_history[-200:]
+        register_trade_cooldown(final_source, mint)
+        engine.log(f"🔴 PAPER SELL {mint[:8]} PnL={pnl:.6f} src={final_source} reason={reason}")
+        return True
+
+    amount_to_sell = float(position.get("amount", 0.0) or 0.0) * fraction
+    sig_json, err = await place_sell_order(mint, amount_to_sell)
+    if err:
+        engine.stats["errors"] += 1
+        engine.log(err)
+        return False
+
+    strategy_state.record_sell(src, position.get("pnl_pct", 0.0))
+    allocator_runtime.update(realized_pnl_sol)
+    evolution.update(src, realized_pnl_sol)
+    risk_engine.record_realized(realized_pnl_sol)
+
+    remaining = max(0.0, float(position.get("amount", 0.0) or 0.0) - amount_to_sell)
+    if remaining <= 1e-12 or fraction >= 0.999:
+        engine.positions = [p for p in engine.positions if p["token"] != mint]
+    else:
+        position["amount"] = remaining
+        position["partial_taken"] = True
+        position["break_even_armed"] = True
+        position["last_sell_reason"] = reason
+
+    engine.stats["sells"] += 1
+    engine.last_trade = f"SELL {mint[:8]}"
+    engine.trade_history.append({"side": "SELL", "mint": mint, "result": sig_json, "source": src, "pnl_pct": position.get("pnl_pct", 0.0), "reason": reason, "fraction": fraction})
+    engine.trade_history = engine.trade_history[-200:]
+    register_trade_cooldown(src, mint)
+    engine.log(f"SELL SUCCESS {mint[:8]} reason={reason} frac={fraction:.2f}")
+    return True
 
 
-async def detect_regime_v19():
-    if len(engine.trade_history) < 5:
+async def detect_regime_v25():
+    if len(engine.trade_history) >= 5:
+        wins = 0
+        total = 0
+        avg_abs = 0.0
+        for t in engine.trade_history[-12:]:
+            pnl = float(t.get("pnl_pct", t.get("pnl", 0)) or 0.0)
+            if pnl > 0:
+                wins += 1
+            avg_abs += abs(pnl)
+            total += 1
+        if total > 0:
+            winrate = wins / total
+            avg_abs /= total
+            if winrate > 0.62 and avg_abs > 0.01:
+                return "trend"
+            if winrate < 0.38:
+                return "chop"
+            if avg_abs < 0.003:
+                return "trash"
+
+    sample = active_candidates(limit=12)
+    if len(sample) < 3:
         return "neutral"
-
-    wins = 0
-    total = 0
-    avg_abs = 0.0
-
-    for t in engine.trade_history[-12:]:
-        pnl = float(t.get("pnl_pct", t.get("pnl", 0)) or 0.0)
-        if pnl > 0:
-            wins += 1
-        avg_abs += abs(pnl)
-        total += 1
-
-    if total == 0:
-        return "neutral"
-
-    winrate = wins / total
-    avg_abs /= total
-
-    if winrate > 0.62 and avg_abs > 0.01:
+    ups, downs = 0, 0
+    for mint in sample[:8]:
+        p1 = await get_price(mint)
+        await asyncio.sleep(0.03)
+        p2 = await get_price(mint)
+        if not p1 or not p2:
+            continue
+        if p2 > p1:
+            ups += 1
+        else:
+            downs += 1
+    if ups >= 5 and ups > downs:
         return "trend"
-    if winrate < 0.38:
+    if downs >= 5 and downs > ups:
         return "chop"
-    if avg_abs < 0.003:
-        return "trash"
     return "neutral"
 
 
 async def monitor():
     while True:
         try:
-            regime = await detect_regime_v19()
+            regime = await detect_regime_v25()
             take_profit = regime_take_profit(regime, BASE_TAKE_PROFIT)
             stop_loss = regime_stop_loss(regime, BASE_STOP_LOSS)
-
             if ENABLE_AUTO_SELL:
                 for p in list(engine.positions):
                     price = await get_price(p["token"])
                     if not price:
                         continue
-
                     entry = p.get("entry_price", 0.0)
                     if not entry or entry <= 0:
                         continue
-
                     p["last_price"] = price
                     p["peak_price"] = max(p.get("peak_price", price), price)
-
                     pnl = (price - entry) / entry
                     p["pnl_pct"] = pnl
-
                     engine.log(f"{p['token'][:8]} PNL {round(pnl * 100, 2)}%")
-
                     if ADD_ON_WIN and pnl >= ADD_TRIGGER_PCT and p.get("adds", 0) < MAX_ADDS_PER_POSITION:
                         await add_to_winner(p)
-
+                    if not p.get("partial_taken") and pnl >= PARTIAL_TP_PCT:
+                        if await sell_fraction(p, PARTIAL_TP_FRACTION, reason="partial_tp"):
+                            p["partial_taken"] = True
+                            p["break_even_armed"] = True
+                            continue
+                    if pnl >= BREAK_EVEN_TRIGGER_PCT:
+                        p["break_even_armed"] = True
+                    if p.get("break_even_armed") and price <= entry * (1.0 + BREAK_EVEN_BUFFER_PCT):
+                        await sell_fraction(p, 1.0, reason="break_even")
+                        continue
                     if take_profit > 0 and pnl >= take_profit:
-                        engine.log("TAKE PROFIT HIT")
-                        await sell(p)
+                        await sell_fraction(p, 1.0, reason="take_profit")
                         continue
-
                     if pnl <= -stop_loss:
-                        engine.log("STOP LOSS HIT")
-                        await sell(p)
+                        await sell_fraction(p, 1.0, reason="stop_loss")
                         continue
-
                     peak = p.get("peak_price", price)
                     if peak > 0:
                         drawdown = (peak - price) / peak
                         if peak > entry and drawdown >= TRAILING:
-                            engine.log("TRAILING STOP HIT")
-                            await sell(p)
+                            await sell_fraction(p, 1.0, reason="trailing_stop")
                             continue
-
+                    held_sec = now_ts() - float(p.get("opened_at", now_ts()))
+                    if held_sec >= TIME_STOP_SEC and pnl > 0.01:
+                        await sell_fraction(p, 1.0, reason="time_stop")
+                        continue
         except Exception as e:
             engine.stats["errors"] += 1
             engine.log(f"MONITOR ERR {e}")
-
-        await asyncio.sleep(5)
+        await asyncio.sleep(MONITOR_SLEEP_SEC)
 
 
 async def handle_mempool(event: dict):
     try:
         mint = event.get("mint")
-        if not mint:
+        if not mint or len(mint) < 32 or len(mint) > 44:
             return
-
-        if len(mint) < 32 or len(mint) > 44:
-            return
-
         price = await get_price(mint)
         if not price:
             return
-
         CANDIDATES.add(mint)
-        if len(CANDIDATES) > 300:
-            try:
-                CANDIDATES.pop()
-            except Exception:
-                pass
-
+        meta = CANDIDATE_META.setdefault(mint, {"seen": 0, "last_seen": 0.0, "last_price": price})
+        meta["seen"] += 1
+        meta["last_seen"] = now_ts()
+        meta["last_price"] = price
+        candidate_cleanup()
         engine.log(f"CANDIDATE ADD {mint[:8]}")
         engine.log(f"CANDIDATES SIZE {len(CANDIDATES)}")
         engine.log(f"CANDIDATE READY {mint[:8]}")
-
     except Exception as e:
         engine.stats["errors"] += 1
         engine.log(f"MEMPOOL ERR {e}")
 
 
-async def bot_loop():
+async def refresh_smart_wallets():
     global AUTO_SMART_WALLETS, LAST_SMART_WALLET_REFRESH
     global REAL_SMART_WALLETS, LAST_REAL_REFRESH
+    now = asyncio.get_event_loop().time()
+    candidate_set = set(active_candidates(limit=80))
+    if now - LAST_SMART_WALLET_REFRESH > MIN_SMART_WALLET_REFRESH:
+        raw_wallets = await auto_discover_smart_wallets(RPC, candidate_set, max_wallets=20)
+        AUTO_SMART_WALLETS = await rank_wallets(raw_wallets or [])
+        LAST_SMART_WALLET_REFRESH = now
+        engine.log(f"SMART RAW {len(raw_wallets or [])}")
+        engine.log(f"SMART RANKED {len(AUTO_SMART_WALLETS)}")
+    if now - LAST_REAL_REFRESH > MIN_REAL_SMART_REFRESH:
+        REAL_SMART_WALLETS = await real_smart_wallets(RPC, candidate_set)
+        LAST_REAL_REFRESH = now
+        engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
 
-    engine.log("🚨 V19 FULL STACK LOADED")
+
+async def select_routes():
+    candidates = active_candidates(limit=80)
+    candidate_set = set(candidates)
+    routes = []
+    fusion_mint, fusion_score, fusion_source = await alpha_fusion(candidate_set)
+    if fusion_mint:
+        routes.append({"mint": fusion_mint, "score": float(fusion_score or 0.0), "source": fusion_source or "fusion_momentum", "route": "fusion"})
+    if AUTO_SMART_WALLETS:
+        auto_mint = await smart_wallet_signal_from_auto(RPC, AUTO_SMART_WALLETS, candidate_set)
+        if auto_mint:
+            routes.append({"mint": auto_mint, "score": 85.0, "source": "auto_smart", "route": "auto_smart"})
+    if REAL_SMART_WALLETS:
+        real_mint = await smart_wallet_signal_from_auto(RPC, REAL_SMART_WALLETS, candidate_set)
+        if real_mint:
+            routes.append({"mint": real_mint, "score": 95.0, "source": "real_smart", "route": "real_smart"})
+    ranked = await rank_candidates(candidate_set)
+    if ranked:
+        for row in ranked[:3]:
+            routes.append({"mint": row["mint"], "score": float(row.get("score", 0.0) or 0.0), "source": "smart_money", "route": "ranked"})
+    best = {}
+    for r in routes:
+        mint = r["mint"]
+        if mint and (mint not in best or r["score"] > best[mint]["score"]):
+            best[mint] = r
+    return list(best.values())
+
+
+async def try_enter_route(route: dict, regime: str) -> bool:
+    mint = route["mint"]
+    src = route["source"]
+    if not mint or has_position(mint) or token_on_cooldown(mint):
+        return False
+
+    merged_wallets = list(dict.fromkeys((AUTO_SMART_WALLETS or []) + (REAL_SMART_WALLETS or [])))
+    ok, reason, strength, liq, impact, smart_hit, alpha_score, level = await should_enter_v25(
+        mint, merged_wallets, rank_score=float(route.get("score", 0.0) or 0.0)
+    )
+    if not ok:
+        engine.log(f"❌ FILTERED {mint[:8]} reason={reason}")
+        return False
+    if not regime_strategy_gate(regime, level, src):
+        engine.log(f"🚫 GATED {mint[:8]} regime={regime} level={level}")
+        return False
+
+    preview_size = weighted_position_size(src)
+    if preview_size <= 0:
+        return False
+    regime_mult = regime_risk_multiplier(regime)
+    base_size = dynamic_size_v25(preview_size * regime_mult, strength, regime, alpha_score)
+    alloc_mult = allocator_runtime.size_multiplier()
+    portfolio_weight = evolution.weight(src)
+    final_size = base_size * alloc_mult * max(0.35, portfolio_weight)
+
+    mode = allocator_runtime.risk_mode()
+    if mode == "hard_defensive":
+        final_size *= 0.35
+    elif mode == "defensive":
+        final_size *= 0.60
+    elif mode == "aggressive":
+        final_size *= 1.20
+
+    if level == "strong":
+        final_size *= 1.20
+    elif level == "weak":
+        if regime == "chop":
+            final_size = 0.0
+        elif regime == "neutral":
+            final_size *= 0.30
+        else:
+            final_size *= 0.45
+
+    if portfolio.source_exposure_ratio(src) > strategy_cap_ratio(src) * 0.85:
+        final_size *= 0.5
+
+    failure_penalty = min(FAILED_ROUTE_COUNTS.get(src, 0), 4) * 0.08
+    final_size *= max(0.60, 1.0 - failure_penalty)
+    final_size = clamp(final_size, 0.0, MAX_POSITION_SOL)
+
+    engine.log(f"📊 SIGNAL {src} route={route['route']} score={alpha_score:.2f} level={level} smart={smart_hit} liq={liq} impact={impact:.3f}")
+    engine.log(f"📊 ALLOC {src} weight={portfolio_weight:.3f} fail_penalty={failure_penalty:.2f}")
+
+    if final_size < MIN_POSITION_SOL or len(engine.positions) >= MAX_POSITIONS:
+        return False
+
+    engine.log(f"🧠 V25 ENTRY {src} {mint[:8]} {level} strength={strength:.4f} regime={regime} alloc={alloc_mult:.2f} port={portfolio_weight:.3f} size={final_size:.6f}")
+    success = await buy(mint, route.get("score", alpha_score) or alpha_score, source_hint=src, size_override=final_size)
+    FAILED_ROUTE_COUNTS[src] = 0 if success else FAILED_ROUTE_COUNTS[src] + 1
+    return success
+
+
+async def bot_loop():
+    engine.log("🚨 V25 FULL STACK LOADED")
     engine.log("🛡️ NO FALLBACK MODE")
     engine.mode = MODE
-
     asyncio.create_task(monitor())
     asyncio.create_task(mempool_stream(handle_mempool))
 
@@ -933,170 +1179,61 @@ async def bot_loop():
         try:
             await sync_sol_balance()
             await sync_positions()
-
             risk_engine.update(engine.capital)
-
-            now = asyncio.get_event_loop().time()
-            regime = await detect_regime_v19()
+            candidate_cleanup()
+            regime = await detect_regime_v25()
             engine.log(f"📊 REGIME {regime}")
-
-            if not risk_engine.allow_trade(engine.capital):
-                engine.log("🛑 RISK BLOCK")
-                await asyncio.sleep(4)
+            allow, reason = risk_engine.allow_trade(engine.capital)
+            if not allow:
+                engine.log(f"🛑 RISK BLOCK {reason}")
+                await asyncio.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            if now - LAST_SMART_WALLET_REFRESH > 5:
-                raw_wallets = await auto_discover_smart_wallets(
-                    RPC, CANDIDATES, max_wallets=20
-                )
-                AUTO_SMART_WALLETS = await rank_wallets(raw_wallets or [])
-                LAST_SMART_WALLET_REFRESH = now
-                engine.log(f"SMART RAW {len(raw_wallets or [])}")
-                engine.log(f"SMART RANKED {len(AUTO_SMART_WALLETS)}")
-
-            if now - LAST_REAL_REFRESH > 15:
-                REAL_SMART_WALLETS = await real_smart_wallets(RPC, CANDIDATES)
-                LAST_REAL_REFRESH = now
-                engine.log(f"REAL SMART {len(REAL_SMART_WALLETS)}")
-
+            await refresh_smart_wallets()
             traded = False
+            routes = await select_routes()
+            routes = sorted(routes, key=lambda r: (float(r.get("score", 0.0) or 0.0), CANDIDATE_META.get(r["mint"], {}).get("last_seen", 0.0)), reverse=True)
 
-            fusion_mint, fusion_score, fusion_source = await alpha_fusion(CANDIDATES)
-
-            if fusion_mint and not has_position(fusion_mint):
-                ok, reason, strength, liq, impact, smart_hit, alpha_score, level = await should_enter_v19(
-                    fusion_mint,
-                    AUTO_SMART_WALLETS
-                )
-
-                if not ok:
-                    engine.log(f"❌ FILTERED {fusion_mint[:8]} reason={reason}")
-                else:
-                    src = fusion_source or "fusion_momentum"
-
-                    if not regime_strategy_gate(regime, level, src):
-                        engine.log(f"🚫 GATED {fusion_mint[:8]} regime={regime} level={level}")
-                    else:
-                        preview_size = weighted_position_size(src)
-                        regime_mult = regime_risk_multiplier(regime)
-                        base_size = dynamic_size_v19(
-                            preview_size * regime_mult,
-                            strength,
-                            regime,
-                            alpha_score,
-                        )
-
-                        alloc_mult = allocator_runtime.size_multiplier()
-                        portfolio_weight = evolution.weight(src)
-                        final_size = base_size * alloc_mult * portfolio_weight
-
-                        mode = allocator_runtime.risk_mode()
-                        if mode == "hard_defensive":
-                            final_size *= 0.35
-                        elif mode == "defensive":
-                            final_size *= 0.60
-                        elif mode == "aggressive":
-                            final_size *= 1.20
-
-                        if level == "strong":
-                            final_size *= 1.20
-                        elif level == "mid":
-                            final_size *= 1.00
-                        else:
-                            if regime == "chop":
-                                final_size = 0.0
-                            else:
-                                final_size *= 0.45
-
-                        # V16 source exposure control
-                        if portfolio.source_exposure_ratio(src) > strategy_cap_ratio(src) * 0.85:
-                            final_size *= 0.5
-
-                        final_size = max(0.0, min(final_size, MAX_POSITION_SOL))
-
-                        engine.log(
-                            f"📊 SIGNAL {src} score={alpha_score:.2f} "
-                            f"level={level} smart={smart_hit} liq={liq} impact={impact:.3f}"
-                        )
-                        engine.log(f"📊 ALLOC {src} weight={portfolio_weight:.3f}")
-
-                        if final_size >= MIN_POSITION_SOL and len(engine.positions) < MAX_POSITIONS:
-                            engine.log(
-                                f"🧠 V19 ENTRY {src} {fusion_mint[:8]} "
-                                f"{level} strength={strength:.4f} regime={regime} "
-                                f"alloc={alloc_mult:.2f} port={portfolio_weight:.3f} "
-                                f"size={final_size:.6f}"
-                            )
-                            await buy(
-                                fusion_mint,
-                                fusion_score if fusion_score else alpha_score,
-                                source_hint=src,
-                                size_override=final_size,
-                            )
-                            traded = True
+            for route in routes:
+                if await try_enter_route(route, regime):
+                    traded = True
+                    break
 
             if not traded and len(engine.positions) == 0:
-                ranked = await rank_candidates(CANDIDATES)
+                ranked = await rank_candidates(set(active_candidates(limit=50)))
                 if ranked:
                     mint = ranked[0]["mint"]
-                    engine.log(f"⚡ V19 SAFE ENTRY {mint[:8]}")
+                    engine.log(f"⚡ V25 SAFE ENTRY {mint[:8]}")
+                    size = clamp(max(MIN_POSITION_SOL * 1.3, 0.0015), 0.0, MAX_POSITION_SOL)
+                    traded = await buy(mint, 20.0, source_hint="v25_safe", size_override=size)
 
-                    size = max(MIN_POSITION_SOL * 1.3, 0.0015)
-                    size = min(size, MAX_POSITION_SOL)
-
-                    await buy(
-                        mint,
-                        20.0,
-                        source_hint="v19_safe",
-                        size_override=size,
-                    )
-                    traded = True
-
-            if not traded and len(engine.positions) == 0 and CANDIDATES:
-                mint = random.choice(list(CANDIDATES))
-                if not has_position(mint):
-                    size = MIN_POSITION_SOL * 1.2
-                    engine.log(f"⚡ V19 SEED ENTRY {mint[:8]}")
-                    await buy(
-                        mint,
-                        15.0,
-                        source_hint="v19_seed",
-                        size_override=size,
-                    )
-                    traded = True
+            if not traded and len(engine.positions) == 0 and regime == "trend":
+                candidates = active_candidates(limit=20)
+                if candidates:
+                    mint = random.choice(candidates)
+                    if not has_position(mint):
+                        size = clamp(MIN_POSITION_SOL * 1.2, 0.0, MAX_POSITION_SOL)
+                        engine.log(f"⚡ V25 SEED ENTRY {mint[:8]}")
+                        traded = await buy(mint, 15.0, source_hint="v25_seed", size_override=size)
 
             for name, s in strategy_state.summary().items():
                 w = evolution.weight(name)
-                if s["loss_streak"] >= 3 or w < 0.03:
+                if s.get("loss_streak", 0) >= 3 or w < 0.03:
                     strategy_state.disable(name)
                     engine.log(f"💀 KILLED {name} weight={w:.3f}")
 
             if not traded:
-                engine.log("🚫 NO TRADE (v19 filtered)")
+                engine.log("🚫 NO TRADE (v25 filtered)")
 
             engine.stats["signals"] += 1
-
             total, by_source = paper.stats()
             engine.log(f"💰 PAPER TOTAL PnL: {total:.9f} SOL")
-
             for k, v in by_source.items():
-                engine.log(
-                    f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} "
-                    f"total={v['total_pnl']:.9f} avg={v['avg_pnl']:.9f}"
-                )
-
+                engine.log(f"📊 {k} count={v['count']} wins={v['wins']} losses={v['losses']} total={v['total_pnl']:.9f} avg={v['avg_pnl']:.9f}")
             for name, s in strategy_state.summary().items():
-                engine.log(
-                    f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} "
-                    f"evo={evolution.weight(name):.3f} "
-                    f"cap={strategy_cap_ratio(name):.2f} buys={s['buys']} sells={s['sells']} "
-                    f"wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f}"
-                )
-
+                engine.log(f"🧠 STRAT {name} enabled={s['enabled']} weight={s['weight']:.2f} evo={evolution.weight(name):.3f} cap={strategy_cap_ratio(name):.2f} buys={s['buys']} sells={s['sells']} wins={s['wins']} losses={s['losses']} total={s['total_pnl']:.9f}")
             engine.log("LOOP RUNNING")
-
         except Exception as e:
             engine.stats["errors"] += 1
             engine.log(f"LOOP ERROR {e}")
-
-        await asyncio.sleep(4)
+        await asyncio.sleep(LOOP_SLEEP_SEC)
