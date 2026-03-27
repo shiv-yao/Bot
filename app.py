@@ -41,19 +41,19 @@ def health():
 
 @app.get("/data")
 def data():
-    return JSONResponse({
+    return {
         "running": engine.running,
         "mode": engine.mode,
         "sol_balance": engine.sol_balance,
         "capital": engine.capital,
         "last_signal": engine.last_signal,
         "last_trade": engine.last_trade,
-        "positions": engine.positions,
-        "logs": engine.logs[-50:],
-        "stats": engine.stats,
-        "trade_history": engine.trade_history[-50:],
-        "bot_ok": BOT_STATUS["ok"],
-        "bot_error": BOT_STATUS["error"],
+        "positions": list(engine.positions),
+        "logs": list(engine.logs)[-50:],
+        "stats": dict(engine.stats),
+        "trade_history": list(engine.trade_history)[-100:],
+        "bot_ok": engine.bot_ok,
+        "bot_error": engine.bot_error,
     })
 
 
