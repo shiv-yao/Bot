@@ -952,7 +952,7 @@ async def bot_loop():
                         await buy(ins, 1000)
                         traded = True
 
-                        if not traded:
+            if not traded:
                 auto_mint = await smart_wallet_signal_from_auto(
                     RPC, AUTO_SMART_WALLETS, CANDIDATES
                 )
@@ -983,7 +983,7 @@ async def bot_loop():
                             )
                             traded = True
 
-                        if not traded:
+            if not traded:
                 real_mint = await real_smart_signal(
                     RPC, REAL_SMART_WALLETS, CANDIDATES
                 )
