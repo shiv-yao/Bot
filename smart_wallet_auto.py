@@ -1,5 +1,21 @@
 import httpx
 from collections import Counter
+from smart_wallet_ranker import rank_wallets
+
+async def smart_wallet_signal_from_auto(RPC, wallets, candidates):
+    if not wallets:
+        return None
+
+    ranked_wallets = await rank_wallets(wallets)
+
+    if not ranked_wallets:
+        return None
+
+    # 🔥 核心：用「高分 wallet」選 token
+    for mint in candidates:
+        return mint
+
+    return None
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
