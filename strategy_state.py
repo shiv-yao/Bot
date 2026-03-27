@@ -52,6 +52,7 @@ class StrategyState:
 
         weight = 1.0
 
+        # 贏家放大
         if sells >= 2 and wins >= 2 and total > 0:
             weight = 1.25
 
@@ -61,6 +62,7 @@ class StrategyState:
         if sells >= 4 and wins >= 3 and total > 0.0008:
             weight = 1.8
 
+        # 輸家縮小
         if loss_streak >= 1 and total < 0:
             weight = 0.75
 
@@ -70,6 +72,7 @@ class StrategyState:
         if loss_streak >= 3 and total < 0:
             weight = 0.0
 
+        # 限制低品質策略上限
         if source == "fallback":
             weight = min(weight, 0.30)
 
@@ -87,21 +90,22 @@ class StrategyState:
         self.ensure(source)
         s = self.stats[source]
 
-        if s["loss_streak"] >= max_loss_streak and s["total_pnl"] < 0:
-            s["enabled"] = False
+        should_disable = False
 
+        # 連虧太多直接停
+        if s["loss_streak"] >= max_loss_streak:
+            should_disable = True
+
+        # 做過幾筆後仍明顯虧損，停用
         if s["sells"] >= 3 and s["total_pnl"] <= min_total_pnl:
-            s["enabled"] = False
+            should_disable = True
 
+        # 權重已經掉到 0，停用
         if s["weight"] <= 0:
-            s["enabled"] = False
-            
-        if s["loss_streak"] >= 3:
-            s["enabled"] = False
+            should_disable = True
 
-        if s["enabled"] is False and s["total_pnl"] > 0:
-            s["enabled"] = True
-
+        if should_disable:
+            s["enabled"] = False
 
     def enabled(self, source: str) -> bool:
         self.ensure(source)
