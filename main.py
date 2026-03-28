@@ -73,32 +73,69 @@ async def get_quote(mint: str):
 
 async def real_alpha(mint: str) -> float:
     try:
-        q1 = await get_quote(mint)
-        await asyncio.sleep(0.2)
-        q2 = await get_quote(mint)
+        sol = "So11111111111111111111111111111111111111112"
 
-        if not q1 or not q2:
-            return 0
+        async with httpx.AsyncClient(timeout=8) as client:
+            r1 = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100,
+                },
+            )
 
-        p1 = q1["price"]
-        p2 = q2["price"]
+            if r1.status_code != 200:
+                return -999.0
 
-        strength = (p2 - p1) / p1
-        liquidity_score = min(1 / p1, 3) * 25
-        impact_penalty = q1["impact"] * 100
+            q1 = r1.json()
+            out1 = int(q1.get("outAmount", 0) or 0)
+            impact1 = float(q1.get("priceImpactPct", 1) or 1)
 
-        alpha = strength * 4000 + liquidity_score - impact_penalty
-        return round(alpha, 2)
+            # 沒 route / 流動性太差 / impact 太高
+            if out1 <= 0:
+                return -999.0
+            if out1 < 1000:
+                return -999.0
+            if impact1 > 0.2:
+                return -999.0
 
-    except:
-        return 0
+            await asyncio.sleep(0.2)
 
+            r2 = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100,
+                },
+            )
+
+            if r2.status_code != 200:
+                return -999.0
+
+            q2 = r2.json()
+            out2 = int(q2.get("outAmount", 0) or 0)
+
+            if out2 <= 0:
+                return -999.0
+
+            strength = (out2 - out1) / out1
+            liquidity_score = min(out1 / 100000, 3) * 25
+            impact_penalty = impact1 * 100
+
+            alpha = strength * 4000 + liquidity_score - impact_penalty
+            return round(alpha, 2)
+
+    except Exception:
+        return -999.0
 
 async def scan_tokens():
     tokens = []
     STATE["scanner_error"] = None
 
-    # 先打 Dexscreener search
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -111,27 +148,29 @@ async def scan_tokens():
                 pairs = data.get("pairs", []) or []
 
                 seen = set()
+
                 for p in pairs:
                     if p.get("chainId") != "solana":
                         continue
 
                     mint = p.get("baseToken", {}).get("address")
+                    liquidity = p.get("liquidity", {}).get("usd", 0) or 0
+
                     if not mint:
                         continue
-
                     if mint.startswith("0x"):
                         continue
-
                     if len(mint) < 32 or len(mint) > 44:
                         continue
+                    if mint.startswith("So1111"):
+                        continue
 
-                    liq = p.get("liquidity", {}).get("usd", 0) or 0
                     try:
-                        liq = float(liq)
+                        liquidity = float(liquidity)
                     except Exception:
-                        liq = 0.0
+                        liquidity = 0.0
 
-                    if liq < 20000:
+                    if liquidity < 20000:
                         continue
 
                     if mint in seen:
@@ -140,19 +179,19 @@ async def scan_tokens():
                     seen.add(mint)
                     tokens.append(mint)
 
-                if tokens:
-                    STATE["scanner_mode"] = "dexscreener"
-                    return tokens[:20]
+                STATE["scanner_mode"] = "dexscreener"
 
             else:
                 STATE["scanner_error"] = f"dex_status_{r.status_code}"
 
     except Exception as e:
-        STATE["scanner_error"] = f"dex_error:{e}"
+        STATE["scanner_error"] = str(e)
 
-    # 最後 fallback
-    STATE["scanner_mode"] = "fallback"
-    return ["TEST_A", "TEST_B"]
+    if not tokens:
+        tokens = ["TEST_A", "TEST_B"]
+        STATE["scanner_mode"] = "fallback"
+
+    return tokens[:20]
 
 # ================= EXECUTION =================
 
