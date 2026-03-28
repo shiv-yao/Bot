@@ -342,7 +342,6 @@ async def lifespan(app: FastAPI):
     yield
     if bot_task:
         bot_task.cancel()
-
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
@@ -353,6 +352,21 @@ async def root():
 async def health():
     return {"ok": True}
 
+# 👉 就放在這裡 👇
 @app.get("/metrics")
 async def metrics():
-    return STATE
+    return {
+        "positions": STATE["positions"],
+        "closed_trades": STATE["closed_trades"],
+        "signals": STATE["signals"],
+        "errors": STATE["errors"],
+        "last_action": STATE["last_action"],
+        "candidates": STATE["candidates"],
+        "last_execution": STATE["last_execution"],
+        "realized_pnl": STATE["realized_pnl"],
+        "daily_trades": STATE["daily_trades"],
+        "last_reset": STATE["last_reset"],
+        "scanner_mode": STATE.get("scanner_mode"),
+        "scanner_error": STATE.get("scanner_error"),
+        "last_alpha": STATE.get("last_alpha"),
+    }
