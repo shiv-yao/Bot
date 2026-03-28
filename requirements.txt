@@ -5,3 +5,5 @@ solders
 streamlit
 pandas
 plotly
+requests
+
