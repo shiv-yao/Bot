@@ -219,22 +219,32 @@ async def bot_loop():
 
             for mint in tokens:
                 if len(STATE["positions"]) >= MAX_POSITIONS:
+                    STATE["last_action"] = "position_limit"
                     break
 
                 if has_position(mint):
+                    STATE["last_action"] = f"already_have:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
 
-                # 如果 fallback 模式下 alpha 不夠，保底讓模擬流程繼續測
+                STATE["last_alpha"] = {
+                    "mint": mint,
+                    "alpha": alpha,
+                }
+
+                if alpha <= 0:
+                    STATE["last_action"] = f"quote_fail:{mint}"
+                    continue
+
                 if alpha < 120:
                     if STATE["scanner_mode"] == "fallback":
                         alpha = random.uniform(125, 160)
                     else:
+                        STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                         continue
 
                 size = min(0.01, 0.1 / (len(STATE["positions"]) + 1))
-
                 entry_price = round(random.uniform(0.00001, 0.00002), 8)
 
                 STATE["positions"].append({
@@ -245,6 +255,7 @@ async def bot_loop():
                     "last_price": entry_price,
                     "pnl_pct": 0.0,
                 })
+
                 STATE["last_action"] = f"paper_buy:{mint}"
 
         except Exception as e:
