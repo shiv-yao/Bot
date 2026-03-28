@@ -122,29 +122,29 @@ async def monitor():
             pos["peak"] = max(pos["peak"], pnl_pct)
 
             # ===== TP1 =====
-            if not pos["tp1"] and pnl_pct > 0.12:
-                sell_qty = pos["qty"] * 0.5
-                record_close(pos, sell_qty, price, "TP1")
-                pos["qty"] -= sell_qty
-                pos["tp1"] = True
+if not pos["tp1"] and pnl_pct > 0.18:
+    sell_qty = pos["qty"] * 0.5
+    record_close(pos, sell_qty, price, "TP1")
+    pos["qty"] -= sell_qty
+    pos["tp1"] = True
 
-            # ===== TP2 =====
-            if not pos["tp2"] and pnl_pct > 0.25:
-                sell_qty = pos["qty"] * 0.5
-                record_close(pos, sell_qty, price, "TP2")
-                pos["qty"] -= sell_qty
-                pos["tp2"] = True
+# ===== TP2 =====
+if not pos["tp2"] and pnl_pct > 0.35:
+    sell_qty = pos["qty"] * 0.5
+    record_close(pos, sell_qty, price, "TP2")
+    pos["qty"] -= sell_qty
+    pos["tp2"] = True
 
-            # ===== trailing =====
-            giveback = 0.04
+# ===== trailing =====
+giveback = 0.06
 
-            if pos["peak"] > 0.2:
-                giveback = 0.035
-            if pos["peak"] > 0.4:
-                giveback = 0.03
+if pos["peak"] > 0.3:
+    giveback = 0.05
+if pos["peak"] > 0.5:
+    giveback = 0.045
 
-            # 🔥 提前 break-even
-            break_even = pos["peak"] > 0.05 and pnl_pct < 0
+# ===== break-even =====
+break_even = pos["peak"] > 0.10 and pnl_pct < 0
 
             should_close = (
                 pnl_pct < STOP_LOSS
