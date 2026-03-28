@@ -18,6 +18,7 @@ MAX_PORTFOLIO_EXPOSURE = 0.03
 
 MAX_HOLD_SECONDS = 240
 KILL_SWITCH_LOSS_STREAK = 6
+MAX_DRAWDOWN = -0.1
 
 MIN_ALPHA_TO_TRADE = 8
 
@@ -32,6 +33,8 @@ STATE = {
     "daily_pnl": 0.0,
 
     "loss_streak": 0,
+    "equity_peak": 0.0,
+
     "regime": "chop",
 
     "engine_stats": {
@@ -55,7 +58,7 @@ STATE = {
     "last_action": None,
     "errors": 0,
 
-    "bot_version": "v21_ai_fund_brain"
+    "bot_version": "v23_warfare_final"
 }
 
 # ================= SAFE =================
@@ -81,10 +84,9 @@ def get_real_alpha():
 
     return round(momentum * 35 + liquidity * 40 - volatility * 25, 2)
 
-# ================= AI ALPHA QUALITY =================
+# ================= AI QUALITY =================
 
 def alpha_quality(alpha):
-    # 👉 AI-like scoring
     return max(0, alpha) * (1 - abs(alpha)/100)
 
 # ================= MEMORY =================
@@ -127,10 +129,10 @@ def engine_score(engine):
 # ================= ALLOCATOR =================
 
 def update_allocator():
-    weights = {e: engine_score(e) for e in ["stable", "degen", "sniper"]}
+    weights = {e: engine_score(e) for e in ["stable","degen","sniper"]}
 
     total = sum(weights.values()) + 1e-6
-    weights = {k: v / total for k, v in weights.items()}
+    weights = {k: v/total for k,v in weights.items()}
 
     if STATE["regime"] == "bull":
         weights["degen"] += 0.2
@@ -139,37 +141,37 @@ def update_allocator():
         weights["stable"] += 0.3
 
     total = sum(weights.values())
-    STATE["allocator"] = {k: max(v / total, 0.05) for k, v in weights.items()}
+    STATE["allocator"] = {k: max(v/total,0.05) for k,v in weights.items()}
 
 # ================= SIZE =================
 
 def get_size(alpha, engine):
-    base = {"stable": 0.003, "degen": 0.002, "sniper": 0.0015}[engine]
+    base = {"stable":0.003,"degen":0.002,"sniper":0.0015}[engine]
 
     size = base * STATE["allocator"][engine]
-    size *= (1 + alpha / 50)
+    size *= (1 + alpha/50)
     size *= get_alpha_edge(engine, alpha)
 
     if STATE["loss_streak"] >= 2:
         size *= 0.5
 
-    return min(max(0.0005, round(size, 4)), MAX_POSITION_SIZE)
+    return min(max(0.0005, round(size,4)), MAX_POSITION_SIZE)
 
-# ================= EXECUTION =================
+# ================= EXEC =================
 
 async def execute_trade(engine, alpha, size):
     if size <= 0:
         return None
 
-    price = random.uniform(0.00001, 0.00002)
+    price = random.uniform(0.00001,0.00002)
     qty = safe_div(size, price)
 
     trade = {
-        "engine": engine,
-        "alpha": alpha,
-        "price": price,
-        "qty": qty,
-        "time": time.time()
+        "engine":engine,
+        "alpha":alpha,
+        "price":price,
+        "qty":qty,
+        "time":time.time()
     }
 
     STATE["trade_log"].append(trade)
@@ -178,15 +180,24 @@ async def execute_trade(engine, alpha, size):
 # ================= RISK =================
 
 def can_open(engine):
-    return sum(1 for p in STATE["positions"] if p["engine"] == engine) < MAX_POSITION_PER_ENGINE
+    return sum(1 for p in STATE["positions"] if p["engine"]==engine) < MAX_POSITION_PER_ENGINE
 
 def portfolio_exposure():
-    return sum(p["qty"] * p["entry_price"] for p in STATE["positions"])
+    return sum(p["qty"]*p["entry_price"] for p in STATE["positions"])
+
+def check_drawdown():
+    equity = STATE["realized_pnl"]
+
+    STATE["equity_peak"] = max(STATE["equity_peak"], equity)
+
+    drawdown = equity - STATE["equity_peak"]
+
+    return drawdown
 
 # ================= MONITOR =================
 
 async def simulate_sell(pos):
-    price = pos["entry_price"] * random.uniform(0.6, 1.6)
+    price = pos["entry_price"] * random.uniform(0.6,1.6)
 
     value = pos["qty"] * price
     entry = pos["qty"] * pos["entry_price"]
@@ -197,7 +208,8 @@ async def simulate_sell(pos):
     return pnl, pnl_pct
 
 def position_score(pos):
-    return pos["alpha"] * (pos.get("peak", 0) + 1)
+    age_penalty = (time.time() - pos["entry_time"]) / 300
+    return pos["alpha"] * (pos.get("peak",0)+1) - age_penalty
 
 async def monitor():
     new_positions = []
@@ -205,34 +217,34 @@ async def monitor():
     for pos in STATE["positions"]:
         pnl, pnl_pct = await simulate_sell(pos)
 
-        pos["peak"] = max(pos.get("peak", 0), pnl_pct)
+        pos["peak"] = max(pos.get("peak",0), pnl_pct)
 
-        giveback = 0.05 + pos["alpha"] / 200
+        giveback = 0.05 + pos["alpha"]/200
 
         if (
             pnl_pct < STOP_LOSS
-            or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback)
-            or time.time() - pos["entry_time"] > MAX_HOLD_SECONDS
+            or (pos["peak"]>0.08 and pos["peak"]-pnl_pct > giveback)
+            or time.time()-pos["entry_time"] > MAX_HOLD_SECONDS
         ):
             engine = pos["engine"]
 
             STATE["closed_trades"].append({
                 **pos,
-                "pnl": pnl,
-                "pnl_pct": pnl_pct,
-                "exit_time": time.time()
+                "pnl":pnl,
+                "pnl_pct":pnl_pct,
+                "exit_time":time.time()
             })
 
             STATE["realized_pnl"] += pnl
             STATE["daily_pnl"] += pnl
 
-            update_alpha_memory(engine, pos["alpha"], pnl)
+            update_alpha_memory(engine,pos["alpha"],pnl)
 
             st = STATE["engine_stats"][engine]
             st["trades"] += 1
             st["pnl"] += pnl
 
-            if pnl > 0:
+            if pnl>0:
                 st["wins"] += 1
                 STATE["loss_streak"] = 0
             else:
@@ -242,20 +254,26 @@ async def monitor():
 
         new_positions.append(pos)
 
-    # 🔥 FUND LOGIC：只留最強倉
-    STATE["positions"] = sorted(new_positions, key=position_score, reverse=True)[:MAX_POSITIONS]
+    STATE["positions"] = sorted(new_positions,key=position_score,reverse=True)[:MAX_POSITIONS]
 
 # ================= LOOP =================
 
 async def bot_loop():
     while True:
         try:
+            # ===== HARD RISK =====
             if STATE["loss_streak"] >= KILL_SWITCH_LOSS_STREAK:
+                STATE["last_action"]="KILL_SWITCH"
                 await asyncio.sleep(10)
                 continue
 
             if STATE["daily_pnl"] < DAILY_STOP:
                 await asyncio.sleep(5)
+                continue
+
+            if check_drawdown() < MAX_DRAWDOWN:
+                STATE["last_action"]="DRAWDOWN_STOP"
+                await asyncio.sleep(10)
                 continue
 
             if portfolio_exposure() > MAX_PORTFOLIO_EXPOSURE:
@@ -271,50 +289,52 @@ async def bot_loop():
                 await asyncio.sleep(2)
                 continue
 
-            # ===== AI SELECT BEST TRADES =====
+            # ===== AI SELECT =====
             candidates = []
 
-            for _ in range(30):
+            for _ in range(40):
                 alpha = get_real_alpha()
                 score = alpha_quality(alpha)
 
-                candidates.append((alpha, score))
+                if alpha < MIN_ALPHA_TO_TRADE:
+                    continue
 
-            # 🔥 只選 top alpha
-            candidates = sorted(candidates, key=lambda x: x[1], reverse=True)[:10]
+                candidates.append((alpha,score))
 
-            for alpha, _ in candidates:
-                if len(STATE["positions"]) >= MAX_POSITIONS:
+            candidates = sorted(candidates,key=lambda x:x[1],reverse=True)[:12]
+
+            for alpha,_ in candidates:
+                if len(STATE["positions"])>=MAX_POSITIONS:
                     break
 
                 engine = random.choices(
-                    ["stable", "degen", "sniper"],
+                    ["stable","degen","sniper"],
                     weights=list(STATE["allocator"].values())
                 )[0]
 
                 if not can_open(engine):
                     continue
 
-                if engine == "stable" and alpha < 8:
+                if engine=="stable" and alpha<8:
                     continue
-                if engine == "degen" and alpha < 25:
+                if engine=="degen" and alpha<25:
                     continue
-                if engine == "sniper" and alpha < 45:
+                if engine=="sniper" and alpha<45:
                     continue
 
-                size = get_size(alpha, engine)
+                size = get_size(alpha,engine)
 
-                trade = await execute_trade(engine, alpha, size)
+                trade = await execute_trade(engine,alpha,size)
                 if not trade:
                     continue
 
                 STATE["positions"].append({
-                    "token": f"TOKEN{random.randint(1,1000)}",
-                    "entry_price": trade["price"],
-                    "qty": trade["qty"],
-                    "alpha": alpha,
-                    "engine": engine,
-                    "entry_time": time.time()
+                    "token":f"TOKEN{random.randint(1,1000)}",
+                    "entry_price":trade["price"],
+                    "qty":trade["qty"],
+                    "alpha":alpha,
+                    "engine":engine,
+                    "entry_time":time.time()
                 })
 
         except Exception as e:
