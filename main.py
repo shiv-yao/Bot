@@ -20,8 +20,58 @@ def has_position(mint: str) -> bool:
     return any(p.get("token") == mint for p in STATE["positions"])
 
 
-def fake_alpha(mint: str) -> float:
-    return random.uniform(80, 180)
+async def real_alpha(mint: str) -> float:
+    try:
+        sol = "So11111111111111111111111111111111111111112"
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            r1 = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100
+                }
+            )
+
+            if r1.status_code != 200:
+                return 0
+
+            q1 = r1.json()
+            out1 = int(q1.get("outAmount", 0) or 0)
+            impact = float(q1.get("priceImpactPct", 1) or 1)
+
+            await asyncio.sleep(0.2)
+
+            r2 = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100
+                }
+            )
+
+            if r2.status_code != 200:
+                return 0
+
+            q2 = r2.json()
+            out2 = int(q2.get("outAmount", 0) or 0)
+
+            if out1 <= 0:
+                return 0
+
+            strength = (out2 - out1) / out1
+            liquidity_score = min(out1 / 100000, 3) * 25
+            impact_penalty = impact * 100
+
+            alpha = strength * 4000 + liquidity_score - impact_penalty
+            return round(alpha, 2)
+
+    except Exception:
+        return 0
 
 
 async def scan_tokens():
