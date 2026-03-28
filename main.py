@@ -1,4 +1,4 @@
-# v29.1_stable_production
+# v29.2_production_final
 
 import asyncio
 import random
@@ -13,7 +13,6 @@ DAILY_STOP = -0.06
 MAX_DRAWDOWN = -0.1
 
 MAX_POSITIONS = 6
-MAX_POSITION_PER_ENGINE = 3
 MAX_POSITION_SIZE = 0.01
 MAX_PORTFOLIO_EXPOSURE = 0.03
 
@@ -35,17 +34,16 @@ STATE = {
 
     "loss_streak": 0,
 
-    "last_action": None,
     "last_error": None,
     "errors": 0,
 
-    "bot_version": "v29.1_stable"
+    "bot_version": "v29.2_production_final"
 }
 
 # ================= SAFE =================
 
-def safe_div(a, b):
-    return a / b if b != 0 else 0
+def safe_div(a,b):
+    return a/b if b!=0 else 0
 
 # ================= ALPHA =================
 
@@ -58,7 +56,7 @@ def get_real_alpha():
     )
 
 def alpha_quality(alpha):
-    return max(0, alpha) * (1 - abs(alpha)/100)
+    return max(0, alpha)*(1-abs(alpha)/100)
 
 # ================= RISK =================
 
@@ -73,18 +71,38 @@ def check_drawdown():
 # ================= SELL =================
 
 async def simulate_sell(pos):
-    try:
-        price = pos.get("entry_price",0) * random.uniform(0.6,1.6)
+    price = pos["entry_price"] * random.uniform(0.7,1.5)
 
-        value = pos.get("qty",0) * price
-        entry = pos.get("qty",0) * pos.get("entry_price",0)
+    value = pos["qty"] * price
+    entry = pos["qty"] * pos["entry_price"]
 
-        pnl = value - entry
-        pnl_pct = safe_div(pnl, entry)
+    pnl = value - entry
+    pnl_pct = safe_div(pnl, entry)
 
-        return pnl, pnl_pct
-    except:
-        return 0, 0
+    return pnl, pnl_pct, price
+
+# ================= PARTIAL CLOSE =================
+
+def record_partial_close(pos, sell_qty, price, tag):
+    entry_price = pos["entry_price"]
+
+    pnl = sell_qty * (price - entry_price)
+    pnl_pct = safe_div(pnl, sell_qty * entry_price)
+
+    STATE["closed_trades"].append({
+        "token": pos["token"],
+        "engine": pos.get("engine"),
+        "alpha": pos["alpha"],
+        "qty": sell_qty,
+        "entry_price": entry_price,
+        "exit_price": price,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "type": tag,
+        "time": time.time()
+    })
+
+    STATE["realized_pnl"] += pnl
 
 # ================= MONITOR =================
 
@@ -93,50 +111,51 @@ async def monitor():
 
     for pos in STATE["positions"]:
         try:
-            # 🔥 自動補欄位（關鍵）
-            pos.setdefault("peak", 0)
-            pos.setdefault("tp1", False)
-            pos.setdefault("tp2", False)
+            pos.setdefault("peak",0)
+            pos.setdefault("tp1",False)
+            pos.setdefault("tp2",False)
+            pos.setdefault("original_qty",pos["qty"])
 
-            pnl, pnl_pct = await simulate_sell(pos)
+            pnl, pnl_pct, price = await simulate_sell(pos)
 
             pos["peak"] = max(pos["peak"], pnl_pct)
 
-            # ===== TP =====
-            if not pos["tp1"] and pnl_pct > 0.15:
-                pos["tp1"] = True
-                pos["qty"] *= 0.5
+            # ===== TP1 =====
+            if not pos["tp1"] and pnl_pct > 0.12:
+                sell_qty = pos["qty"] * 0.5
+                record_partial_close(pos, sell_qty, price, "TP1")
 
-            if not pos["tp2"] and pnl_pct > 0.30:
+                pos["qty"] -= sell_qty
+                pos["tp1"] = True
+
+            # ===== TP2 =====
+            if not pos["tp2"] and pnl_pct > 0.25:
+                sell_qty = pos["qty"] * 0.5
+                record_partial_close(pos, sell_qty, price, "TP2")
+
+                pos["qty"] -= sell_qty
                 pos["tp2"] = True
-                pos["qty"] *= 0.75
 
             # ===== trailing =====
-            giveback = 0.05 + pos.get("alpha",0)/200
+            giveback = 0.04
 
-            if pos["peak"] > 0.3:
-                giveback += 0.05
-            if pos["peak"] > 0.6:
-                giveback += 0.1
+            if pos["peak"] > 0.2:
+                giveback = 0.035
+            if pos["peak"] > 0.4:
+                giveback = 0.03
 
-            break_even = pos["peak"] > 0.1 and pnl_pct < 0
+            # ===== break-even =====
+            break_even = pos["peak"] > 0.08 and pnl_pct < 0
 
             should_close = (
                 pnl_pct < STOP_LOSS
                 or break_even
-                or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback)
-                or time.time() - pos.get("entry_time",0) > MAX_HOLD_SECONDS
+                or (pos["peak"] > 0.05 and pos["peak"] - pnl_pct > giveback)
+                or time.time() - pos["entry_time"] > MAX_HOLD_SECONDS
             )
 
             if should_close:
-                STATE["closed_trades"].append({
-                    **pos,
-                    "pnl": pnl,
-                    "pnl_pct": pnl_pct,
-                    "exit_time": time.time()
-                })
-
-                STATE["realized_pnl"] += pnl
+                record_partial_close(pos, pos["qty"], price, "FINAL_EXIT")
 
                 if pnl > 0:
                     STATE["loss_streak"] = 0
@@ -150,7 +169,6 @@ async def monitor():
         except Exception as e:
             STATE["errors"] += 1
             STATE["last_error"] = str(e)
-            print("MONITOR ERROR:", e)
 
     STATE["positions"] = new_positions[:MAX_POSITIONS]
 
@@ -161,10 +179,7 @@ async def execute_trade(alpha):
     size = min(max(0.001*(1+alpha/50),0.0005), MAX_POSITION_SIZE)
     qty = safe_div(size, price)
 
-    return {
-        "price": price,
-        "qty": qty
-    }
+    return price, qty
 
 # ================= LOOP =================
 
@@ -189,34 +204,29 @@ async def bot_loop():
                 await asyncio.sleep(2)
                 continue
 
-            # ===== SIGNAL =====
             signals = []
 
             for _ in range(30):
                 alpha = get_real_alpha()
-
                 if alpha < MIN_ALPHA_TO_TRADE:
                     continue
+                signals.append((alpha, alpha_quality(alpha)))
 
-                score = alpha_quality(alpha)
-                signals.append((alpha, score))
+            signals = sorted(signals, key=lambda x:x[1], reverse=True)[:8]
 
-            signals = sorted(signals, key=lambda x: x[1], reverse=True)[:8]
-
-            for alpha, _ in signals:
+            for alpha,_ in signals:
                 if len(STATE["positions"]) >= MAX_POSITIONS:
                     break
 
-                trade = await execute_trade(alpha)
+                price, qty = await execute_trade(alpha)
 
                 STATE["positions"].append({
                     "token": f"TOKEN{random.randint(1,9999)}",
-                    "entry_price": trade["price"],
-                    "qty": trade["qty"],
+                    "entry_price": price,
+                    "qty": qty,
+                    "original_qty": qty,
                     "alpha": alpha,
                     "entry_time": time.time(),
-
-                    # 🔥 永遠初始化
                     "peak": 0,
                     "tp1": False,
                     "tp2": False
@@ -225,7 +235,6 @@ async def bot_loop():
         except Exception as e:
             STATE["errors"] += 1
             STATE["last_error"] = str(e)
-            print("LOOP ERROR:", e)
 
         await asyncio.sleep(2)
 
