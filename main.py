@@ -133,6 +133,43 @@ async def get_real_price(mint: str):
     except Exception:
         return None
 
+async def get_quote(mint: str):
+    try:
+        sol = "So11111111111111111111111111111111111111112"
+        amount_in = 10_000_000  # 0.01 SOL
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": str(amount_in),
+                    "slippageBps": 100,
+                },
+            )
+
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            out = int(data.get("outAmount", 0) or 0)
+            impact = float(data.get("priceImpactPct", 1) or 1)
+
+            if out <= 0:
+                return None
+
+            price = amount_in / out
+
+            return {
+                "price": price,
+                "impact": impact,
+                "raw": data,
+            }
+
+    except Exception:
+        return None
+
 
 async def scan_tokens():
     tokens = []
@@ -195,51 +232,80 @@ async def scan_tokens():
 
 
 async def simulate_buy(mint: str, size: float):
-    mark_price = await get_real_price(mint)
-    if mark_price is None:
+    quote = await get_quote(mint)
+    if not quote:
         return None
 
-    fill_price = apply_entry_slippage(mark_price)
+    price = quote["price"]
+    impact = quote["impact"]
+
+    # 流動性太差直接跳過
+    if impact > 0.2:
+        STATE["last_action"] = f"skip_illiquid:{mint}:{impact:.3f}"
+        return None
+
+    # 動態滑點：impact 越大，成交越差
+    slippage = impact * random.uniform(1.2, 2.0)
+    fill_price = price * (1 + slippage)
+
+    # 模擬成交失敗
+    if random.random() < 0.1:
+        STATE["last_action"] = f"fill_fail:{mint}"
+        return None
+
     token_qty = size / fill_price if fill_price > 0 else 0.0
 
     result = {
         "ok": True,
         "mint": mint,
         "size": round(size, 6),
-        "mark_price": round(mark_price, 12),
+        "mark_price": round(price, 12),
         "fill_price": round(fill_price, 12),
         "token_qty": round(token_qty, 6),
         "gas_cost": GAS_COST,
+        "impact": round(impact, 6),
+        "slippage": round(slippage, 6),
         "side": "buy",
     }
+
     STATE["last_execution"] = result
     return result
 
 
 async def simulate_sell(pos: dict, reason: str):
-    mark_price = await get_real_price(pos["token"])
-    if mark_price is None:
+    quote = await get_quote(pos["token"])
+    if not quote:
         return None
 
-    fill_price = apply_exit_slippage(mark_price)
+    price = quote["price"]
+    impact = quote["impact"]
+
+    # 賣出也吃滑點
+    slippage = impact * random.uniform(1.0, 1.8)
+    fill_price = price * (1 - slippage)
+
     entry_price = pos["entry_price"]
     pnl_pct = (fill_price - entry_price) / entry_price
+
     gross_pnl = pos["size"] * pnl_pct
     net_pnl = gross_pnl - GAS_COST
 
     result = {
         "ok": True,
         "mint": pos["token"],
-        "mark_price": round(mark_price, 12),
+        "mark_price": round(price, 12),
         "fill_price": round(fill_price, 12),
         "entry_price": round(entry_price, 12),
         "pnl_pct": round(pnl_pct, 4),
         "gross_pnl": round(gross_pnl, 6),
         "net_pnl": round(net_pnl, 6),
         "gas_cost": GAS_COST,
+        "impact": round(impact, 6),
+        "slippage": round(slippage, 6),
         "reason": reason,
         "side": "sell",
     }
+
     STATE["last_execution"] = result
     return result
 
