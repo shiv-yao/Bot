@@ -165,76 +165,36 @@ async def real_alpha(mint: str) -> float:
 
     except Exception:
         return -999.0
-
 async def scan_tokens():
     tokens = []
-    STATE["scanner_error"] = None
 
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with httpx.AsyncClient(timeout=6) as client:
             r = await client.get(
                 "https://api.dexscreener.com/latest/dex/search",
-                params={"q": "solana"},
+                params={"q": "SOL"},
             )
 
             if r.status_code == 200:
                 data = r.json()
-                pairs = data.get("pairs", []) or []
-
-                seen = set()
+                pairs = data.get("pairs", [])[:20]
 
                 for p in pairs:
-                    if p.get("chainId") != "solana":
-                        continue
-
                     mint = p.get("baseToken", {}).get("address")
-                    liquidity = p.get("liquidity", {}).get("usd", 0) or 0
-
-                    if not mint:
-                        continue
-                    if mint.startswith("0x"):
-                        continue
-                    if len(mint) < 32 or len(mint) > 44:
-                        continue
-                    if mint.startswith("So1111"):
-                        continue
-
-                    try:
-                        liquidity = float(liquidity)
-                    except Exception:
-                        liquidity = 0.0
-
-                    if liquidity < 20000:
-                        continue
-
-                    if mint in seen:
-                        continue
-
-                    seen.add(mint)
-                    tokens.append(mint)
+                    if mint:
+                        tokens.append(mint)
 
                 STATE["scanner_mode"] = "dexscreener"
-
-            else:
-                STATE["scanner_error"] = f"dex_status_{r.status_code}"
+                STATE["scanner_error"] = None
 
     except Exception as e:
+        STATE["scanner_mode"] = "fallback"
         STATE["scanner_error"] = str(e)
 
-    # 再過一層：只留下 Jupiter 可報價的 token
-    filtered = []
+    if not tokens:
+        tokens = ["TEST_A", "TEST_B"]
 
-    for mint in tokens:
-        if await has_jupiter_route(mint):
-            filtered.append(mint)
-
-    STATE["candidate_count"] = len(filtered)
-
-    if not filtered:
-        STATE["scanner_mode"] = "fallback"
-        return ["TEST_A", "TEST_B"]
-
-    return filtered[:20]
+    return tokens
 
 # ================= EXECUTION =================
 
