@@ -311,7 +311,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha20_v2"
+            STATE["bot_version"] = "alpha100_slipcheck_v1"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -331,6 +331,10 @@ async def bot_loop():
                     STATE["last_action"] = "daily_limit_hit"
                     break
 
+                if STATE["daily_trades"] >= 5:
+                    STATE["last_action"] = "soft_daily_limit_hit"
+                    break
+
                 if len(STATE["positions"]) >= MAX_POSITIONS:
                     STATE["last_action"] = "position_limit"
                     break
@@ -346,20 +350,24 @@ async def bot_loop():
                     STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                     continue
 
-                result = await simulate_buy(mint, 0.01)
-                if not result:
+                exec_result = await simulate_buy(mint, 0.01)
+                if not exec_result:
+                    continue
+
+                if exec_result["slippage"] > 0.01:
+                    STATE["last_action"] = f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
                     continue
 
                 STATE["positions"].append({
                     "token": mint,
                     "alpha": alpha,
-                    "size": result["size"],
-                    "entry_price": result["fill_price"],
-                    "mark_price": result["mark_price"],
-                    "last_price": result["fill_price"],
-                    "token_qty": result["token_qty"],
+                    "size": exec_result["size"],
+                    "entry_price": exec_result["fill_price"],
+                    "mark_price": exec_result["mark_price"],
+                    "last_price": exec_result["fill_price"],
+                    "token_qty": exec_result["token_qty"],
                     "entry_time": time.time(),
-                    "entry_gas_cost": result["gas_cost"],
+                    "entry_gas_cost": exec_result["gas_cost"],
                     "pnl_pct": 0.0,
                 })
 
