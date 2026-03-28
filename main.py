@@ -50,8 +50,8 @@ MAX_POSITIONS = 4
 MAX_DAILY_TRADES = 20
 MAX_HOLD_SECONDS = 120
 
-STOP_LOSS = -0.10
-TAKE_PROFIT = 0.20
+STOP_LOSS = -0.06
+TAKE_PROFIT = 0.12
 DAILY_STOP = -0.03
 
 GAS_COST = 0.000005
@@ -74,14 +74,13 @@ def is_valid_mint(mint: str) -> bool:
     return True
 
 
-def get_position_size(alpha: float, engine: str) -> float:
-    if engine == "stable":
-        return 0.006
-    if alpha > 50:
-        return 0.003
-    if alpha > 30:
-        return 0.002
-    return 0.001
+def get_position_size(alpha, engine):
+    base = 0.003 if engine == "stable" else 0.002
+
+    if STATE["loss_streak"] >= 2:
+        return base * 0.5   # 🔥 自動降風險
+
+    return base
 
 
 def update_engine_stats_on_close(engine: str, pnl: float):
