@@ -245,11 +245,9 @@ def dashboard():
 
 # ================= API =================
 
-app = FastAPI()
-app.router.lifespan_context = lifespan
-
 bot_task = None
 
+# 1️⃣ 先定義 lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task, SESSION
@@ -262,6 +260,28 @@ async def lifespan(app: FastAPI):
     await SESSION.close()
     bot_task.cancel()
 
+
+# 2️⃣ 再宣告 app
+app = FastAPI()
+app.router.lifespan_context = lifespan
+
+
+# ================= ROUTES =================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return f"""
+    <html>
+    <body style="background:black;color:#00ffcc;font-family:monospace">
+    <h1>🚀 FUND DASHBOARD</h1>
+    <p>Balance: {STATE["balance"]:.4f}</p>
+    <p>PnL: {STATE["realized_pnl"]:.4f}</p>
+    <p>Drawdown: {STATE["max_drawdown"]:.2%}</p>
+    <p>Positions: {len(STATE["positions"])}</p>
+    <p>Trades: {len(STATE["trade_log"])}</p>
+    </body>
+    </html>
+    """
 
 @app.get("/")
 def root():
