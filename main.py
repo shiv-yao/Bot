@@ -342,7 +342,7 @@ async def bot_loop():
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                if alpha < 20:
+                if alpha < 100:
                     STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                     continue
 
