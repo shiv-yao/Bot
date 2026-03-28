@@ -1,4 +1,4 @@
-# v48_alpha_brain_dashboard
+# v47_fund_accounting_full
 
 import asyncio
 import random
@@ -9,7 +9,6 @@ import os
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
@@ -57,8 +56,6 @@ STATE = {
     "peak_balance": 1.0,
     "max_drawdown": 0.0,
 
-    "alpha_memory": [],
-
     "flow_history": [],
     "realized_pnl": 0.0,
     "loss_streak": 0,
@@ -68,7 +65,7 @@ STATE = {
     "kill": False,
     "last_heartbeat": time.time(),
 
-    "bot_version": "v48_alpha_brain_dashboard"
+    "bot_version": "v47_fund_accounting"
 }
 
 # ================= SAFE =================
@@ -77,14 +74,18 @@ async def safe_get(url):
     try:
         async with SESSION.get(url, timeout=4) as res:
             return await res.json()
-    except:
+    except Exception as e:
+        STATE["errors"] += 1
+        STATE["last_error"] = str(e)
         return None
 
 async def safe_post(url, data):
     try:
         async with SESSION.post(url, json=data, timeout=4) as res:
             return await res.json()
-    except:
+    except Exception as e:
+        STATE["errors"] += 1
+        STATE["last_error"] = str(e)
         return None
 
 # ================= FLOW =================
@@ -101,22 +102,7 @@ def flow_acceleration():
         return 0
     return STATE["flow_history"][-1] - STATE["flow_history"][-2]
 
-# ================= ALPHA AI =================
-
-def alpha_edge(alpha):
-    mem = STATE["alpha_memory"]
-
-    if not mem:
-        return 1.0
-
-    similar = [p for a,p in mem if abs(a-alpha)<10]
-
-    if not similar:
-        return 1.0
-
-    avg = sum(similar)/len(similar)
-
-    return max(0.5, min(2.0, 1 + avg*5))
+# ================= ALPHA =================
 
 async def compute_alpha():
     flow = random.uniform(0,1)
@@ -125,14 +111,13 @@ async def compute_alpha():
     mem = random.uniform(0,1)
     launch = random.random() < 0.1
 
-    base = flow*50 + accel*80 + mem*60 + (80 if launch else 0)
-
-    return base * alpha_edge(base)
+    return flow*50 + accel*80 + mem*60 + (80 if launch else 0)
 
 # ================= ACCOUNTING =================
 
 def record_trade(entry, exit, size, alpha):
     pnl = (exit - entry) * size
+    pnl_pct = pnl / (entry * size)
 
     STATE["realized_pnl"] += pnl
     STATE["balance"] += pnl
@@ -151,38 +136,108 @@ def record_trade(entry, exit, size, alpha):
         "entry": entry,
         "exit": exit,
         "pnl": pnl,
-        "alpha": alpha
+        "pnl_pct": pnl_pct,
+        "alpha": alpha,
+        "time": time.time()
     })
-
-    STATE["alpha_memory"].append((alpha, pnl))
 
     if pnl > 0:
         STATE["loss_streak"] = 0
     else:
         STATE["loss_streak"] += 1
 
-# ================= POSITION =================
+# ================= POSITION UPDATE =================
 
 async def update_positions():
     new_positions = []
 
     for pos in STATE["positions"]:
-        price = pos["entry_price"] * random.uniform(0.7,1.5)
+        price = pos["entry_price"] * random.uniform(0.7, 1.5)
 
         pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
 
         if pnl_pct < STOP_LOSS or pnl_pct > TAKE_PROFIT:
-            record_trade(pos["entry_price"], price, 1, pos["alpha"])
+            record_trade(
+                pos["entry_price"],
+                price,
+                1,
+                pos["alpha"]
+            )
             continue
 
         new_positions.append(pos)
 
     STATE["positions"] = new_positions
 
+# ================= JUP =================
+
+async def get_quote(amount, slippage):
+    return await safe_get(
+        f"{JUP_API}/v6/quote"
+        f"?inputMint=So11111111111111111111111111111111111111112"
+        f"&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        f"&amount={int(amount*1e9)}"
+        f"&slippageBps={slippage}"
+    )
+
+async def get_swap(route):
+    return await safe_post(
+        f"{JUP_API}/v6/swap",
+        {
+            "quoteResponse": route,
+            "userPublicKey": str(keypair.pubkey()),
+            "wrapAndUnwrapSol": True
+        }
+    )
+
+# ================= JITO =================
+
+async def send_bundle_multi(tx):
+    bundle = {
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"sendBundle",
+        "params":[{"transactions":[tx],"encoding":"base64"}]
+    }
+
+    results = await asyncio.gather(
+        *[safe_post(url, bundle) for url in JITO_ENDPOINTS]
+    )
+
+    for r in results:
+        if r and "result" in r:
+            return r["result"]
+
+    return None
+
 # ================= EXEC =================
 
 async def execute_real(amount, alpha):
-    return random.uniform(0.00001,0.00002)
+    slippage = BASE_SLIPPAGE + int(alpha*2)
+
+    quote = await get_quote(amount, slippage)
+    if not quote or "data" not in quote or not quote["data"]:
+        return None
+
+    route = quote["data"][0]
+
+    swap = await get_swap(route)
+    if not swap or "swapTransaction" not in swap:
+        return None
+
+    tx = VersionedTransaction.from_bytes(
+        base64.b64decode(swap["swapTransaction"])
+    )
+    tx.sign([keypair])
+
+    raw = base64.b64encode(bytes(tx)).decode()
+
+    sig = await send_bundle_multi(raw)
+
+    if sig:
+        return float(route["outAmount"]) / float(route["inAmount"])
+
+    return None
 
 # ================= LOOP =================
 
@@ -213,9 +268,14 @@ async def bot_loop():
 
                 price = await execute_real(size, alpha)
 
+                if not price:
+                    continue
+
                 STATE["positions"].append({
+                    "token": f"TOKEN{random.randint(1,9999)}",
                     "entry_price": price,
-                    "alpha": alpha
+                    "alpha": alpha,
+                    "time": time.time()
                 })
 
         except Exception as e:
@@ -226,31 +286,13 @@ async def bot_loop():
 
         await asyncio.sleep(1)
 
-# ================= DASHBOARD =================
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return f"""
-    <html>
-    <body style="background:black;color:#00ffcc;font-family:monospace">
-    <h1>🚀 FUND DASHBOARD</h1>
-    <p>Balance: {STATE["balance"]:.4f}</p>
-    <p>PnL: {STATE["realized_pnl"]:.4f}</p>
-    <p>Drawdown: {STATE["max_drawdown"]:.2%}</p>
-    <p>Positions: {len(STATE["positions"])}</p>
-    <p>Trades: {len(STATE["trade_log"])}</p>
-    </body>
-    </html>
-    """
-
 # ================= API =================
 
 bot_task = None
 
-# 1️⃣ 先定義 lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global SESSION, bot_task
+    global bot_task, SESSION
 
     SESSION = aiohttp.ClientSession()
     bot_task = asyncio.create_task(bot_loop())
@@ -260,8 +302,6 @@ async def lifespan(app: FastAPI):
     await SESSION.close()
     bot_task.cancel()
 
-
-# 2️⃣ 再宣告 app
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
@@ -271,6 +311,23 @@ def root():
 @app.get("/metrics")
 def metrics():
     return STATE
+
+@app.get("/analytics")
+def analytics():
+    trades = STATE["trade_log"]
+
+    if not trades:
+        return {"msg": "no trades"}
+
+    wins = [t for t in trades if t["pnl"] > 0]
+
+    return {
+        "trades": len(trades),
+        "winrate": len(wins)/len(trades),
+        "pnl": STATE["realized_pnl"],
+        "balance": STATE["balance"],
+        "max_drawdown": STATE["max_drawdown"]
+    }
 
 @app.post("/kill")
 def kill():
