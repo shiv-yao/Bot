@@ -87,6 +87,13 @@ async def scan_tokens():
     STATE["scanner_error"] = None
     STATE["dex_pairs"] = 0
 
+    def is_solana_mint(addr: str) -> bool:
+        if not isinstance(addr, str):
+            return False
+        if addr.startswith("0x"):
+            return False
+        return 32 <= len(addr) <= 44
+
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -96,23 +103,36 @@ async def scan_tokens():
 
             if r.status_code == 200:
                 data = r.json()
-                pairs = data.get("pairs", [])
+                pairs = data.get("pairs", []) or []
                 STATE["dex_pairs"] = len(pairs)
 
-                for p in pairs[:50]:
+                seen = set()
+
+                for p in pairs:
+                    if p.get("chainId") != "solana":
+                        continue
+
                     mint = p.get("baseToken", {}).get("address")
                     liquidity = p.get("liquidity", {}).get("usd", 0) or 0
 
                     try:
                         liquidity = float(liquidity)
-                    except:
+                    except Exception:
                         liquidity = 0
 
-                    if mint and liquidity > 20000:
-                        tokens.append(mint)
+                    if not is_solana_mint(mint):
+                        continue
+
+                    if liquidity < 20000:
+                        continue
+
+                    if mint in seen:
+                        continue
+
+                    seen.add(mint)
+                    tokens.append(mint)
 
                 STATE["scanner_mode"] = "dexscreener"
-
             else:
                 STATE["scanner_error"] = f"dex_status_{r.status_code}"
 
