@@ -1,5 +1,7 @@
 import asyncio
 import random
+import httpx
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
@@ -14,25 +16,25 @@ STATE = {
 MAX_POSITIONS = 3
 
 
-import httpx
-
 async def scan_tokens():
     tokens = []
 
+    # ===== Pump.fun =====
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get("https://frontend-api.pump.fun/coins")
-
             if r.status_code == 200:
                 data = r.json()
-
                 for item in data[:10]:
                     mint = item.get("mint")
                     if mint:
                         tokens.append(mint)
-
-    except Exception:
+    except:
         pass
+
+    # ===== fallback（假的先保底）=====
+    if not tokens:
+        tokens = ["TEST_A", "TEST_B"]
 
     return tokens
 
