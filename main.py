@@ -1,4 +1,4 @@
-# v31.4_real_signing_final
+# v31.5_real_stable (Railway READY)
 
 import asyncio
 import random
@@ -18,6 +18,7 @@ from solders.transaction import VersionedTransaction
 USE_REAL_EXECUTION = True
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
+JUP_API = "https://lite-api.jup.ag"   # 🔥 FIXED
 
 SLIPPAGE_BPS = 200
 
@@ -34,24 +35,18 @@ if not PRIVATE_KEY:
     raise RuntimeError("PRIVATE_KEY not set")
 
 try:
-    # list format
     if PRIVATE_KEY.startswith("["):
         keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
-
-    # csv format
     elif "," in PRIVATE_KEY:
         keypair = Keypair.from_bytes(
             bytes(int(x) for x in PRIVATE_KEY.split(","))
         )
-
-    # base58 format ✅
     else:
         keypair = Keypair.from_base58_string(PRIVATE_KEY)
-
 except Exception as e:
     raise RuntimeError(f"PRIVATE_KEY format error: {e}")
 
-# ================= GLOBAL SESSION =================
+# ================= GLOBAL =================
 
 SESSION = None
 
@@ -63,8 +58,28 @@ STATE = {
     "realized_pnl": 0.0,
     "errors": 0,
     "last_error": None,
-    "bot_version": "v31.4_real_signing_final"
+    "bot_version": "v31.5_real_stable"
 }
+
+# ================= UTILS =================
+
+async def safe_get(url):
+    for _ in range(3):
+        try:
+            async with SESSION.get(url, timeout=5) as res:
+                return await res.json()
+        except Exception:
+            await asyncio.sleep(0.3)
+    return None
+
+async def safe_post(url, json_data):
+    for _ in range(3):
+        try:
+            async with SESSION.post(url, json=json_data, timeout=5) as res:
+                return await res.json()
+        except Exception:
+            await asyncio.sleep(0.3)
+    return None
 
 # ================= ALPHA =================
 
@@ -75,28 +90,25 @@ def get_alpha():
 
 async def get_quote(amount):
     url = (
-        "https://quote-api.jup.ag/v6/quote"
+        f"{JUP_API}/v6/quote"
         f"?inputMint=So11111111111111111111111111111111111111112"
         f"&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         f"&amount={int(amount*1e9)}"
         f"&slippageBps={SLIPPAGE_BPS}"
     )
-
-    async with SESSION.get(url) as res:
-        return await res.json()
+    return await safe_get(url)
 
 async def get_swap_tx(route):
-    async with SESSION.post(
-        "https://quote-api.jup.ag/v6/swap",
-        json={
+    return await safe_post(
+        f"{JUP_API}/v6/swap",
+        {
             "quoteResponse": route,
             "userPublicKey": str(keypair.pubkey()),
             "wrapAndUnwrapSol": True,
             "dynamicComputeUnitLimit": True,
             "prioritizationFeeLamports": 5000
         }
-    ) as res:
-        return await res.json()
+    )
 
 # ================= EXECUTION =================
 
@@ -113,14 +125,11 @@ async def send_tx(tx_base64):
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
-            "params": [
-                raw_tx,
-                {"skipPreflight": True}
-            ]
+            "params": [raw_tx, {"skipPreflight": True}]
         }
 
-        async with SESSION.post(RPC_URL, json=payload) as res:
-            return await res.json()
+        res = await safe_post(RPC_URL, payload)
+        return res
 
     except Exception as e:
         STATE["errors"] += 1
@@ -128,45 +137,29 @@ async def send_tx(tx_base64):
         return None
 
 async def execute_real_trade(amount):
-    try:
-        quote = await get_quote(amount)
+    quote = await get_quote(amount)
 
-        if not quote or "data" not in quote:
-            return None
-
-        route = quote["data"][0]
-
-        swap = await get_swap_tx(route)
-
-        if "swapTransaction" not in swap:
-            return None
-
-        tx = swap["swapTransaction"]
-
-        for _ in range(3):  # retry
-            result = await send_tx(tx)
-
-            if result and "result" in result:
-                return {
-                    "tx": result["result"],
-                    "price": float(route["outAmount"]) / float(route["inAmount"])
-                }
-
-            await asyncio.sleep(0.5)
-
+    if not quote or "data" not in quote:
         return None
 
-    except Exception as e:
-        STATE["errors"] += 1
-        STATE["last_error"] = str(e)
+    route = quote["data"][0]
+
+    swap = await get_swap_tx(route)
+
+    if not swap or "swapTransaction" not in swap:
         return None
 
-# ================= SIM =================
+    tx = swap["swapTransaction"]
 
-async def simulate_trade(amount):
-    price = random.uniform(0.00001, 0.00002)
-    qty = amount / price
-    return price, qty
+    for _ in range(2):
+        result = await send_tx(tx)
+
+        if result and "result" in result:
+            return {
+                "price": float(route["outAmount"]) / float(route["inAmount"])
+            }
+
+    return None
 
 # ================= EXEC WRAPPER =================
 
@@ -174,7 +167,8 @@ async def execute_trade(alpha):
     size = min(0.002 * (1 + alpha/50), MAX_POSITION_SIZE)
 
     if not USE_REAL_EXECUTION:
-        return await simulate_trade(size)
+        price = random.uniform(0.00001, 0.00002)
+        return price, size / price
 
     res = await execute_real_trade(size)
 
@@ -182,9 +176,7 @@ async def execute_trade(alpha):
         return None, None
 
     price = res["price"]
-    qty = size / price
-
-    return price, qty
+    return price, size / price
 
 # ================= MONITOR =================
 
@@ -203,7 +195,6 @@ async def monitor():
                 "exit_price": price,
                 "pnl": pnl
             })
-
             STATE["realized_pnl"] += pnl
             continue
 
@@ -214,9 +205,6 @@ async def monitor():
 # ================= LOOP =================
 
 async def bot_loop():
-    global SESSION
-    SESSION = aiohttp.ClientSession()
-
     while True:
         try:
             await monitor()
@@ -244,7 +232,7 @@ async def bot_loop():
             STATE["errors"] += 1
             STATE["last_error"] = str(e)
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 # ================= API =================
 
@@ -252,9 +240,14 @@ bot_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_task
+    global bot_task, SESSION
+
+    SESSION = aiohttp.ClientSession()
     bot_task = asyncio.create_task(bot_loop())
+
     yield
+
+    await SESSION.close()
     bot_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
