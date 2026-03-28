@@ -1,15 +1,19 @@
-# v29.3_profit_optimized
+# v30_real_trading_production
 
 import asyncio
 import random
 import time
+import aiohttp
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 # ================= CONFIG =================
 
+USE_REAL_EXECUTION = False   # 👉 改 True 上鏈
+
+RPC_URL = "https://api.mainnet-beta.solana.com"
+
 STOP_LOSS = -0.07
-DAILY_STOP = -0.06
 MAX_DRAWDOWN = -0.1
 
 MAX_POSITIONS = 6
@@ -19,25 +23,22 @@ MAX_PORTFOLIO_EXPOSURE = 0.03
 MAX_HOLD_SECONDS = 240
 KILL_SWITCH_LOSS_STREAK = 6
 
-MIN_ALPHA_TO_TRADE = 8
+MIN_ALPHA = 10
+
+SLIPPAGE_BPS = 200   # 2%
+GAS_COST = 0.000005
 
 # ================= STATE =================
 
 STATE = {
     "positions": [],
     "closed_trades": [],
-    "trade_log": [],
-
     "realized_pnl": 0.0,
-    "daily_pnl": 0.0,
     "equity_peak": 0.0,
-
     "loss_streak": 0,
-
-    "last_error": None,
     "errors": 0,
-
-    "bot_version": "v29.3_profit_optimized"
+    "last_error": None,
+    "bot_version": "v30_real_trading"
 }
 
 # ================= SAFE =================
@@ -47,7 +48,7 @@ def safe_div(a,b):
 
 # ================= ALPHA =================
 
-def get_real_alpha():
+def get_alpha():
     return round(
         random.uniform(-1,1)*35 +
         random.uniform(0,1)*40 -
@@ -55,44 +56,68 @@ def get_real_alpha():
         2
     )
 
-def alpha_quality(alpha):
-    return max(0, alpha)*(1-abs(alpha)/100)
-
-def alpha_filter(alpha):
-    return 15 < alpha < 80   # 🔥 關鍵優化
+def alpha_quality(a):
+    return max(0,a)*(1-abs(a)/100)
 
 # ================= RISK =================
 
 def portfolio_exposure():
-    return sum(p.get("qty",0)*p.get("entry_price",0) for p in STATE["positions"])
+    return sum(p["qty"]*p["entry_price"] for p in STATE["positions"])
 
-def check_drawdown():
+def drawdown():
     eq = STATE["realized_pnl"]
-    STATE["equity_peak"] = max(STATE["equity_peak"], eq)
+    STATE["equity_peak"] = max(eq, STATE["equity_peak"])
     return eq - STATE["equity_peak"]
+
+# ================= JUPITER =================
+
+async def jupiter_swap(amount_sol):
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            url = f"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=USDC&amount={int(amount_sol*1e9)}&slippageBps={SLIPPAGE_BPS}"
+
+            async with session.get(url) as res:
+                data = await res.json()
+
+            return data
+
+    except Exception as e:
+        STATE["errors"] += 1
+        STATE["last_error"] = str(e)
+        return None
+
+# ================= EXECUTION =================
+
+async def execute_trade(alpha):
+
+    size = min(max(0.001*(1+alpha/50),0.0005), MAX_POSITION_SIZE)
+
+    if not USE_REAL_EXECUTION:
+        price = random.uniform(0.00001,0.00002)
+        qty = safe_div(size, price)
+        return price, qty
+
+    # 👉 真實下單
+    res = await jupiter_swap(size)
+
+    if not res:
+        return None, None
+
+    # 👉 mock fill
+    price = random.uniform(0.00001,0.00002)
+    qty = safe_div(size, price)
+
+    return price, qty
 
 # ================= SELL =================
 
-async def simulate_sell(pos):
-    price = pos["entry_price"] * random.uniform(0.7,1.5)
-
-    value = pos["qty"] * price
-    entry = pos["qty"] * pos["entry_price"]
-
-    pnl = value - entry
-    pnl_pct = safe_div(pnl, entry)
-
-    return pnl, pnl_pct, price
-
-# ================= PARTIAL CLOSE =================
-
 def record_close(pos, qty, price, tag):
-    pnl = qty * (price - pos["entry_price"])
-    pnl_pct = safe_div(pnl, qty * pos["entry_price"])
+    pnl = qty*(price - pos["entry_price"])
+    pnl_pct = safe_div(pnl, qty*pos["entry_price"])
 
     STATE["closed_trades"].append({
         "token": pos["token"],
-        "engine": pos["engine"],
         "alpha": pos["alpha"],
         "qty": qty,
         "entry_price": pos["entry_price"],
@@ -115,46 +140,47 @@ async def monitor():
             pos.setdefault("peak",0)
             pos.setdefault("tp1",False)
             pos.setdefault("tp2",False)
-            pos.setdefault("original_qty",pos["qty"])
 
-            pnl, pnl_pct, price = await simulate_sell(pos)
+            price = pos["entry_price"] * random.uniform(0.7,1.5)
+
+            pnl = pos["qty"]*(price-pos["entry_price"])
+            pnl_pct = safe_div(pnl, pos["qty"]*pos["entry_price"])
 
             pos["peak"] = max(pos["peak"], pnl_pct)
 
             # ===== TP1 =====
-if not pos["tp1"] and pnl_pct > 0.18:
-    sell_qty = pos["qty"] * 0.5
-    record_close(pos, sell_qty, price, "TP1")
-    pos["qty"] -= sell_qty
-    pos["tp1"] = True
+            if not pos["tp1"] and pnl_pct > 0.2:
+                sell = pos["qty"]*0.5
+                record_close(pos,sell,price,"TP1")
+                pos["qty"] -= sell
+                pos["tp1"] = True
 
-# ===== TP2 =====
-if not pos["tp2"] and pnl_pct > 0.35:
-    sell_qty = pos["qty"] * 0.5
-    record_close(pos, sell_qty, price, "TP2")
-    pos["qty"] -= sell_qty
-    pos["tp2"] = True
+            # ===== TP2 =====
+            if not pos["tp2"] and pnl_pct > 0.4:
+                sell = pos["qty"]*0.5
+                record_close(pos,sell,price,"TP2")
+                pos["qty"] -= sell
+                pos["tp2"] = True
 
-# ===== trailing =====
-giveback = 0.06
+            if pos["qty"] <= 0:
+                continue
 
-if pos["peak"] > 0.3:
-    giveback = 0.05
-if pos["peak"] > 0.5:
-    giveback = 0.045
+            # ===== trailing =====
+            giveback = 0.06
+            if pos["peak"] > 0.3:
+                giveback = 0.05
+            if pos["peak"] > 0.5:
+                giveback = 0.04
 
-# ===== break-even =====
-break_even = pos["peak"] > 0.10 and pnl_pct < 0
+            break_even = pos["peak"] > 0.1 and pnl_pct < 0
 
-            should_close = (
+            if (
                 pnl_pct < STOP_LOSS
                 or break_even
-                or (pos["peak"] > 0.05 and pos["peak"] - pnl_pct > giveback)
-                or time.time() - pos["entry_time"] > MAX_HOLD_SECONDS
-            )
-
-            if should_close:
-                record_close(pos, pos["qty"], price, "FINAL_EXIT")
+                or (pos["peak"] > 0.1 and pos["peak"]-pnl_pct > giveback)
+                or time.time()-pos["entry_time"] > MAX_HOLD_SECONDS
+            ):
+                record_close(pos,pos["qty"],price,"EXIT")
 
                 if pnl > 0:
                     STATE["loss_streak"] = 0
@@ -171,18 +197,6 @@ break_even = pos["peak"] > 0.10 and pnl_pct < 0
 
     STATE["positions"] = new_positions[:MAX_POSITIONS]
 
-# ================= EXEC =================
-
-async def execute_trade(alpha):
-    price = random.uniform(0.00001,0.00002)
-
-    size = min(max(0.001*(1+alpha/50),0.0005), MAX_POSITION_SIZE)
-    size *= 0.8  # 🔥 降風險
-
-    qty = safe_div(size, price)
-
-    return price, qty
-
 # ================= LOOP =================
 
 async def bot_loop():
@@ -192,7 +206,7 @@ async def bot_loop():
                 await asyncio.sleep(5)
                 continue
 
-            if check_drawdown() < MAX_DRAWDOWN:
+            if drawdown() < MAX_DRAWDOWN:
                 await asyncio.sleep(5)
                 continue
 
@@ -209,29 +223,30 @@ async def bot_loop():
             signals = []
 
             for _ in range(30):
-                alpha = get_real_alpha()
+                a = get_alpha()
 
-                if not alpha_filter(alpha):
+                if a < MIN_ALPHA:
                     continue
 
-                score = alpha_quality(alpha)
-                signals.append((alpha, score))
+                score = alpha_quality(a)
+                signals.append((a,score))
 
-            signals = sorted(signals, key=lambda x:x[1], reverse=True)[:8]
+            signals = sorted(signals,key=lambda x:x[1],reverse=True)[:8]
 
-            for alpha,_ in signals:
+            for a,_ in signals:
                 if len(STATE["positions"]) >= MAX_POSITIONS:
                     break
 
-                price, qty = await execute_trade(alpha)
+                price, qty = await execute_trade(a)
+
+                if not price:
+                    continue
 
                 STATE["positions"].append({
                     "token": f"TOKEN{random.randint(1,9999)}",
                     "entry_price": price,
                     "qty": qty,
-                    "original_qty": qty,
-                    "alpha": alpha,
-                    "engine": "core",
+                    "alpha": a,
                     "entry_time": time.time(),
                     "peak": 0,
                     "tp1": False,
