@@ -13,14 +13,15 @@ STATE = {
     "last_action": None,
     "candidates": [],
     "scanner_mode": None,
-    "pump_status": None,
-    "pump_error": None,
+    "scanner_error": None,
+    "dex_pairs": 0,
     "realized_pnl": 0.0,
 }
 
 MAX_POSITIONS = 3
 TAKE_PROFIT = 0.08
 STOP_LOSS = 0.05
+DAILY_LOSS_LIMIT = -0.02
 
 
 def has_position(mint: str) -> bool:
@@ -83,41 +84,55 @@ async def real_alpha(mint: str) -> float:
 
 async def scan_tokens():
     tokens = []
+    STATE["scanner_error"] = None
+    STATE["dex_pairs"] = 0
 
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get("https://frontend-api.pump.fun/coins")
-            STATE["pump_status"] = r.status_code
+            r = await client.get(
+                "https://api.dexscreener.com/latest/dex/pairs/solana"
+            )
 
             if r.status_code == 200:
                 data = r.json()
+                pairs = data.get("pairs", []) or []
+                STATE["dex_pairs"] = len(pairs)
 
-                if isinstance(data, list):
-                    rows = data
-                elif isinstance(data, dict):
-                    rows = data.get("coins") or data.get("data") or []
-                else:
-                    rows = []
+                for p in pairs[:50]:
+                    mint = p.get("baseToken", {}).get("address")
+                    liquidity = p.get("liquidity", {}).get("usd", 0) or 0
 
-                for item in rows[:10]:
-                    mint = item.get("mint")
-                    if mint:
+                    try:
+                        liquidity = float(liquidity)
+                    except Exception:
+                        liquidity = 0
+
+                    if mint and liquidity > 20000:
                         tokens.append(mint)
 
+                STATE["scanner_mode"] = "dexscreener"
+            else:
+                STATE["scanner_error"] = f"dexscreener_status_{r.status_code}"
+
     except Exception as e:
-        STATE["pump_error"] = str(e)
+        STATE["scanner_error"] = str(e)
 
     if not tokens:
-        # 保底測流程用
         tokens = [
             "So11111111111111111111111111111111111111112",
             "Es9vMFrzaCERmJfrF4H2Fy7pRkNvztNFVQVw1Gc7emsK",
         ]
-        STATE["scanner_mode"] = "fallback_real_mints"
-    else:
-        STATE["scanner_mode"] = "pumpfun"
+        STATE["scanner_mode"] = "fallback"
 
-    return tokens
+    # 去重
+    clean = []
+    seen = set()
+    for mint in tokens:
+        if mint not in seen:
+            seen.add(mint)
+            clean.append(mint)
+
+    return clean[:20]
 
 
 def fake_price_walk(entry_price: float) -> float:
@@ -180,6 +195,11 @@ async def bot_loop():
             STATE["signals"] += 1
             STATE["last_action"] = "scan"
 
+            if STATE["realized_pnl"] < DAILY_LOSS_LIMIT:
+                STATE["last_action"] = "kill_switch"
+                await asyncio.sleep(5)
+                continue
+
             tokens = await scan_tokens()
             STATE["candidates"] = tokens
 
@@ -192,20 +212,23 @@ async def bot_loop():
 
                 alpha = await real_alpha(mint)
 
-                # 如果是真 fallback 幣種，alpha 很可能過不了
-                # 所以保底讓測試流程可跑
+                # 如果 fallback 模式下 alpha 不夠，保底讓模擬流程繼續測
                 if alpha < 120:
-                    if STATE["scanner_mode"] == "fallback_real_mints":
+                    if STATE["scanner_mode"] == "fallback":
                         alpha = random.uniform(125, 160)
                     else:
                         continue
 
+                size = min(0.01, 0.1 / (len(STATE["positions"]) + 1))
+
+                entry_price = round(random.uniform(0.00001, 0.00002), 8)
+
                 STATE["positions"].append({
                     "token": mint,
                     "alpha": round(alpha, 2),
-                    "size": 0.01,
-                    "entry_price": round(random.uniform(0.00001, 0.00002), 8),
-                    "last_price": None,
+                    "size": round(size, 4),
+                    "entry_price": entry_price,
+                    "last_price": entry_price,
                     "pnl_pct": 0.0,
                 })
                 STATE["last_action"] = f"paper_buy:{mint}"
@@ -261,7 +284,7 @@ async def metrics():
         "last_action": STATE["last_action"],
         "candidates": STATE["candidates"],
         "scanner_mode": STATE.get("scanner_mode"),
-        "pump_status": STATE.get("pump_status"),
-        "pump_error": STATE.get("pump_error"),
+        "scanner_error": STATE.get("scanner_error"),
+        "dex_pairs": STATE.get("dex_pairs"),
         "realized_pnl": round(STATE["realized_pnl"], 6),
     }
