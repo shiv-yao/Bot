@@ -1,5 +1,1 @@
-
-import asyncio
-from core.bot import run
-
-asyncio.run(run())
+uvicorn main:app --host 0.0.0.0 --port $PORT
