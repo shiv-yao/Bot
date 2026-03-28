@@ -23,7 +23,7 @@ STATE = {
     "scanner_mode": None,
     "scanner_error": None,
     "last_alpha": None,
-    "bot_version": "alpha_dual_engine_v5_allocator_cooldown",
+    "bot_version": "alpha_dual_engine_v6_trailing",
     "candidate_count": 0,
     "loss_streak": 0,
     "last_trade_time": {},
@@ -54,6 +54,9 @@ TRADE_COOLDOWN_SECONDS = 120
 
 STOP_LOSS = -0.06
 TAKE_PROFIT = 0.12
+TP1_LEVEL = 0.08
+TRAILING_GIVEBACK = 0.06
+TRAILING_ARM = 0.10
 DAILY_STOP = -0.03
 
 GAS_COST = 0.000005
@@ -69,7 +72,7 @@ def is_valid_mint(mint: str) -> bool:
         return False
     if len(mint) < 32 or len(mint) > 44:
         return False
-    if any(c in mint for c in [".", "/", ":"]):
+    if any(c in mint for c in mint for c in [".", "/", ":"]):
         return False
     if mint.startswith("0x"):
         return False
@@ -112,8 +115,6 @@ def get_engine_weight(engine: str) -> float:
 
 def get_dynamic_alpha_threshold(engine: str) -> float:
     stats = STATE["engine_stats"][engine]
-
-    # stable 拉高一點，避免 9.69 那種反覆進場
     base = 12.0 if engine == "stable" else 35.0
 
     if stats["trades"] >= 5:
@@ -384,13 +385,61 @@ async def monitor_positions():
         pos["last_price"] = r["price"]
         pos["pnl_pct"] = r["pnl_pct"]
 
+        peak = pos.get("peak_pnl_pct", pos["pnl_pct"])
+        pos["peak_pnl_pct"] = max(peak, pos["pnl_pct"])
+
+        # =========================
+        # TP1: +8% 先賣一半
+        # =========================
+        if (not pos.get("tp1_done", False)) and pos["pnl_pct"] >= TP1_LEVEL:
+            half_qty = pos["token_qty"] * 0.5
+            half_size = pos["size"] * 0.5
+
+            realized_half = (r["price"] - pos["entry_price"]) * half_qty - GAS_COST
+
+            partial_closed = {
+                "token": pos["token"],
+                "alpha": pos["alpha"],
+                "size": half_size,
+                "entry_price": pos["entry_price"],
+                "exit_price": r["price"],
+                "entry_time": pos["entry_time"],
+                "exit_time": r["timestamp"],
+                "exit_reason": "take_profit_1",
+                "realized_pnl": realized_half,
+                "engine": pos.get("engine"),
+                "partial": True,
+            }
+
+            STATE["closed_trades"].append(partial_closed)
+            STATE["realized_pnl"] += realized_half
+            STATE["daily_pnl"] += realized_half
+            update_engine_stats_on_close(pos["engine"], realized_half)
+
+            pos["token_qty"] = half_qty
+            pos["size"] = half_size
+            pos["tp1_done"] = True
+            pos["entry_gas_cost"] += GAS_COST
+
+            STATE["last_action"] = f"tp1_half:{pos['token']}"
+            new_positions.append(pos)
+            continue
+
+        # =========================
+        # SL / TP2 / Timeout / Trailing Stop
+        # =========================
         reason = None
+
         if pos["pnl_pct"] < STOP_LOSS:
             reason = "stop_loss"
         elif pos["pnl_pct"] > TAKE_PROFIT:
             reason = "take_profit"
         elif time.time() - pos["entry_time"] > MAX_HOLD_SECONDS:
             reason = "timeout"
+        elif pos.get("peak_pnl_pct", 0.0) >= TRAILING_ARM:
+            giveback = pos["peak_pnl_pct"] - pos["pnl_pct"]
+            if giveback >= TRAILING_GIVEBACK:
+                reason = "trailing_stop"
 
         if reason:
             closed = dict(pos)
@@ -418,7 +467,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v5_allocator_cooldown"
+            STATE["bot_version"] = "alpha_dual_engine_v6_trailing"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -527,6 +576,7 @@ async def bot_loop():
                     "token": mint,
                     "alpha": alpha,
                     "size": buy["size"],
+                    "original_size": buy["size"],
                     "entry_price": buy["fill_price"],
                     "mark_price": buy["mark_price"],
                     "last_price": buy["fill_price"],
@@ -535,6 +585,8 @@ async def bot_loop():
                     "entry_gas_cost": buy["gas_cost"],
                     "pnl_pct": 0.0,
                     "engine": "stable",
+                    "tp1_done": False,
+                    "peak_pnl_pct": 0.0,
                 })
 
                 mark_trade_time(mint)
@@ -589,6 +641,7 @@ async def bot_loop():
                     "token": mint,
                     "alpha": alpha,
                     "size": buy["size"],
+                    "original_size": buy["size"],
                     "entry_price": buy["fill_price"],
                     "mark_price": buy["mark_price"],
                     "last_price": buy["fill_price"],
@@ -597,6 +650,8 @@ async def bot_loop():
                     "entry_gas_cost": buy["gas_cost"],
                     "pnl_pct": 0.0,
                     "engine": "degen",
+                    "tp1_done": False,
+                    "peak_pnl_pct": 0.0,
                 })
 
                 mark_trade_time(mint)
