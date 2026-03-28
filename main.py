@@ -94,6 +94,7 @@ async def real_alpha(mint: str) -> float:
 async def get_real_price(mint: str):
     try:
         sol = "So11111111111111111111111111111111111111112"
+        amount_in = 1_000_000  # 0.001 SOL
 
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -101,7 +102,7 @@ async def get_real_price(mint: str):
                 params={
                     "inputMint": sol,
                     "outputMint": mint,
-                    "amount": "1000000",
+                    "amount": str(amount_in),
                     "slippageBps": 100,
                 },
             )
@@ -115,7 +116,10 @@ async def get_real_price(mint: str):
             if out <= 0:
                 return None
 
-            return out / 1_000_000
+            # 🔥 正確價格（SOL per token）
+            price = amount_in / out
+
+            return price
 
     except Exception:
         return None
