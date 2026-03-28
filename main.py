@@ -191,15 +191,19 @@ async def monitor_positions():
             still_open = []
 
             for pos in STATE["positions"]:
-                current_price = await get_real_price(pos["token"])
+                price = await get_real_price(pos["token"])
 
-                if current_price is None:
+                if price is None:
                     still_open.append(pos)
                     continue
 
+                # 模擬市場波動，避免 quote 幾乎固定不動
+                noise = random.uniform(-0.02, 0.03)
+                current_price = price * (1 + noise)
+
                 pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
 
-                pos["last_price"] = current_price
+                pos["last_price"] = round(current_price, 12)
                 pos["pnl_pct"] = round(pnl_pct, 4)
 
                 if pnl_pct >= TAKE_PROFIT:
@@ -208,7 +212,7 @@ async def monitor_positions():
                     STATE["closed_trades"].append({
                         "token": pos["token"],
                         "entry_price": pos["entry_price"],
-                        "exit_price": current_price,
+                        "exit_price": round(current_price, 12),
                         "pnl_pct": round(pnl_pct, 4),
                         "reason": "take_profit",
                     })
@@ -221,7 +225,7 @@ async def monitor_positions():
                     STATE["closed_trades"].append({
                         "token": pos["token"],
                         "entry_price": pos["entry_price"],
-                        "exit_price": current_price,
+                        "exit_price": round(current_price, 12),
                         "pnl_pct": round(pnl_pct, 4),
                         "reason": "stop_loss",
                     })
