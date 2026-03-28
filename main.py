@@ -194,22 +194,7 @@ def check_drawdown():
 
     return drawdown
 
-# ================= MONITOR =================
-
-async def simulate_sell(pos):
-    price = pos["entry_price"] * random.uniform(0.6,1.6)
-
-    value = pos["qty"] * price
-    entry = pos["qty"] * pos["entry_price"]
-
-    pnl = value - entry
-    pnl_pct = safe_div(pnl, entry)
-
-    return pnl, pnl_pct
-
-def position_score(pos):
-    age_penalty = (time.time() - pos["entry_time"]) / 300
-    return pos["alpha"] * (pos.get("peak",0)+1) - age_penalty
+# ================= MONITOR v29 =================
 
 async def monitor():
     new_positions = []
@@ -217,34 +202,57 @@ async def monitor():
     for pos in STATE["positions"]:
         pnl, pnl_pct = await simulate_sell(pos)
 
-        pos["peak"] = max(pos.get("peak",0), pnl_pct)
+        # ===== 更新 peak =====
+        pos["peak"] = max(pos.get("peak", 0), pnl_pct)
 
-        giveback = 0.05 + pos["alpha"]/200
+        # ===== 分段止盈 =====
+        if not pos.get("tp1") and pnl_pct > 0.15:
+            pos["tp1"] = True
+            pos["qty"] *= 0.5
 
-        if (
+        if not pos.get("tp2") and pnl_pct > 0.30:
+            pos["tp2"] = True
+            pos["qty"] *= 0.75
+
+        # ===== 動態 trailing =====
+        giveback = 0.05 + pos["alpha"] / 200
+
+        if pos["peak"] > 0.3:
+            giveback += 0.05
+        if pos["peak"] > 0.6:
+            giveback += 0.1
+
+        # ===== Break-even 保護 =====
+        break_even = pos["peak"] > 0.1 and pnl_pct < 0
+
+        # ===== 出場條件 =====
+        should_close = (
             pnl_pct < STOP_LOSS
-            or (pos["peak"]>0.08 and pos["peak"]-pnl_pct > giveback)
-            or time.time()-pos["entry_time"] > MAX_HOLD_SECONDS
-        ):
+            or break_even
+            or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback)
+            or time.time() - pos["entry_time"] > MAX_HOLD_SECONDS
+        )
+
+        if should_close:
             engine = pos["engine"]
 
             STATE["closed_trades"].append({
                 **pos,
-                "pnl":pnl,
-                "pnl_pct":pnl_pct,
-                "exit_time":time.time()
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "exit_time": time.time()
             })
 
             STATE["realized_pnl"] += pnl
             STATE["daily_pnl"] += pnl
 
-            update_alpha_memory(engine,pos["alpha"],pnl)
+            update_alpha_memory(engine, pos["alpha"], pnl)
 
             st = STATE["engine_stats"][engine]
             st["trades"] += 1
             st["pnl"] += pnl
 
-            if pnl>0:
+            if pnl > 0:
                 st["wins"] += 1
                 STATE["loss_streak"] = 0
             else:
@@ -254,7 +262,13 @@ async def monitor():
 
         new_positions.append(pos)
 
-    STATE["positions"] = sorted(new_positions,key=position_score,reverse=True)[:MAX_POSITIONS]
+    # 🔥 只保留最強倉（基金邏輯）
+    STATE["positions"] = sorted(
+        new_positions,
+        key=position_score,
+        reverse=True
+    )[:MAX_POSITIONS]
+
 
 # ================= LOOP =================
 
