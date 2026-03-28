@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 STATE = {
     "positions": [],
+    "closed_trades": [],
     "signals": 0,
     "errors": 0,
     "last_action": None,
@@ -14,9 +15,12 @@ STATE = {
     "scanner_mode": None,
     "pump_status": None,
     "pump_error": None,
+    "realized_pnl": 0.0,
 }
 
 MAX_POSITIONS = 3
+TAKE_PROFIT = 0.08
+STOP_LOSS = 0.05
 
 
 def has_position(mint: str) -> bool:
@@ -80,7 +84,6 @@ async def real_alpha(mint: str) -> float:
 async def scan_tokens():
     tokens = []
 
-    # source 1: pump.fun
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get("https://frontend-api.pump.fun/coins")
@@ -104,8 +107,8 @@ async def scan_tokens():
     except Exception as e:
         STATE["pump_error"] = str(e)
 
-    # fallback: real-looking mints to keep pipeline testable
     if not tokens:
+        # 保底測流程用
         tokens = [
             "So11111111111111111111111111111111111111112",
             "Es9vMFrzaCERmJfrF4H2Fy7pRkNvztNFVQVw1Gc7emsK",
@@ -115,6 +118,60 @@ async def scan_tokens():
         STATE["scanner_mode"] = "pumpfun"
 
     return tokens
+
+
+def fake_price_walk(entry_price: float) -> float:
+    move = random.uniform(-0.06, 0.10)
+    return round(entry_price * (1 + move), 8)
+
+
+async def monitor_positions():
+    while True:
+        try:
+            still_open = []
+
+            for pos in STATE["positions"]:
+                current_price = fake_price_walk(pos["entry_price"])
+                pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+
+                pos["last_price"] = current_price
+                pos["pnl_pct"] = round(pnl_pct, 4)
+
+                if pnl_pct >= TAKE_PROFIT:
+                    pnl_value = pos["size"] * pnl_pct
+                    STATE["realized_pnl"] += pnl_value
+                    STATE["closed_trades"].append({
+                        "token": pos["token"],
+                        "entry_price": pos["entry_price"],
+                        "exit_price": current_price,
+                        "pnl_pct": round(pnl_pct, 4),
+                        "reason": "take_profit",
+                    })
+                    STATE["last_action"] = f"tp_sell:{pos['token']}"
+                    continue
+
+                if pnl_pct <= -STOP_LOSS:
+                    pnl_value = pos["size"] * pnl_pct
+                    STATE["realized_pnl"] += pnl_value
+                    STATE["closed_trades"].append({
+                        "token": pos["token"],
+                        "entry_price": pos["entry_price"],
+                        "exit_price": current_price,
+                        "pnl_pct": round(pnl_pct, 4),
+                        "reason": "stop_loss",
+                    })
+                    STATE["last_action"] = f"sl_sell:{pos['token']}"
+                    continue
+
+                still_open.append(pos)
+
+            STATE["positions"] = still_open
+
+        except Exception as e:
+            STATE["errors"] += 1
+            STATE["last_action"] = f"monitor_error:{str(e)}"
+
+        await asyncio.sleep(3)
 
 
 async def bot_loop():
@@ -133,19 +190,23 @@ async def bot_loop():
                 if has_position(mint):
                     continue
 
-                if mint.startswith("TEST_"):
-                    continue
-
                 alpha = await real_alpha(mint)
 
+                # 如果是真 fallback 幣種，alpha 很可能過不了
+                # 所以保底讓測試流程可跑
                 if alpha < 120:
-                    continue
+                    if STATE["scanner_mode"] == "fallback_real_mints":
+                        alpha = random.uniform(125, 160)
+                    else:
+                        continue
 
                 STATE["positions"].append({
                     "token": mint,
                     "alpha": round(alpha, 2),
                     "size": 0.01,
                     "entry_price": round(random.uniform(0.00001, 0.00002), 8),
+                    "last_price": None,
+                    "pnl_pct": 0.0,
                 })
                 STATE["last_action"] = f"paper_buy:{mint}"
 
@@ -157,15 +218,19 @@ async def bot_loop():
 
 
 bot_task = None
+monitor_task = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_task
+    global bot_task, monitor_task
     bot_task = asyncio.create_task(bot_loop())
+    monitor_task = asyncio.create_task(monitor_positions())
     yield
     if bot_task:
         bot_task.cancel()
+    if monitor_task:
+        monitor_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -190,6 +255,7 @@ async def data():
 async def metrics():
     return {
         "positions": STATE["positions"],
+        "closed_trades": STATE["closed_trades"][-10:],
         "signals": STATE["signals"],
         "errors": STATE["errors"],
         "last_action": STATE["last_action"],
@@ -197,4 +263,5 @@ async def metrics():
         "scanner_mode": STATE.get("scanner_mode"),
         "pump_status": STATE.get("pump_status"),
         "pump_error": STATE.get("pump_error"),
+        "realized_pnl": round(STATE["realized_pnl"], 6),
     }
