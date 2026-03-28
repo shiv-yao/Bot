@@ -11,6 +11,9 @@ STATE = {
     "errors": 0,
     "last_action": None,
     "candidates": [],
+    "scanner_mode": None,
+    "pump_status": None,
+    "pump_error": None,
 }
 
 MAX_POSITIONS = 3
@@ -36,7 +39,7 @@ async def real_alpha(mint: str) -> float:
             )
 
             if r1.status_code != 200:
-                return 0
+                return 0.0
 
             q1 = r1.json()
             out1 = int(q1.get("outAmount", 0) or 0)
@@ -55,13 +58,13 @@ async def real_alpha(mint: str) -> float:
             )
 
             if r2.status_code != 200:
-                return 0
+                return 0.0
 
             q2 = r2.json()
             out2 = int(q2.get("outAmount", 0) or 0)
 
             if out1 <= 0:
-                return 0
+                return 0.0
 
             strength = (out2 - out1) / out1
             liquidity_score = min(out1 / 100000, 3) * 25
@@ -71,26 +74,45 @@ async def real_alpha(mint: str) -> float:
             return round(alpha, 2)
 
     except Exception:
-        return 0
+        return 0.0
 
 
 async def scan_tokens():
     tokens = []
 
+    # source 1: pump.fun
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get("https://frontend-api.pump.fun/coins")
+            STATE["pump_status"] = r.status_code
+
             if r.status_code == 200:
                 data = r.json()
-                for item in data[:10]:
+
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict):
+                    rows = data.get("coins") or data.get("data") or []
+                else:
+                    rows = []
+
+                for item in rows[:10]:
                     mint = item.get("mint")
                     if mint:
                         tokens.append(mint)
-    except Exception:
-        pass
 
+    except Exception as e:
+        STATE["pump_error"] = str(e)
+
+    # fallback: real-looking mints to keep pipeline testable
     if not tokens:
-        tokens = ["TEST_A", "TEST_B"]
+        tokens = [
+            "So11111111111111111111111111111111111111112",
+            "Es9vMFrzaCERmJfrF4H2Fy7pRkNvztNFVQVw1Gc7emsK",
+        ]
+        STATE["scanner_mode"] = "fallback_real_mints"
+    else:
+        STATE["scanner_mode"] = "pumpfun"
 
     return tokens
 
@@ -172,4 +194,7 @@ async def metrics():
         "errors": STATE["errors"],
         "last_action": STATE["last_action"],
         "candidates": STATE["candidates"],
+        "scanner_mode": STATE.get("scanner_mode"),
+        "pump_status": STATE.get("pump_status"),
+        "pump_error": STATE.get("pump_error"),
     }
