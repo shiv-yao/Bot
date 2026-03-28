@@ -70,6 +70,32 @@ async def get_quote(mint: str):
     except:
         return None
 
+async def has_jupiter_route(mint: str) -> bool:
+    try:
+        sol = "So11111111111111111111111111111111111111112"
+
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100,
+                },
+            )
+
+            if r.status_code != 200:
+                return False
+
+            data = r.json()
+            out = int(data.get("outAmount", 0) or 0)
+
+            return out > 1000
+
+    except Exception:
+        return False
+
 
 async def real_alpha(mint: str) -> float:
     try:
@@ -187,11 +213,20 @@ async def scan_tokens():
     except Exception as e:
         STATE["scanner_error"] = str(e)
 
-    if not tokens:
-        tokens = ["TEST_A", "TEST_B"]
-        STATE["scanner_mode"] = "fallback"
+    # 再過一層：只留下 Jupiter 可報價的 token
+    filtered = []
 
-    return tokens[:20]
+    for mint in tokens:
+        if await has_jupiter_route(mint):
+            filtered.append(mint)
+
+    STATE["candidate_count"] = len(filtered)
+
+    if not filtered:
+        STATE["scanner_mode"] = "fallback"
+        return ["TEST_A", "TEST_B"]
+
+    return filtered[:20]
 
 # ================= EXECUTION =================
 
@@ -419,4 +454,5 @@ async def metrics():
         "scanner_error": STATE.get("scanner_error"),
         "last_alpha": STATE.get("last_alpha"),
         "bot_version": STATE.get("bot_version"),
+        "candidate_count": STATE.get("candidate_count"),
     }
