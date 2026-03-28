@@ -385,10 +385,10 @@ async def bot_loop():
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                if STATE["daily_trades"] == 0 and alpha > 30:
+                if STATE["daily_trades"] == 0 and alpha > 10:
                     STATE["last_action"] = f"fallback_buy:{mint}:{alpha}"
                 else:
-                    if alpha < 60:
+                    if alpha < 15:
                         STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                         continue
 
