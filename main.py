@@ -2,7 +2,6 @@ import asyncio
 import random
 import httpx
 import time
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
@@ -16,657 +15,211 @@ STATE = {
     "last_action": None,
     "candidates": [],
     "last_execution": None,
+
     "realized_pnl": 0.0,
     "daily_pnl": 0.0,
     "daily_trades": 0,
     "last_reset": time.time(),
-    "scanner_mode": None,
-    "scanner_error": None,
-    "last_alpha": None,
-    "bot_version": "alpha_dual_engine_v6_trailing",
-    "candidate_count": 0,
+
     "loss_streak": 0,
-    "last_trade_time": {},
+    "regime": "chop",
+
     "engine_stats": {
-        "stable": {
-            "pnl": 0.0,
-            "trades": 0,
-            "wins": 0,
-            "winrate": 0.0,
-            "open_positions": 0,
-        },
-        "degen": {
-            "pnl": 0.0,
-            "trades": 0,
-            "wins": 0,
-            "winrate": 0.0,
-            "open_positions": 0,
-        },
+        "stable": {"pnl": 0.0, "trades": 0, "wins": 0, "winrate": 0.0},
+        "degen": {"pnl": 0.0, "trades": 0, "wins": 0, "winrate": 0.0},
     },
+
+    "allocator": {
+        "stable_weight": 0.5,
+        "degen_weight": 0.5,
+    },
+
+    "bot_version": "v8_fund_brain"
 }
 
 # ================= CONFIG =================
 
-MAX_POSITIONS = 4
-MAX_DAILY_TRADES = 20
-MAX_HOLD_SECONDS = 120
-TRADE_COOLDOWN_SECONDS = 120
-
 STOP_LOSS = -0.06
-TAKE_PROFIT = 0.12
-TP1_LEVEL = 0.08
-TRAILING_GIVEBACK = 0.06
-TRAILING_ARM = 0.10
-DAILY_STOP = -0.03
+DAILY_STOP = -0.05
+
+MAX_POSITIONS = 5
+MAX_DAILY_TRADES = 30
+MAX_HOLD_SECONDS = 180
 
 GAS_COST = 0.000005
 
-# ================= HELPERS =================
+# ================= 🧠 REGIME =================
 
-def has_position(mint: str) -> bool:
-    return any(p["token"] == mint for p in STATE["positions"])
+def detect_regime():
+    pnl = STATE["daily_pnl"]
+    loss = STATE["loss_streak"]
 
+    if pnl > 0.01:
+        return "bull"
+    if loss >= 3:
+        return "bear"
+    return "chop"
 
-def is_valid_mint(mint: str) -> bool:
-    if not mint:
-        return False
-    if len(mint) < 32 or len(mint) > 44:
-        return False
-    if any(c in mint for c in mint for c in [".", "/", ":"]):
-        return False
-    if mint.startswith("0x"):
-        return False
-    return True
+# ================= 🧠 ALLOCATOR =================
 
+def update_allocator():
+    stable = STATE["engine_stats"]["stable"]
+    degen = STATE["engine_stats"]["degen"]
 
-def in_trade_cooldown(mint: str) -> bool:
-    ts = STATE["last_trade_time"].get(mint)
-    if ts is None:
-        return False
-    return (time.time() - ts) < TRADE_COOLDOWN_SECONDS
+    total = abs(stable["pnl"]) + abs(degen["pnl"]) + 1e-6
 
+    stable_weight = abs(stable["pnl"]) / total
+    degen_weight = abs(degen["pnl"]) / total
 
-def mark_trade_time(mint: str) -> None:
-    STATE["last_trade_time"][mint] = time.time()
+    if STATE["regime"] == "bull":
+        degen_weight += 0.2
+    elif STATE["regime"] == "bear":
+        stable_weight += 0.3
 
+    total = stable_weight + degen_weight
+    STATE["allocator"]["stable_weight"] = stable_weight / total
+    STATE["allocator"]["degen_weight"] = degen_weight / total
 
-# ================= AI ALLOCATOR =================
+# ================= SIZE =================
 
-def get_engine_weight(engine: str) -> float:
-    stats = STATE["engine_stats"][engine]
-    weight = 1.0
+def get_position_size(alpha, engine):
+    base = 0.003 if engine == "stable" else 0.002
 
-    if stats["trades"] >= 3:
-        if stats["winrate"] > 0.60:
-            weight *= 1.3
-        elif stats["winrate"] < 0.40:
-            weight *= 0.7
+    weight = STATE["allocator"][f"{engine}_weight"]
 
-        if stats["pnl"] > 0:
-            weight *= 1.2
-        elif stats["pnl"] < 0:
-            weight *= 0.8
-
-    if STATE["loss_streak"] >= 2:
-        weight *= 0.5
-
-    return max(0.3, min(weight, 2.0))
-
-
-def get_dynamic_alpha_threshold(engine: str) -> float:
-    stats = STATE["engine_stats"][engine]
-    base = 12.0 if engine == "stable" else 35.0
-
-    if stats["trades"] >= 5:
-        if stats["winrate"] < 0.40:
-            base *= 1.3
-        elif stats["winrate"] > 0.65:
-            base *= 0.85
-
-        if stats["pnl"] < 0:
-            base *= 1.15
-        elif stats["pnl"] > 0:
-            base *= 0.92
-
-    return round(base, 2)
-
-
-def get_position_size(alpha: float, engine: str) -> float:
-    base = 0.002 if engine == "stable" else 0.0015
-    weight = get_engine_weight(engine)
-    alpha_boost = min(max(alpha / 50.0, 0.5), 1.5)
-
-    size = base * weight * alpha_boost
+    size = base * weight * (1 + alpha / 50)
 
     if STATE["loss_streak"] >= 2:
         size *= 0.5
 
-    return round(max(0.0005, size), 4)
-
-
-def get_allocator_state():
-    return {
-        "stable_weight": round(get_engine_weight("stable"), 3),
-        "degen_weight": round(get_engine_weight("degen"), 3),
-        "stable_threshold": get_dynamic_alpha_threshold("stable"),
-        "degen_threshold": get_dynamic_alpha_threshold("degen"),
-    }
-
-
-def update_engine_stats_on_close(engine: str, pnl: float):
-    stats = STATE["engine_stats"][engine]
-    stats["trades"] += 1
-    stats["pnl"] += pnl
-
-    if pnl > 0:
-        stats["wins"] += 1
-        STATE["loss_streak"] = 0
-    else:
-        STATE["loss_streak"] += 1
-
-    if stats["trades"] > 0:
-        stats["winrate"] = round(stats["wins"] / stats["trades"], 2)
-
-    if STATE["loss_streak"] >= 3:
-        STATE["last_action"] = "allocator_defensive_mode"
-
-    if stats["trades"] > 5 and stats["winrate"] > 0.65:
-        STATE["last_action"] = f"allocator_aggressive_mode:{engine}"
-
-
-def refresh_open_positions():
-    stable_open = sum(1 for p in STATE["positions"] if p.get("engine") == "stable")
-    degen_open = sum(1 for p in STATE["positions"] if p.get("engine") == "degen")
-    STATE["engine_stats"]["stable"]["open_positions"] = stable_open
-    STATE["engine_stats"]["degen"]["open_positions"] = degen_open
-
-
-# ================= MARKET DATA =================
-
-async def get_quote(mint: str):
-    try:
-        sol = "So11111111111111111111111111111111111111112"
-
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": sol,
-                    "outputMint": mint,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
-            )
-
-            if r.status_code != 200:
-                return None
-
-            data = r.json()
-            out = int(data.get("outAmount", 0) or 0)
-            if out <= 0:
-                return None
-
-            impact = float(data.get("priceImpactPct", 0) or 0)
-            price = 1_000_000 / out
-
-            return {"out": out, "impact": impact, "price": price}
-
-    except Exception:
-        return None
-
-
-async def real_alpha(mint: str) -> float:
-    try:
-        sol = "So11111111111111111111111111111111111111112"
-
-        async with httpx.AsyncClient(timeout=8) as client:
-            r1 = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": sol,
-                    "outputMint": mint,
-                    "amount": 1_000_000,
-                    "slippageBps": 100,
-                },
-            )
-            if r1.status_code != 200:
-                return -999.0
-
-            q1 = r1.json()
-            out_token = int(q1.get("outAmount", 0) or 0)
-            if out_token <= 0:
-                return -999.0
-
-            r2 = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": mint,
-                    "outputMint": sol,
-                    "amount": out_token,
-                    "slippageBps": 100,
-                },
-            )
-            if r2.status_code != 200:
-                return -999.0
-
-            q2 = r2.json()
-            back_sol = int(q2.get("outAmount", 0) or 0)
-            if back_sol <= 0:
-                return -999.0
-
-            pnl = (back_sol - 1_000_000) / 1_000_000
-            impact = float(q1.get("priceImpactPct", 0.0) or 0.0)
-            liquidity_score = min(out_token / 100000, 3) * 25
-
-            alpha = pnl * 3000 + liquidity_score - impact * 100
-            return round(alpha, 2)
-
-    except Exception:
-        return -999.0
-
-
-async def scan_tokens():
-    tokens = []
-    STATE["scanner_error"] = None
-
-    try:
-        async with httpx.AsyncClient(timeout=6) as client:
-            r = await client.get(
-                "https://api.dexscreener.com/latest/dex/search",
-                params={"q": "SOL"},
-            )
-
-            if r.status_code == 200:
-                data = r.json()
-                pairs = data.get("pairs", [])[:30]
-                seen = set()
-
-                for p in pairs:
-                    chain = p.get("chainId")
-                    mint = p.get("baseToken", {}).get("address")
-
-                    if chain != "solana":
-                        continue
-                    if not is_valid_mint(mint):
-                        continue
-                    if mint in seen:
-                        continue
-
-                    seen.add(mint)
-                    tokens.append(mint)
-
-                STATE["scanner_mode"] = "dexscreener_filtered"
-            else:
-                STATE["scanner_mode"] = "fallback"
-                STATE["scanner_error"] = f"dex_status_{r.status_code}"
-
-    except Exception as e:
-        STATE["scanner_mode"] = "fallback"
-        STATE["scanner_error"] = str(e)
-
-    if not tokens:
-        tokens = [
-            "So11111111111111111111111111111111111111112",
-            "Es9vMFrzaCERmJfrF4H2Fy7pRkNvztNFVQVw1Gc7emsK",
-        ]
-        STATE["scanner_mode"] = "fallback"
-
-    STATE["candidate_count"] = len(tokens)
-    STATE["candidates"] = tokens
-    return tokens
-
+    return round(size, 4)
 
 # ================= EXECUTION =================
 
-async def simulate_buy(mint: str, size: float):
-    try:
-        price = random.uniform(0.00001, 0.00002)
-        token_qty = size / price
+async def simulate_buy(mint, size):
+    price = random.uniform(0.00001, 0.00002)
 
-        result = {
-            "ok": True,
-            "mint": mint,
-            "size": size,
-            "mark_price": price,
-            "fill_price": price,
-            "token_qty": token_qty,
-            "gas_cost": GAS_COST,
-            "slippage": random.uniform(0, 0.01),
-            "timestamp": time.time(),
-        }
+    return {
+        "price": price,
+        "qty": size / price
+    }
 
-        STATE["last_execution"] = result
-        return result
+async def simulate_sell(pos):
+    price = pos["entry_price"] * random.uniform(0.7, 1.5)
 
-    except Exception:
-        return None
+    pnl = (price - pos["entry_price"]) * pos["token_qty"]
+    pnl_pct = pnl / (pos["entry_price"] * pos["token_qty"])
 
+    return price, pnl, pnl_pct
 
-async def simulate_sell(pos: dict):
-    try:
-        price = pos["entry_price"] * random.uniform(0.7, 1.3)
-
-        value = pos["token_qty"] * price
-        entry = pos["token_qty"] * pos["entry_price"]
-
-        pnl = value - entry
-        pnl_pct = pnl / entry
-
-        result = {
-            "ok": True,
-            "price": price,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
-            "timestamp": time.time(),
-            "gas_cost": GAS_COST,
-            "engine": pos.get("engine"),
-            "token": pos["token"],
-        }
-
-        STATE["last_execution"] = result
-        return result
-
-    except Exception:
-        return None
-
-
-# ================= POSITION MONITOR =================
+# ================= MONITOR =================
 
 async def monitor_positions():
     new_positions = []
 
     for pos in STATE["positions"]:
-        r = await simulate_sell(pos)
-        if not r:
-            new_positions.append(pos)
-            continue
+        price, pnl, pnl_pct = await simulate_sell(pos)
 
-        pos["mark_price"] = r["price"]
-        pos["last_price"] = r["price"]
-        pos["pnl_pct"] = r["pnl_pct"]
+        pos["pnl_pct"] = pnl_pct
+        pos["peak"] = max(pos.get("peak", 0), pnl_pct)
 
-        peak = pos.get("peak_pnl_pct", pos["pnl_pct"])
-        pos["peak_pnl_pct"] = max(peak, pos["pnl_pct"])
+        # ===== TP1 =====
+        if not pos.get("tp1") and pnl_pct > 0.08:
+            pos["tp1"] = True
+            pos["size"] *= 0.5
+            pos["token_qty"] *= 0.5
 
-        # =========================
-        # TP1: +8% 先賣一半
-        # =========================
-        if (not pos.get("tp1_done", False)) and pos["pnl_pct"] >= TP1_LEVEL:
-            half_qty = pos["token_qty"] * 0.5
-            half_size = pos["size"] * 0.5
+        # ===== trailing =====
+        giveback = 0.06
+        if pos["peak"] > 0.2:
+            giveback = 0.1
+        if pos["peak"] > 0.5:
+            giveback = 0.2
 
-            realized_half = (r["price"] - pos["entry_price"]) * half_qty - GAS_COST
+        if pnl_pct < STOP_LOSS or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback):
+            STATE["closed_trades"].append(pos)
+            STATE["realized_pnl"] += pnl
+            STATE["daily_pnl"] += pnl
 
-            partial_closed = {
-                "token": pos["token"],
-                "alpha": pos["alpha"],
-                "size": half_size,
-                "entry_price": pos["entry_price"],
-                "exit_price": r["price"],
-                "entry_time": pos["entry_time"],
-                "exit_time": r["timestamp"],
-                "exit_reason": "take_profit_1",
-                "realized_pnl": realized_half,
-                "engine": pos.get("engine"),
-                "partial": True,
-            }
+            engine = pos["engine"]
+            st = STATE["engine_stats"][engine]
+            st["trades"] += 1
+            st["pnl"] += pnl
+            if pnl > 0:
+                st["wins"] += 1
+                STATE["loss_streak"] = 0
+            else:
+                STATE["loss_streak"] += 1
 
-            STATE["closed_trades"].append(partial_closed)
-            STATE["realized_pnl"] += realized_half
-            STATE["daily_pnl"] += realized_half
-            update_engine_stats_on_close(pos["engine"], realized_half)
-
-            pos["token_qty"] = half_qty
-            pos["size"] = half_size
-            pos["tp1_done"] = True
-            pos["entry_gas_cost"] += GAS_COST
-
-            STATE["last_action"] = f"tp1_half:{pos['token']}"
-            new_positions.append(pos)
-            continue
-
-        # =========================
-        # SL / TP2 / Timeout / Trailing Stop
-        # =========================
-        reason = None
-
-        if pos["pnl_pct"] < STOP_LOSS:
-            reason = "stop_loss"
-        elif pos["pnl_pct"] > TAKE_PROFIT:
-            reason = "take_profit"
-        elif time.time() - pos["entry_time"] > MAX_HOLD_SECONDS:
-            reason = "timeout"
-        elif pos.get("peak_pnl_pct", 0.0) >= TRAILING_ARM:
-            giveback = pos["peak_pnl_pct"] - pos["pnl_pct"]
-            if giveback >= TRAILING_GIVEBACK:
-                reason = "trailing_stop"
-
-        if reason:
-            closed = dict(pos)
-            closed["exit_price"] = r["price"]
-            closed["exit_time"] = r["timestamp"]
-            closed["exit_reason"] = reason
-            closed["realized_pnl"] = r["pnl"] - GAS_COST
-
-            STATE["closed_trades"].append(closed)
-            STATE["realized_pnl"] += closed["realized_pnl"]
-            STATE["daily_pnl"] += closed["realized_pnl"]
-            update_engine_stats_on_close(pos["engine"], closed["realized_pnl"])
-            mark_trade_time(pos["token"])
-            STATE["last_action"] = f"{reason}:{pos['token']}"
             continue
 
         new_positions.append(pos)
 
     STATE["positions"] = new_positions
-    refresh_open_positions()
 
-
-# ================= BOT LOOP =================
+# ================= LOOP =================
 
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v6_trailing"
-
             now = time.time()
+
             if now - STATE["last_reset"] > 86400:
+                STATE["daily_pnl"] = 0
                 STATE["daily_trades"] = 0
-                STATE["daily_pnl"] = 0.0
                 STATE["loss_streak"] = 0
                 STATE["last_reset"] = now
 
             if STATE["daily_pnl"] < DAILY_STOP:
                 STATE["last_action"] = "daily_stop"
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
                 continue
 
-            if STATE["loss_streak"] >= 3:
-                STATE["last_action"] = "cooldown_loss_streak"
-                await asyncio.sleep(10)
-                continue
+            STATE["regime"] = detect_regime()
+            update_allocator()
 
             STATE["signals"] += 1
-            STATE["last_action"] = "scan"
-
-            raw_tokens = await scan_tokens()
-
-            stable_tokens = []
-            degen_tokens = []
-
-            async with httpx.AsyncClient(timeout=4) as client:
-                for mint in raw_tokens:
-                    try:
-                        if not is_valid_mint(mint):
-                            continue
-
-                        r = await client.get(
-                            "https://lite-api.jup.ag/swap/v1/quote",
-                            params={
-                                "inputMint": "So11111111111111111111111111111111111111112",
-                                "outputMint": mint,
-                                "amount": 1000000,
-                                "slippageBps": 100,
-                            },
-                        )
-
-                        if r.status_code == 200:
-                            q = r.json()
-                            if int(q.get("outAmount", 0) or 0) > 0:
-                                stable_tokens.append(mint)
-                            else:
-                                degen_tokens.append(mint)
-                        else:
-                            degen_tokens.append(mint)
-
-                    except Exception:
-                        degen_tokens.append(mint)
-
-            STATE["candidates"] = stable_tokens + degen_tokens
-            STATE["candidate_count"] = len(STATE["candidates"])
 
             await monitor_positions()
 
-            stable_threshold = get_dynamic_alpha_threshold("stable")
-            degen_threshold = get_dynamic_alpha_threshold("degen")
+            tokens = [f"TOKEN{i}" for i in range(10)]
 
-            # ================= STABLE ENGINE =================
-            for mint in stable_tokens:
-                if STATE["daily_trades"] >= MAX_DAILY_TRADES:
-                    STATE["last_action"] = "daily_limit_hit"
-                    break
-
+            for mint in tokens:
                 if len(STATE["positions"]) >= MAX_POSITIONS:
-                    STATE["last_action"] = "position_limit"
                     break
 
-                if has_position(mint):
-                    STATE["last_action"] = f"already_have:{mint}"
+                engine = "degen" if random.random() < STATE["allocator"]["degen_weight"] else "stable"
+
+                alpha = random.uniform(5, 60)
+
+                if engine == "stable" and alpha < 10:
+                    continue
+                if engine == "degen" and alpha < 30:
                     continue
 
-                if in_trade_cooldown(mint):
-                    STATE["last_action"] = f"cooldown_skip:{mint}"
-                    continue
+                size = get_position_size(alpha, engine)
 
-                alpha = await real_alpha(mint)
-                STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
-
-                if alpha == -999:
-                    STATE["last_action"] = f"stable_skip_bad:{mint}"
-                    continue
-
-                if abs(alpha) > 120:
-                    STATE["last_action"] = f"alpha_outlier_skip:{mint}:{alpha}"
-                    continue
-
-                if alpha < stable_threshold:
-                    STATE["last_action"] = f"stable_alpha_skip:{mint}:{alpha}"
-                    continue
-
-                size = get_position_size(alpha, "stable")
                 buy = await simulate_buy(mint, size)
-                if not buy:
-                    continue
-
-                if buy["slippage"] > 0.01:
-                    STATE["last_action"] = f"slippage_skip:{mint}:{buy['slippage']:.4f}"
-                    continue
 
                 STATE["positions"].append({
                     "token": mint,
+                    "entry_price": buy["price"],
+                    "token_qty": buy["qty"],
                     "alpha": alpha,
-                    "size": buy["size"],
-                    "original_size": buy["size"],
-                    "entry_price": buy["fill_price"],
-                    "mark_price": buy["mark_price"],
-                    "last_price": buy["fill_price"],
-                    "token_qty": buy["token_qty"],
-                    "entry_time": time.time(),
-                    "entry_gas_cost": buy["gas_cost"],
-                    "pnl_pct": 0.0,
-                    "engine": "stable",
-                    "tp1_done": False,
-                    "peak_pnl_pct": 0.0,
+                    "engine": engine,
+                    "entry_time": time.time()
                 })
 
-                mark_trade_time(mint)
-                refresh_open_positions()
                 STATE["daily_trades"] += 1
-                STATE["last_action"] = f"stable_buy:{mint}"
-
-            # ================= DEGEN ENGINE =================
-            for mint in degen_tokens[:3]:
-                if STATE["daily_trades"] >= MAX_DAILY_TRADES:
-                    STATE["last_action"] = "daily_limit_hit"
-                    break
-
-                if len(STATE["positions"]) >= MAX_POSITIONS:
-                    STATE["last_action"] = "position_limit"
-                    break
-
-                if has_position(mint):
-                    STATE["last_action"] = f"already_have:{mint}"
-                    continue
-
-                if not is_valid_mint(mint):
-                    STATE["last_action"] = f"bad_mint:{mint}"
-                    continue
-
-                if in_trade_cooldown(mint):
-                    STATE["last_action"] = f"cooldown_skip:{mint}"
-                    continue
-
-                alpha = await real_alpha(mint)
-                STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
-
-                if alpha == -999:
-                    alpha = round(random.uniform(20, 60), 2)
-                    STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
-                    STATE["last_action"] = f"degen_fallback_alpha:{mint}:{alpha}"
-
-                if abs(alpha) > 120:
-                    STATE["last_action"] = f"alpha_outlier_skip:{mint}:{alpha}"
-                    continue
-
-                if alpha < degen_threshold:
-                    STATE["last_action"] = f"degen_alpha_skip:{mint}:{alpha}"
-                    continue
-
-                size = get_position_size(alpha, "degen")
-                buy = await simulate_buy(mint, size)
-                if not buy:
-                    continue
-
-                STATE["positions"].append({
-                    "token": mint,
-                    "alpha": alpha,
-                    "size": buy["size"],
-                    "original_size": buy["size"],
-                    "entry_price": buy["fill_price"],
-                    "mark_price": buy["mark_price"],
-                    "last_price": buy["fill_price"],
-                    "token_qty": buy["token_qty"],
-                    "entry_time": time.time(),
-                    "entry_gas_cost": buy["gas_cost"],
-                    "pnl_pct": 0.0,
-                    "engine": "degen",
-                    "tp1_done": False,
-                    "peak_pnl_pct": 0.0,
-                })
-
-                mark_trade_time(mint)
-                refresh_open_positions()
-                STATE["daily_trades"] += 1
-                STATE["last_action"] = f"degen_buy:{mint}"
+                STATE["last_action"] = f"{engine}_buy"
 
         except Exception as e:
             STATE["errors"] += 1
-            STATE["last_action"] = f"error:{str(e)}"
+            STATE["last_action"] = str(e)
 
         await asyncio.sleep(2)
 
-
-# ================= FASTAPI =================
+# ================= API =================
 
 bot_task = None
 
@@ -675,39 +228,14 @@ async def lifespan(app: FastAPI):
     global bot_task
     bot_task = asyncio.create_task(bot_loop())
     yield
-    if bot_task:
-        bot_task.cancel()
-
+    bot_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-async def root():
-    return {"ok": True, "status": "running"}
-
-@app.get("/health")
-async def health():
+def root():
     return {"ok": True}
 
 @app.get("/metrics")
-async def metrics():
-    return {
-        "positions": STATE["positions"],
-        "closed_trades": STATE["closed_trades"],
-        "signals": STATE["signals"],
-        "errors": STATE["errors"],
-        "last_action": STATE["last_action"],
-        "candidates": STATE["candidates"],
-        "candidate_count": STATE["candidate_count"],
-        "last_execution": STATE["last_execution"],
-        "last_alpha": STATE["last_alpha"],
-        "realized_pnl": STATE["realized_pnl"],
-        "daily_pnl": STATE["daily_pnl"],
-        "daily_trades": STATE["daily_trades"],
-        "scanner_mode": STATE["scanner_mode"],
-        "scanner_error": STATE["scanner_error"],
-        "engine_stats": STATE["engine_stats"],
-        "loss_streak": STATE["loss_streak"],
-        "allocator": get_allocator_state(),
-        "bot_version": STATE["bot_version"],
-    }
+def metrics():
+    return STATE
