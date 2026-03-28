@@ -1,4 +1,4 @@
-# ================= v90_FUND_SYSTEM_WITH_UI =================
+# ================= v90_FUND_SYSTEM_WITH_UI_FIXED =================
 
 import asyncio
 import random
@@ -41,8 +41,8 @@ MAX_POSITION_SIZE = 0.02
 MIN_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
-TAKE_PROFIT = 0.3
-TRAILING = 0.1
+TAKE_PROFIT = 0.30
+TRAILING = 0.10
 MAX_HOLD = 300
 
 BASE_SLIPPAGE = 180
@@ -59,6 +59,7 @@ keypair = Keypair.from_base58_string(PRIVATE_KEY)
 # ================= STATE =================
 
 SESSION = None
+bot_task = None
 
 STATE = {
     "positions": [],
@@ -71,10 +72,10 @@ STATE = {
         "launch": 0.25
     },
     "alpha_models": {
-        "wallet": {"score": 1, "history": []},
-        "flow": {"score": 1, "history": []},
-        "mempool": {"score": 1, "history": []},
-        "launch": {"score": 1, "history": []}
+        "wallet": {"score": 1.0, "history": []},
+        "flow": {"score": 1.0, "history": []},
+        "mempool": {"score": 1.0, "history": []},
+        "launch": {"score": 1.0, "history": []}
     },
     "daily_pnl": 0.0,
     "loss_streak": 0,
@@ -92,15 +93,23 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 async def safe_get(url: str):
     try:
         async with SESSION.get(url, timeout=8, headers=HEADERS) as r:
-            return await r.json() if r.status == 200 else None
-    except Exception:
+            if r.status != 200:
+                STATE["last_error"] = f"GET status {r.status}"
+                return None
+            return await r.json()
+    except Exception as e:
+        STATE["last_error"] = f"GET error: {e}"
         return None
 
 async def safe_post(url: str, data: dict):
     try:
         async with SESSION.post(url, json=data, timeout=8, headers=HEADERS) as r:
-            return await r.json() if r.status == 200 else None
-    except Exception:
+            if r.status != 200:
+                STATE["last_error"] = f"POST status {r.status}"
+                return None
+            return await r.json()
+    except Exception as e:
+        STATE["last_error"] = f"POST error: {e}"
         return None
 
 # ================= SIGNAL =================
@@ -119,6 +128,14 @@ def wallet_alpha() -> float:
 
 # ================= ALPHA MODEL =================
 
+def update_allocator() -> None:
+    scores = {
+        k: max(0.01, v["score"])
+        for k, v in STATE["alpha_models"].items()
+    }
+    total = sum(scores.values()) or 1.0
+    STATE["allocator"] = {k: v / total for k, v in scores.items()}
+
 def update_alpha_model(pnl: float, sources: list[str]) -> None:
     for s in sources:
         m = STATE["alpha_models"][s]
@@ -129,8 +146,9 @@ def update_alpha_model(pnl: float, sources: list[str]) -> None:
         h = m["history"]
         win = sum(1 for x in h if x > 0) / len(h)
         avg = sum(h) / len(h)
-
         m["score"] = max(0.1, win * avg * 10)
+
+    update_allocator()
 
 # ================= ALPHA =================
 
@@ -153,7 +171,7 @@ async def compute_alpha() -> tuple[float, list[str]]:
     STATE["alpha_scores"].append(alpha)
 
     if len(STATE["alpha_scores"]) > 300:
-        STATE["alpha_scores"].pop(0)
+        STATE["alpha_scores"] = STATE["alpha_scores"][-300:]
 
     return alpha, sources
 
@@ -210,7 +228,9 @@ async def send_bundle(raw: str):
 
 async def execute_trade(size: float, alpha: float):
     for _ in range(4):
-        q = await get_quote(size, BASE_SLIPPAGE)
+        slippage = BASE_SLIPPAGE + min(int(alpha), 200)
+
+        q = await get_quote(size, slippage)
         if not q:
             continue
 
@@ -256,12 +276,15 @@ async def monitor_positions():
         p["mark_price"] = price
         p["pnl"] = pnl
         p["pnl_pct"] = pnl_pct
+        p["peak_pnl_pct"] = max(p.get("peak_pnl_pct", 0.0), pnl_pct)
 
         close = False
 
         if pnl_pct < STOP_LOSS:
             close = True
         if pnl_pct > TAKE_PROFIT:
+            close = True
+        if p["peak_pnl_pct"] - pnl_pct > TRAILING:
             close = True
         if time.time() - p["time"] > MAX_HOLD:
             close = True
@@ -275,9 +298,17 @@ async def monitor_positions():
                 STATE["loss_streak"] += 1
 
             STATE["daily_pnl"] += pnl
-            p["exit_price"] = price
-            p["closed_at"] = time.time()
-            STATE["closed"].append(p)
+
+            closed_pos = {
+                **p,
+                "exit_price": price,
+                "closed_at": time.time(),
+            }
+            STATE["closed"].append(closed_pos)
+
+            if len(STATE["closed"]) > 500:
+                STATE["closed"] = STATE["closed"][-500:]
+
             continue
 
         new_positions.append(p)
@@ -317,6 +348,7 @@ async def bot_loop():
                     continue
 
                 STATE["positions"].append({
+                    "id": f"pos_{int(time.time()*1000)}_{random.randint(1000,9999)}",
                     "entry": price,
                     "qty": qty,
                     "sources": sources,
@@ -325,6 +357,7 @@ async def bot_loop():
                     "mark_price": price,
                     "pnl": 0.0,
                     "pnl_pct": 0.0,
+                    "peak_pnl_pct": 0.0,
                 })
 
                 STATE["daily_trades"] += 1
@@ -335,8 +368,6 @@ async def bot_loop():
         await asyncio.sleep(1)
 
 # ================= API =================
-
-bot_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -363,12 +394,14 @@ def brain():
         "alpha_models": STATE["alpha_models"],
         "pnl": STATE["daily_pnl"],
         "allocator": STATE["allocator"],
+        "alpha_count": len(STATE["alpha_scores"]),
     }
 
 @app.get("/status")
 def status():
     return {
         "ok": True,
+        "alive": True,
         "daily_pnl": STATE["daily_pnl"],
         "daily_trades": STATE["daily_trades"],
         "loss_streak": STATE["loss_streak"],
@@ -412,7 +445,6 @@ def dashboard():
       --green: #17b26a;
       --red: #f04438;
       --blue: #2e90fa;
-      --yellow: #f79009;
     }
     * { box-sizing: border-box; }
     body {
@@ -536,15 +568,13 @@ def dashboard():
       background: linear-gradient(90deg, var(--blue), #7c3aed);
       width: 0%;
     }
-    .muted {
-      color: var(--muted);
-    }
-    .ok { color: var(--green); }
-    .bad { color: var(--red); }
     .mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .muted {
+      color: var(--muted);
     }
     .footer {
       margin-top: 20px;
@@ -616,6 +646,7 @@ def dashboard():
           <table>
             <thead>
               <tr>
+                <th>ID</th>
                 <th>Entry</th>
                 <th>Qty</th>
                 <th>Alpha</th>
@@ -635,6 +666,7 @@ def dashboard():
           <table>
             <thead>
               <tr>
+                <th>ID</th>
                 <th>Entry</th>
                 <th>Exit</th>
                 <th>Qty</th>
@@ -660,9 +692,7 @@ def dashboard():
       </div>
     </div>
 
-    <div class="footer">
-      Auto refresh every 3 seconds
-    </div>
+    <div class="footer">Auto refresh every 3 seconds</div>
   </div>
 
   <script>
@@ -728,6 +758,7 @@ def dashboard():
       (rows || []).forEach((r) => {
         const tr = document.createElement("tr");
         tr.innerHTML =
+          td(r.id) +
           td(fmt(r.entry)) +
           td(fmt(r.qty)) +
           td(fmt(r.alpha)) +
@@ -745,6 +776,7 @@ def dashboard():
       (rows || []).slice(-20).reverse().forEach((r) => {
         const tr = document.createElement("tr");
         tr.innerHTML =
+          td(r.id) +
           td(fmt(r.entry)) +
           td(fmt(r.exit_price)) +
           td(fmt(r.qty)) +
@@ -812,4 +844,4 @@ def dashboard():
   </script>
 </body>
 </html>
-    """
+    ""
