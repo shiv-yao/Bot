@@ -90,12 +90,13 @@ async def scan_tokens():
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
-                "https://api.dexscreener.com/latest/dex/pairs/solana"
+                "https://api.dexscreener.com/latest/dex/search",
+                params={"q": "solana"}
             )
 
             if r.status_code == 200:
                 data = r.json()
-                pairs = data.get("pairs", []) or []
+                pairs = data.get("pairs", [])
                 STATE["dex_pairs"] = len(pairs)
 
                 for p in pairs[:50]:
@@ -104,15 +105,16 @@ async def scan_tokens():
 
                     try:
                         liquidity = float(liquidity)
-                    except Exception:
+                    except:
                         liquidity = 0
 
                     if mint and liquidity > 20000:
                         tokens.append(mint)
 
                 STATE["scanner_mode"] = "dexscreener"
+
             else:
-                STATE["scanner_error"] = f"dexscreener_status_{r.status_code}"
+                STATE["scanner_error"] = f"dex_status_{r.status_code}"
 
     except Exception as e:
         STATE["scanner_error"] = str(e)
@@ -124,15 +126,7 @@ async def scan_tokens():
         ]
         STATE["scanner_mode"] = "fallback"
 
-    # 去重
-    clean = []
-    seen = set()
-    for mint in tokens:
-        if mint not in seen:
-            seen.add(mint)
-            clean.append(mint)
-
-    return clean[:20]
+    return tokens[:20]
 
 
 def fake_price_walk(entry_price: float) -> float:
