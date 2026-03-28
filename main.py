@@ -20,7 +20,7 @@ USE_REAL_EXECUTION = True
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 
-PRIVATE_KEY = [AWCNMXgwtjuLTRtrThfTVgHv8BT6c5xp5PdYBW4JeotZzfTET43dWARWGiu4NpYxLHbH2EvLP5QsLYMAXW1wKR4] # 🔥 放你的 private key array
+PRIVATE_KEY = [] # 🔥 放你的 private key array
 
 SLIPPAGE_BPS = 200
 
