@@ -427,7 +427,7 @@ async def bot_loop():
                     STATE["last_action"] = f"alpha_outlier_skip:{mint}:{alpha}"
                     continue
 
-                if alpha < 15:
+                if alpha < 10:
                     STATE["last_action"] = f"stable_alpha_skip:{mint}:{alpha}"
                     continue
 
@@ -488,7 +488,7 @@ async def bot_loop():
                     STATE["last_action"] = f"alpha_outlier_skip:{mint}:{alpha}"
                     continue
 
-                if alpha < 25:
+                if alpha < 35:
                     STATE["last_action"] = f"degen_alpha_skip:{mint}:{alpha}"
                     continue
 
