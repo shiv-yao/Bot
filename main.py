@@ -16,10 +16,17 @@ STATE = {
 MAX_POSITIONS = 3
 
 
+def has_position(mint: str) -> bool:
+    return any(p.get("token") == mint for p in STATE["positions"])
+
+
+def fake_alpha(mint: str) -> float:
+    return random.uniform(80, 180)
+
+
 async def scan_tokens():
     tokens = []
 
-    # ===== Pump.fun =====
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get("https://frontend-api.pump.fun/coins")
@@ -29,10 +36,9 @@ async def scan_tokens():
                     mint = item.get("mint")
                     if mint:
                         tokens.append(mint)
-    except:
+    except Exception:
         pass
 
-    # ===== fallback（假的先保底）=====
     if not tokens:
         tokens = ["TEST_A", "TEST_B"]
 
@@ -60,7 +66,6 @@ async def bot_loop():
                 if alpha < 120:
                     continue
 
-                # 模擬買入
                 STATE["positions"].append({
                     "token": mint,
                     "alpha": round(alpha, 2),
@@ -69,8 +74,9 @@ async def bot_loop():
                 })
                 STATE["last_action"] = f"paper_buy:{mint}"
 
-        except Exception:
+        except Exception as e:
             STATE["errors"] += 1
+            STATE["last_action"] = f"error:{str(e)}"
 
         await asyncio.sleep(2)
 
