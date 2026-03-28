@@ -5,11 +5,13 @@
 
 # ================= RPC =================
 
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
 RPCS = [
     HELIUS_RPC,
     "https://api.mainnet-beta.solana.com"
 ]
-
 async def rpc_post(payload):
     for rpc in RPCS:
         res = await safe_post(rpc, payload)
