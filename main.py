@@ -1,4 +1,4 @@
-# ================= v500_REAL_FULL =================
+# ================= v500_REAL_FULL_INTEGRATED =================
 
 import asyncio, time, aiohttp, base64, os, random
 from contextlib import asynccontextmanager
@@ -38,7 +38,6 @@ SESSION = None
 STATE = {
     "positions": [],
     "closed": [],
-    "alpha_scores": [],
 
     "alpha_weight": {
         "wallet": 1,
@@ -56,6 +55,7 @@ STATE = {
 
     "sniper": False,
     "last_pump": 0,
+    "current_token": INPUT,
 
     "daily_pnl": 0,
     "loss_streak": 0,
@@ -78,10 +78,20 @@ async def post(url, data):
     except:
         return None
 
+# ================= TOKEN PARSER =================
+
+def extract_token(logs):
+    for l in logs:
+        parts = l.split(" ")
+        for p in parts:
+            if len(p) > 30:
+                return p
+    return None
+
 # ================= PRICE =================
 
-async def get_price():
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount=10000000")
+async def get_price(token):
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount=10000000")
     if not r or not r.get("data"):
         return None
     route = r["data"][0]
@@ -117,8 +127,12 @@ async def pump_ws():
                     logs = data["params"]["result"]["value"]["logs"]
 
                     if any("initialize" in l for l in logs):
-                        STATE["sniper"] = True
-                        STATE["last_pump"] = time.time()
+                        token = extract_token(logs)
+
+                        if token:
+                            STATE["current_token"] = token
+                            STATE["sniper"] = True
+                            STATE["last_pump"] = time.time()
 
 # ================= ALPHA =================
 
@@ -164,9 +178,9 @@ def update_alpha(sources, pnl):
 
 # ================= FILTER =================
 
-async def check_liquidity():
+async def check_liquidity(token):
 
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount=10000000")
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount=10000000")
 
     if not r or not r.get("data"):
         return False
@@ -217,11 +231,11 @@ async def confirm_tx(sig):
 
     return False
 
-# ================= EXEC =================
+# ================= BUY =================
 
-async def exec_trade(sz):
+async def buy(sz, token):
 
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount={int(sz*1e9)}")
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount={int(sz*1e9)}")
     if not r:
         return None, None
 
@@ -257,11 +271,46 @@ async def exec_trade(sz):
 
     return price, qty
 
+# ================= SELL =================
+
+async def sell(qty, token):
+
+    r = await get(f"{JUP}/v6/quote?inputMint={token}&outputMint={INPUT}&amount={int(qty*1e9)}")
+    if not r:
+        return False
+
+    route = r["data"][0]
+
+    swap = await post(JUP + "/v6/swap", {
+        "quoteResponse": route,
+        "userPublicKey": str(keypair.pubkey())
+    })
+
+    tx = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
+    tx.sign([keypair])
+
+    raw = base64.b64encode(bytes(tx)).decode()
+
+    res = await post(RPC, {
+        "jsonrpc": "2.0",
+        "method": "sendTransaction",
+        "params": [raw]
+    })
+
+    if not res or "result" not in res:
+        return False
+
+    sig = res["result"]
+
+    return await confirm_tx(sig)
+
 # ================= MONITOR =================
 
 async def monitor():
 
-    price = await get_price()
+    token = STATE["current_token"]
+    price = await get_price(token)
+
     if not price:
         return
 
@@ -273,6 +322,12 @@ async def monitor():
         pct = pnl / (p["entry"] * p["qty"])
 
         if pct < STOP_LOSS or pct > TAKE_PROFIT:
+
+            ok = await sell(p["qty"], token)
+
+            if not ok:
+                new.append(p)
+                continue
 
             update_alpha(p["sources"], pnl)
 
@@ -297,8 +352,9 @@ async def bot():
 
         try:
 
-            if STATE["sniper"] and time.time() - STATE["last_pump"] > 3:
+            if STATE["sniper"] and time.time() - STATE["last_pump"] > 5:
                 STATE["sniper"] = False
+                STATE["current_token"] = INPUT
 
             await monitor()
 
@@ -316,16 +372,18 @@ async def bot():
                 if alpha["total"] < 80:
                     continue
 
+                token = STATE["current_token"]
+
                 if not rug_filter():
                     continue
 
-                ok = await check_liquidity()
+                ok = await check_liquidity(token)
                 if not ok:
                     continue
 
                 sz = size(alpha)
 
-                price, qty = await exec_trade(sz)
+                price, qty = await buy(sz, token)
 
                 if not price:
                     continue
@@ -334,6 +392,7 @@ async def bot():
                     "entry": price,
                     "qty": qty,
                     "sources": [k for k in alpha if k != "total"],
+                    "token": token,
                     "time": time.time()
                 })
 
@@ -360,5 +419,6 @@ def root():
     return {
         "status": "running",
         "pnl": STATE["daily_pnl"],
-        "positions": len(STATE["positions"])
+        "positions": len(STATE["positions"]),
+        "token": STATE["current_token"]
     }
