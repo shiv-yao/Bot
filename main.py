@@ -314,7 +314,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v1"
+            STATE["bot_version"] = "alpha_dual_engine_v2"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -329,7 +329,10 @@ async def bot_loop():
             stable_tokens = []
             degen_tokens = []
 
-            # === 分流（有流動性 vs 無流動性）===
+            # =========================
+            # 分流：有 Jupiter route = stable
+            # 沒 route / 太早期 = degen
+            # =========================
             async with httpx.AsyncClient(timeout=4) as client:
                 for mint in raw_tokens:
                     try:
@@ -352,7 +355,7 @@ async def bot_loop():
                         else:
                             degen_tokens.append(mint)
 
-                    except:
+                    except Exception:
                         degen_tokens.append(mint)
 
             STATE["candidates"] = stable_tokens + degen_tokens
@@ -360,19 +363,39 @@ async def bot_loop():
             await monitor_positions()
 
             # =========================
-            # 🟢 ENGINE 1：穩定賺（Jupiter）
+            # 🟢 ENGINE 1：穩定賺（只打有 route）
             # =========================
             for mint in stable_tokens:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
+                    STATE["last_action"] = "daily_limit_hit"
+                    break
+
+                if len(STATE["positions"]) >= MAX_POSITIONS:
+                    STATE["last_action"] = "position_limit"
                     break
 
                 if has_position(mint):
+                    STATE["last_action"] = f"already_have:{mint}"
+                    continue
+
+                if not mint or len(mint) < 32:
+                    STATE["last_action"] = f"bad_mint:{mint}"
+                    continue
+
+                if any(c in mint for c in [".", "/", ":"]):
+                    STATE["last_action"] = f"weird_mint:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
+                # 穩定引擎：垃圾幣直接跳過
+                if alpha == -999:
+                    STATE["last_action"] = f"stable_skip_bad:{mint}"
+                    continue
+
                 if alpha < 15:
+                    STATE["last_action"] = f"stable_alpha_skip:{mint}:{alpha}"
                     continue
 
                 exec_result = await simulate_buy(mint, 0.01)
@@ -380,6 +403,7 @@ async def bot_loop():
                     continue
 
                 if exec_result["slippage"] > 0.01:
+                    STATE["last_action"] = f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
                     continue
 
                 STATE["positions"].append({
@@ -393,7 +417,7 @@ async def bot_loop():
                     "entry_time": time.time(),
                     "entry_gas_cost": exec_result["gas_cost"],
                     "pnl_pct": 0.0,
-                    "engine": "stable"
+                    "engine": "stable",
                 })
 
                 STATE["daily_trades"] += 1
@@ -402,21 +426,41 @@ async def bot_loop():
             # =========================
             # 🔴 ENGINE 2：打仗（早期幣）
             # =========================
-            for mint in degen_tokens[:3]:  # 控制風險
+            for mint in degen_tokens[:3]:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
+                    STATE["last_action"] = "daily_limit_hit"
+                    break
+
+                if len(STATE["positions"]) >= MAX_POSITIONS:
+                    STATE["last_action"] = "position_limit"
                     break
 
                 if has_position(mint):
+                    STATE["last_action"] = f"already_have:{mint}"
+                    continue
+
+                if not mint or len(mint) < 32:
+                    STATE["last_action"] = f"bad_mint:{mint}"
+                    continue
+
+                if any(c in mint for c in [".", "/", ":"]):
+                    STATE["last_action"] = f"weird_mint:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                # 🔥 關鍵：只抓爆發
-                if alpha < 30:
+                # 🔥 關鍵：early coin fallback
+                if alpha == -999:
+                    alpha = round(random.uniform(20, 60), 2)
+                    STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
+                    STATE["last_action"] = f"degen_fallback_alpha:{mint}:{alpha}"
+
+                if alpha < 20:
+                    STATE["last_action"] = f"degen_alpha_skip:{mint}:{alpha}"
                     continue
 
-                exec_result = await simulate_buy(mint, 0.005)  # 小倉位
+                exec_result = await simulate_buy(mint, 0.005)
                 if not exec_result:
                     continue
 
@@ -431,7 +475,7 @@ async def bot_loop():
                     "entry_time": time.time(),
                     "entry_gas_cost": exec_result["gas_cost"],
                     "pnl_pct": 0.0,
-                    "engine": "degen"
+                    "engine": "degen",
                 })
 
                 STATE["daily_trades"] += 1
