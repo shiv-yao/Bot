@@ -1,4 +1,4 @@
-# v31.2_real_signing_stable
+# v31.3_real_signing_stable
 
 import asyncio
 import random
@@ -19,8 +19,6 @@ USE_REAL_EXECUTION = True
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")  # 🔥 從 ENV 讀
-
 SLIPPAGE_BPS = 200
 
 MAX_POSITIONS = 5
@@ -28,9 +26,19 @@ MAX_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
 
-# ================= WALLET =================
+# ================= PRIVATE KEY LOAD（🔥已修）=================
 
-keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+
+try:
+    if PRIVATE_KEY.startswith("["):
+        private_key_bytes = bytes(eval(PRIVATE_KEY))
+    else:
+        private_key_bytes = bytes(int(x) for x in PRIVATE_KEY.split(",") if x.strip())
+
+    keypair = Keypair.from_bytes(private_key_bytes)
+except Exception as e:
+    raise RuntimeError(f"PRIVATE_KEY format error: {e}")
 
 # ================= GLOBAL SESSION =================
 
@@ -44,7 +52,7 @@ STATE = {
     "realized_pnl": 0.0,
     "errors": 0,
     "last_error": None,
-    "bot_version": "v31.2_real_signing_stable"
+    "bot_version": "v31.3_real_signing_stable"
 }
 
 # ================= ALPHA =================
