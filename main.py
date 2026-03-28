@@ -1,6 +1,5 @@
 import asyncio
 import random
-import httpx
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -13,8 +12,6 @@ STATE = {
     "signals": 0,
     "errors": 0,
     "last_action": None,
-    "candidates": [],
-    "last_execution": None,
 
     "realized_pnl": 0.0,
     "daily_pnl": 0.0,
@@ -24,29 +21,36 @@ STATE = {
     "loss_streak": 0,
     "regime": "chop",
 
+    # ===== alpha memory =====
+    "alpha_memory": {
+        "stable": [],
+        "degen": [],
+        "sniper": []
+    },
+
     "engine_stats": {
-        "stable": {"pnl": 0.0, "trades": 0, "wins": 0, "winrate": 0.0},
-        "degen": {"pnl": 0.0, "trades": 0, "wins": 0, "winrate": 0.0},
+        "stable": {"pnl": 0, "trades": 0, "wins": 0},
+        "degen": {"pnl": 0, "trades": 0, "wins": 0},
+        "sniper": {"pnl": 0, "trades": 0, "wins": 0},
     },
 
     "allocator": {
-        "stable_weight": 0.5,
-        "degen_weight": 0.5,
+        "stable": 0.4,
+        "degen": 0.4,
+        "sniper": 0.2,
     },
 
-    "bot_version": "v8_fund_brain"
+    "bot_version": "v10_god_brain"
 }
 
 # ================= CONFIG =================
 
-STOP_LOSS = -0.06
-DAILY_STOP = -0.05
+STOP_LOSS = -0.07
+DAILY_STOP = -0.06
 
-MAX_POSITIONS = 5
-MAX_DAILY_TRADES = 30
-MAX_HOLD_SECONDS = 180
-
-GAS_COST = 0.000005
+MAX_POSITIONS = 6
+MAX_DAILY_TRADES = 40
+MAX_HOLD_SECONDS = 240
 
 # ================= 🧠 REGIME =================
 
@@ -54,67 +58,106 @@ def detect_regime():
     pnl = STATE["daily_pnl"]
     loss = STATE["loss_streak"]
 
-    if pnl > 0.01:
+    if pnl > 0.02:
         return "bull"
-    if loss >= 3:
+    if loss >= 4:
         return "bear"
     return "chop"
+
+# ================= 🧠 ALPHA MEMORY =================
+
+def update_alpha_memory(engine, alpha, pnl):
+    mem = STATE["alpha_memory"][engine]
+    mem.append((alpha, pnl))
+
+    if len(mem) > 50:
+        mem.pop(0)
+
+def get_alpha_edge(engine, alpha):
+    mem = STATE["alpha_memory"][engine]
+
+    if not mem:
+        return 1.0
+
+    similar = [p for a, p in mem if abs(a - alpha) < 10]
+
+    if not similar:
+        return 1.0
+
+    avg = sum(similar) / len(similar)
+
+    return max(0.5, min(1.5, 1 + avg * 5))
 
 # ================= 🧠 ALLOCATOR =================
 
 def update_allocator():
-    stable = STATE["engine_stats"]["stable"]
-    degen = STATE["engine_stats"]["degen"]
+    stats = STATE["engine_stats"]
 
-    total = abs(stable["pnl"]) + abs(degen["pnl"]) + 1e-6
+    weights = {}
 
-    stable_weight = abs(stable["pnl"]) / total
-    degen_weight = abs(degen["pnl"]) / total
+    for e in ["stable", "degen", "sniper"]:
+        s = stats[e]
+        if s["trades"] == 0:
+            weights[e] = 1
+        else:
+            winrate = s["wins"] / s["trades"]
+            weights[e] = (s["pnl"] + 0.001) * winrate
 
+    total = sum(abs(w) for w in weights.values()) + 1e-6
+
+    for e in weights:
+        weights[e] = abs(weights[e]) / total
+
+    # ===== regime bias =====
     if STATE["regime"] == "bull":
-        degen_weight += 0.2
+        weights["degen"] += 0.2
+        weights["sniper"] += 0.1
     elif STATE["regime"] == "bear":
-        stable_weight += 0.3
+        weights["stable"] += 0.3
 
-    total = stable_weight + degen_weight
-    STATE["allocator"]["stable_weight"] = stable_weight / total
-    STATE["allocator"]["degen_weight"] = degen_weight / total
+    total = sum(weights.values())
+    for e in weights:
+        weights[e] /= total
+
+    STATE["allocator"] = weights
 
 # ================= SIZE =================
 
-def get_position_size(alpha, engine):
-    base = 0.003 if engine == "stable" else 0.002
+def get_size(alpha, engine):
+    base = {
+        "stable": 0.003,
+        "degen": 0.002,
+        "sniper": 0.0015
+    }[engine]
 
-    weight = STATE["allocator"][f"{engine}_weight"]
+    weight = STATE["allocator"][engine]
 
-    size = base * weight * (1 + alpha / 50)
+    edge = get_alpha_edge(engine, alpha)
+
+    size = base * weight * (1 + alpha / 50) * edge
 
     if STATE["loss_streak"] >= 2:
         size *= 0.5
 
     return round(size, 4)
 
-# ================= EXECUTION =================
+# ================= EXEC =================
 
-async def simulate_buy(mint, size):
+async def simulate_buy(size):
     price = random.uniform(0.00001, 0.00002)
-
-    return {
-        "price": price,
-        "qty": size / price
-    }
+    return price, size / price
 
 async def simulate_sell(pos):
-    price = pos["entry_price"] * random.uniform(0.7, 1.5)
+    price = pos["entry_price"] * random.uniform(0.6, 1.6)
 
-    pnl = (price - pos["entry_price"]) * pos["token_qty"]
-    pnl_pct = pnl / (pos["entry_price"] * pos["token_qty"])
+    pnl = (price - pos["entry_price"]) * pos["qty"]
+    pnl_pct = pnl / (pos["entry_price"] * pos["qty"])
 
     return price, pnl, pnl_pct
 
 # ================= MONITOR =================
 
-async def monitor_positions():
+async def monitor():
     new_positions = []
 
     for pos in STATE["positions"]:
@@ -124,27 +167,36 @@ async def monitor_positions():
         pos["peak"] = max(pos.get("peak", 0), pnl_pct)
 
         # ===== TP1 =====
-        if not pos.get("tp1") and pnl_pct > 0.08:
+        if not pos.get("tp1") and pnl_pct > 0.1:
             pos["tp1"] = True
-            pos["size"] *= 0.5
-            pos["token_qty"] *= 0.5
+            pos["qty"] *= 0.5
 
         # ===== trailing =====
         giveback = 0.06
-        if pos["peak"] > 0.2:
+        if pos["peak"] > 0.3:
             giveback = 0.1
-        if pos["peak"] > 0.5:
+        if pos["peak"] > 0.6:
             giveback = 0.2
 
-        if pnl_pct < STOP_LOSS or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback):
+        timeout = time.time() - pos["entry_time"] > MAX_HOLD_SECONDS
+
+        if (
+            pnl_pct < STOP_LOSS
+            or (pos["peak"] > 0.08 and pos["peak"] - pnl_pct > giveback)
+            or timeout
+        ):
+            engine = pos["engine"]
+
             STATE["closed_trades"].append(pos)
             STATE["realized_pnl"] += pnl
             STATE["daily_pnl"] += pnl
 
-            engine = pos["engine"]
+            update_alpha_memory(engine, pos["alpha"], pnl)
+
             st = STATE["engine_stats"][engine]
             st["trades"] += 1
             st["pnl"] += pnl
+
             if pnl > 0:
                 st["wins"] += 1
                 STATE["loss_streak"] = 0
@@ -180,31 +232,41 @@ async def bot_loop():
 
             STATE["signals"] += 1
 
-            await monitor_positions()
+            await monitor()
 
-            tokens = [f"TOKEN{i}" for i in range(10)]
+            tokens = [f"TOKEN{i}" for i in range(20)]
 
             for mint in tokens:
                 if len(STATE["positions"]) >= MAX_POSITIONS:
                     break
 
-                engine = "degen" if random.random() < STATE["allocator"]["degen_weight"] else "stable"
+                engine = random.choices(
+                    ["stable", "degen", "sniper"],
+                    weights=[
+                        STATE["allocator"]["stable"],
+                        STATE["allocator"]["degen"],
+                        STATE["allocator"]["sniper"],
+                    ],
+                )[0]
 
-                alpha = random.uniform(5, 60)
+                alpha = random.uniform(5, 80)
 
+                # ===== filters =====
                 if engine == "stable" and alpha < 10:
                     continue
                 if engine == "degen" and alpha < 30:
                     continue
+                if engine == "sniper" and alpha < 50:
+                    continue
 
-                size = get_position_size(alpha, engine)
+                size = get_size(alpha, engine)
 
-                buy = await simulate_buy(mint, size)
+                price, qty = await simulate_buy(size)
 
                 STATE["positions"].append({
                     "token": mint,
-                    "entry_price": buy["price"],
-                    "token_qty": buy["qty"],
+                    "entry_price": price,
+                    "qty": qty,
                     "alpha": alpha,
                     "engine": engine,
                     "entry_time": time.time()
