@@ -1,4 +1,4 @@
-# v29.2_production_final
+# v29.3_profit_optimized
 
 import asyncio
 import random
@@ -37,7 +37,7 @@ STATE = {
     "last_error": None,
     "errors": 0,
 
-    "bot_version": "v29.2_production_final"
+    "bot_version": "v29.3_profit_optimized"
 }
 
 # ================= SAFE =================
@@ -57,6 +57,9 @@ def get_real_alpha():
 
 def alpha_quality(alpha):
     return max(0, alpha)*(1-abs(alpha)/100)
+
+def alpha_filter(alpha):
+    return 15 < alpha < 80   # 🔥 關鍵優化
 
 # ================= RISK =================
 
@@ -83,18 +86,16 @@ async def simulate_sell(pos):
 
 # ================= PARTIAL CLOSE =================
 
-def record_partial_close(pos, sell_qty, price, tag):
-    entry_price = pos["entry_price"]
-
-    pnl = sell_qty * (price - entry_price)
-    pnl_pct = safe_div(pnl, sell_qty * entry_price)
+def record_close(pos, qty, price, tag):
+    pnl = qty * (price - pos["entry_price"])
+    pnl_pct = safe_div(pnl, qty * pos["entry_price"])
 
     STATE["closed_trades"].append({
         "token": pos["token"],
-        "engine": pos.get("engine"),
+        "engine": pos["engine"],
         "alpha": pos["alpha"],
-        "qty": sell_qty,
-        "entry_price": entry_price,
+        "qty": qty,
+        "entry_price": pos["entry_price"],
         "exit_price": price,
         "pnl": pnl,
         "pnl_pct": pnl_pct,
@@ -123,16 +124,14 @@ async def monitor():
             # ===== TP1 =====
             if not pos["tp1"] and pnl_pct > 0.12:
                 sell_qty = pos["qty"] * 0.5
-                record_partial_close(pos, sell_qty, price, "TP1")
-
+                record_close(pos, sell_qty, price, "TP1")
                 pos["qty"] -= sell_qty
                 pos["tp1"] = True
 
             # ===== TP2 =====
             if not pos["tp2"] and pnl_pct > 0.25:
                 sell_qty = pos["qty"] * 0.5
-                record_partial_close(pos, sell_qty, price, "TP2")
-
+                record_close(pos, sell_qty, price, "TP2")
                 pos["qty"] -= sell_qty
                 pos["tp2"] = True
 
@@ -144,8 +143,8 @@ async def monitor():
             if pos["peak"] > 0.4:
                 giveback = 0.03
 
-            # ===== break-even =====
-            break_even = pos["peak"] > 0.08 and pnl_pct < 0
+            # 🔥 提前 break-even
+            break_even = pos["peak"] > 0.05 and pnl_pct < 0
 
             should_close = (
                 pnl_pct < STOP_LOSS
@@ -155,7 +154,7 @@ async def monitor():
             )
 
             if should_close:
-                record_partial_close(pos, pos["qty"], price, "FINAL_EXIT")
+                record_close(pos, pos["qty"], price, "FINAL_EXIT")
 
                 if pnl > 0:
                     STATE["loss_streak"] = 0
@@ -176,7 +175,10 @@ async def monitor():
 
 async def execute_trade(alpha):
     price = random.uniform(0.00001,0.00002)
+
     size = min(max(0.001*(1+alpha/50),0.0005), MAX_POSITION_SIZE)
+    size *= 0.8  # 🔥 降風險
+
     qty = safe_div(size, price)
 
     return price, qty
@@ -208,9 +210,12 @@ async def bot_loop():
 
             for _ in range(30):
                 alpha = get_real_alpha()
-                if alpha < MIN_ALPHA_TO_TRADE:
+
+                if not alpha_filter(alpha):
                     continue
-                signals.append((alpha, alpha_quality(alpha)))
+
+                score = alpha_quality(alpha)
+                signals.append((alpha, score))
 
             signals = sorted(signals, key=lambda x:x[1], reverse=True)[:8]
 
@@ -226,6 +231,7 @@ async def bot_loop():
                     "qty": qty,
                     "original_qty": qty,
                     "alpha": alpha,
+                    "engine": "core",
                     "entry_time": time.time(),
                     "peak": 0,
                     "tp1": False,
