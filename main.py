@@ -314,7 +314,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha15_fallback10_v1"
+            STATE["bot_version"] = "alpha_dual_engine_v1"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -324,39 +324,15 @@ async def bot_loop():
             STATE["signals"] += 1
             STATE["last_action"] = "scan"
 
-            tokens = await scan_tokens()
-            STATE["candidates"] = tokens
+            raw_tokens = await scan_tokens()
 
-            await monitor_positions()
+            stable_tokens = []
+            degen_tokens = []
 
-            for mint in tokens:
-                if STATE["daily_trades"] >= MAX_DAILY_TRADES:
-                    STATE["last_action"] = "daily_limit_hit"
-                    break
-
-                if STATE["daily_trades"] >= 5:
-                    STATE["last_action"] = "soft_daily_limit_hit"
-                    break
-
-                if len(STATE["positions"]) >= MAX_POSITIONS:
-                    STATE["last_action"] = "position_limit"
-                    break
-
-                if has_position(mint):
-                    STATE["last_action"] = f"already_have:{mint}"
-                    continue
-
-                if not mint or len(mint) < 32:
-                    STATE["last_action"] = f"bad_mint:{mint}"
-                    continue
-
-                if any(c in mint for c in [".", "/", ":"]):
-                    STATE["last_action"] = f"weird_mint:{mint}"
-                    continue
-
-                # 先做 route / liquidity check
-                try:
-                    async with httpx.AsyncClient(timeout=4) as client:
+            # === 分流（有流動性 vs 無流動性）===
+            async with httpx.AsyncClient(timeout=4) as client:
+                for mint in raw_tokens:
+                    try:
                         r = await client.get(
                             "https://lite-api.jup.ag/swap/v1/quote",
                             params={
@@ -367,36 +343,43 @@ async def bot_loop():
                             },
                         )
 
-                        if r.status_code != 200:
-                            STATE["last_action"] = f"no_route:{mint}"
-                            continue
+                        if r.status_code == 200:
+                            q = r.json()
+                            if int(q.get("outAmount", 0) or 0) > 0:
+                                stable_tokens.append(mint)
+                            else:
+                                degen_tokens.append(mint)
+                        else:
+                            degen_tokens.append(mint)
 
-                        q = r.json()
-                        if int(q.get("outAmount", 0) or 0) <= 0:
-                            STATE["last_action"] = f"no_liquidity:{mint}"
-                            continue
+                    except:
+                        degen_tokens.append(mint)
 
-                except Exception:
-                    STATE["last_action"] = f"quote_fail:{mint}"
+            STATE["candidates"] = stable_tokens + degen_tokens
+
+            await monitor_positions()
+
+            # =========================
+            # 🟢 ENGINE 1：穩定賺（Jupiter）
+            # =========================
+            for mint in stable_tokens:
+                if STATE["daily_trades"] >= MAX_DAILY_TRADES:
+                    break
+
+                if has_position(mint):
                     continue
 
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                # 第一筆單放寬
-                if STATE["daily_trades"] == 0 and alpha > 10:
-                    STATE["last_action"] = f"fallback_buy:{mint}:{alpha}"
-                else:
-                    if alpha < 15:
-                        STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
-                        continue
+                if alpha < 15:
+                    continue
 
                 exec_result = await simulate_buy(mint, 0.01)
                 if not exec_result:
                     continue
 
                 if exec_result["slippage"] > 0.01:
-                    STATE["last_action"] = f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
                     continue
 
                 STATE["positions"].append({
@@ -410,10 +393,49 @@ async def bot_loop():
                     "entry_time": time.time(),
                     "entry_gas_cost": exec_result["gas_cost"],
                     "pnl_pct": 0.0,
+                    "engine": "stable"
                 })
 
                 STATE["daily_trades"] += 1
-                STATE["last_action"] = f"buy:{mint}"
+                STATE["last_action"] = f"stable_buy:{mint}"
+
+            # =========================
+            # 🔴 ENGINE 2：打仗（早期幣）
+            # =========================
+            for mint in degen_tokens[:3]:  # 控制風險
+                if STATE["daily_trades"] >= MAX_DAILY_TRADES:
+                    break
+
+                if has_position(mint):
+                    continue
+
+                alpha = await real_alpha(mint)
+                STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
+
+                # 🔥 關鍵：只抓爆發
+                if alpha < 30:
+                    continue
+
+                exec_result = await simulate_buy(mint, 0.005)  # 小倉位
+                if not exec_result:
+                    continue
+
+                STATE["positions"].append({
+                    "token": mint,
+                    "alpha": alpha,
+                    "size": exec_result["size"],
+                    "entry_price": exec_result["fill_price"],
+                    "mark_price": exec_result["mark_price"],
+                    "last_price": exec_result["fill_price"],
+                    "token_qty": exec_result["token_qty"],
+                    "entry_time": time.time(),
+                    "entry_gas_cost": exec_result["gas_cost"],
+                    "pnl_pct": 0.0,
+                    "engine": "degen"
+                })
+
+                STATE["daily_trades"] += 1
+                STATE["last_action"] = f"degen_buy:{mint}"
 
         except Exception as e:
             STATE["errors"] += 1
