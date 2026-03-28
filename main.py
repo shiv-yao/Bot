@@ -203,7 +203,6 @@ async def monitor_positions():
 
         await asyncio.sleep(3)
 
-
 async def bot_loop():
     while True:
         try:
@@ -240,10 +239,7 @@ async def bot_loop():
 
                 if alpha < 20:
                     STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
-                        continue
-                    else:
-                        STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
-                        continue
+                    continue
 
                 size = min(0.01, 0.1 / (len(STATE["positions"]) + 1))
                 entry_price = round(random.uniform(0.00001, 0.00002), 8)
