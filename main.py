@@ -1,4 +1,4 @@
-# ================= v500_REAL_FULL_INTEGRATED =================
+# ================= v600_ME​​V_FULL_SYSTEM =================
 
 import asyncio, time, aiohttp, base64, os, random
 from contextlib import asynccontextmanager
@@ -11,6 +11,11 @@ from solders.transaction import VersionedTransaction
 JUP = "https://lite-api.jup.ag"
 HELIUS = os.getenv("HELIUS_API_KEY", "")
 RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS}"
+
+JITO = [
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://ny.block-engine.jito.wtf/api/v1/bundles"
+]
 
 INPUT = "So11111111111111111111111111111111111111112"
 
@@ -66,14 +71,14 @@ STATE = {
 
 async def get(url):
     try:
-        async with SESSION.get(url, timeout=6) as r:
+        async with SESSION.get(url, timeout=5) as r:
             return await r.json()
     except:
         return None
 
 async def post(url, data):
     try:
-        async with SESSION.post(url, json=data, timeout=6) as r:
+        async with SESSION.post(url, json=data, timeout=5) as r:
             return await r.json()
     except:
         return None
@@ -82,29 +87,10 @@ async def post(url, data):
 
 def extract_token(logs):
     for l in logs:
-        parts = l.split(" ")
-        for p in parts:
+        for p in l.split(" "):
             if len(p) > 30:
                 return p
     return None
-
-# ================= PRICE =================
-
-async def get_price(token):
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount=10000000")
-    if not r or not r.get("data"):
-        return None
-    route = r["data"][0]
-    return float(route["outAmount"]) / float(route["inAmount"])
-
-# ================= FLOW =================
-
-async def flow_alpha():
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount=10000000")
-    if not r:
-        return 0
-    impact = float(r["data"][0].get("priceImpactPct", 0))
-    return max(0, 50 - impact * 100)
 
 # ================= SNIPER =================
 
@@ -133,6 +119,15 @@ async def pump_ws():
                             STATE["current_token"] = token
                             STATE["sniper"] = True
                             STATE["last_pump"] = time.time()
+
+# ================= FLOW =================
+
+async def flow_alpha():
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount=10000000")
+    if not r:
+        return 0
+    impact = float(r["data"][0].get("priceImpactPct", 0))
+    return max(0, 50 - impact * 100)
 
 # ================= ALPHA =================
 
@@ -179,14 +174,10 @@ def update_alpha(sources, pnl):
 # ================= FILTER =================
 
 async def check_liquidity(token):
-
     r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount=10000000")
-
     if not r or not r.get("data"):
         return False
-
     impact = float(r["data"][0].get("priceImpactPct", 1))
-
     return impact < 0.2
 
 def rug_filter():
@@ -205,65 +196,60 @@ def size(alpha):
 
     s *= 0.04
 
+    if STATE["sniper"]:
+        s *= 1.5  # 🚀 sniper boost
+
     if STATE["loss_streak"] >= 2:
         s *= 0.5
 
     return max(MIN_SIZE, min(s, MAX_SIZE))
 
-# ================= TX CONFIRM =================
+# ================= MEV EXEC =================
 
-async def confirm_tx(sig):
+async def execute_trade_mev(sz, token):
 
-    for _ in range(5):
+    slippage = 300 if STATE["sniper"] else BASE_SLIPPAGE
 
-        r = await post(RPC, {
-            "jsonrpc": "2.0",
-            "method": "getSignatureStatuses",
-            "params": [[sig]]
-        })
+    quote = await get(
+        f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}"
+        f"&amount={int(sz*1e9)}&slippageBps={slippage}"
+    )
 
-        if r and r.get("result"):
-            val = r["result"]["value"][0]
-            if val and val.get("confirmationStatus") in ["confirmed", "finalized"]:
-                return True
-
-        await asyncio.sleep(0.5)
-
-    return False
-
-# ================= BUY =================
-
-async def buy(sz, token):
-
-    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount={int(sz*1e9)}")
-    if not r:
+    if not quote or not quote.get("data"):
         return None, None
 
-    route = r["data"][0]
+    route = quote["data"][0]
 
     swap = await post(JUP + "/v6/swap", {
         "quoteResponse": route,
-        "userPublicKey": str(keypair.pubkey())
+        "userPublicKey": str(keypair.pubkey()),
+        "dynamicComputeUnitLimit": True,
+        "prioritizationFeeLamports": 50000  # 🔥 priority fee
     })
 
-    tx = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
+    if not swap or "swapTransaction" not in swap:
+        return None, None
+
+    tx = VersionedTransaction.from_bytes(
+        base64.b64decode(swap["swapTransaction"])
+    )
     tx.sign([keypair])
 
     raw = base64.b64encode(bytes(tx)).decode()
 
-    res = await post(RPC, {
+    bundle = {
         "jsonrpc": "2.0",
-        "method": "sendTransaction",
-        "params": [raw]
-    })
+        "id": 1,
+        "method": "sendBundle",
+        "params": [{
+            "transactions": [raw],
+            "encoding": "base64"
+        }]
+    }
 
-    if not res or "result" not in res:
-        return None, None
+    res = await asyncio.gather(*[post(u, bundle) for u in JITO])
 
-    sig = res["result"]
-
-    ok = await confirm_tx(sig)
-    if not ok:
+    if not any(r and "result" in r for r in res):
         return None, None
 
     price = float(route["outAmount"]) / float(route["inAmount"])
@@ -297,22 +283,19 @@ async def sell(qty, token):
         "params": [raw]
     })
 
-    if not res or "result" not in res:
-        return False
-
-    sig = res["result"]
-
-    return await confirm_tx(sig)
+    return bool(res)
 
 # ================= MONITOR =================
 
 async def monitor():
 
     token = STATE["current_token"]
-    price = await get_price(token)
 
-    if not price:
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount=10000000")
+    if not r:
         return
+
+    price = float(r["data"][0]["outAmount"]) / float(r["data"][0]["inAmount"])
 
     new = []
 
@@ -383,7 +366,7 @@ async def bot():
 
                 sz = size(alpha)
 
-                price, qty = await buy(sz, token)
+                price, qty = await execute_trade_mev(sz, token)
 
                 if not price:
                     continue
@@ -399,7 +382,7 @@ async def bot():
         except Exception as e:
             STATE["last_error"] = str(e)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.8)  # 🔥 降 latency
 
 # ================= API =================
 
@@ -417,7 +400,7 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 def root():
     return {
-        "status": "running",
+        "status": "v600 running",
         "pnl": STATE["daily_pnl"],
         "positions": len(STATE["positions"]),
         "token": STATE["current_token"]
