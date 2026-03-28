@@ -23,9 +23,10 @@ STATE = {
     "scanner_mode": None,
     "scanner_error": None,
     "last_alpha": None,
-    "bot_version": "alpha_dual_engine_v5_allocator",
+    "bot_version": "alpha_dual_engine_v5_allocator_cooldown",
     "candidate_count": 0,
     "loss_streak": 0,
+    "last_trade_time": {},
     "engine_stats": {
         "stable": {
             "pnl": 0.0,
@@ -49,6 +50,7 @@ STATE = {
 MAX_POSITIONS = 4
 MAX_DAILY_TRADES = 20
 MAX_HOLD_SECONDS = 120
+TRADE_COOLDOWN_SECONDS = 120
 
 STOP_LOSS = -0.06
 TAKE_PROFIT = 0.12
@@ -72,6 +74,17 @@ def is_valid_mint(mint: str) -> bool:
     if mint.startswith("0x"):
         return False
     return True
+
+
+def in_trade_cooldown(mint: str) -> bool:
+    ts = STATE["last_trade_time"].get(mint)
+    if ts is None:
+        return False
+    return (time.time() - ts) < TRADE_COOLDOWN_SECONDS
+
+
+def mark_trade_time(mint: str) -> None:
+    STATE["last_trade_time"][mint] = time.time()
 
 
 # ================= AI ALLOCATOR =================
@@ -99,24 +112,26 @@ def get_engine_weight(engine: str) -> float:
 
 def get_dynamic_alpha_threshold(engine: str) -> float:
     stats = STATE["engine_stats"][engine]
-    base = 8.0 if engine == "stable" else 35.0
+
+    # stable 拉高一點，避免 9.69 那種反覆進場
+    base = 12.0 if engine == "stable" else 35.0
 
     if stats["trades"] >= 5:
         if stats["winrate"] < 0.40:
             base *= 1.3
         elif stats["winrate"] > 0.65:
-            base *= 0.8
+            base *= 0.85
 
         if stats["pnl"] < 0:
             base *= 1.15
         elif stats["pnl"] > 0:
-            base *= 0.9
+            base *= 0.92
 
     return round(base, 2)
 
 
 def get_position_size(alpha: float, engine: str) -> float:
-    base = 0.003 if engine == "stable" else 0.002
+    base = 0.002 if engine == "stable" else 0.0015
     weight = get_engine_weight(engine)
     alpha_boost = min(max(alpha / 50.0, 0.5), 1.5)
 
@@ -388,6 +403,7 @@ async def monitor_positions():
             STATE["realized_pnl"] += closed["realized_pnl"]
             STATE["daily_pnl"] += closed["realized_pnl"]
             update_engine_stats_on_close(pos["engine"], closed["realized_pnl"])
+            mark_trade_time(pos["token"])
             STATE["last_action"] = f"{reason}:{pos['token']}"
             continue
 
@@ -402,7 +418,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v5_allocator"
+            STATE["bot_version"] = "alpha_dual_engine_v5_allocator_cooldown"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -462,9 +478,10 @@ async def bot_loop():
 
             await monitor_positions()
 
-            # ================= STABLE ENGINE =================
             stable_threshold = get_dynamic_alpha_threshold("stable")
+            degen_threshold = get_dynamic_alpha_threshold("degen")
 
+            # ================= STABLE ENGINE =================
             for mint in stable_tokens:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
                     STATE["last_action"] = "daily_limit_hit"
@@ -476,6 +493,10 @@ async def bot_loop():
 
                 if has_position(mint):
                     STATE["last_action"] = f"already_have:{mint}"
+                    continue
+
+                if in_trade_cooldown(mint):
+                    STATE["last_action"] = f"cooldown_skip:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
@@ -516,13 +537,12 @@ async def bot_loop():
                     "engine": "stable",
                 })
 
+                mark_trade_time(mint)
                 refresh_open_positions()
                 STATE["daily_trades"] += 1
                 STATE["last_action"] = f"stable_buy:{mint}"
 
             # ================= DEGEN ENGINE =================
-            degen_threshold = get_dynamic_alpha_threshold("degen")
-
             for mint in degen_tokens[:3]:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
                     STATE["last_action"] = "daily_limit_hit"
@@ -538,6 +558,10 @@ async def bot_loop():
 
                 if not is_valid_mint(mint):
                     STATE["last_action"] = f"bad_mint:{mint}"
+                    continue
+
+                if in_trade_cooldown(mint):
+                    STATE["last_action"] = f"cooldown_skip:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
@@ -575,6 +599,7 @@ async def bot_loop():
                     "engine": "degen",
                 })
 
+                mark_trade_time(mint)
                 refresh_open_positions()
                 STATE["daily_trades"] += 1
                 STATE["last_action"] = f"degen_buy:{mint}"
