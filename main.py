@@ -242,14 +242,14 @@ def dashboard():
     </body>
     </html>
     """
+
 # ================= API =================
 
 bot_task = None
 
-# 1️⃣ 先定義 lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global SESSION, bot_task
+    global bot_task, SESSION
 
     SESSION = aiohttp.ClientSession()
     bot_task = asyncio.create_task(bot_loop())
@@ -259,34 +259,22 @@ async def lifespan(app: FastAPI):
     await SESSION.close()
     bot_task.cancel()
 
-
-# 2️⃣ 再宣告 app
 app = FastAPI(lifespan=lifespan)
-
-
-# ================= ROUTES =================
 
 @app.get("/")
 def root():
     return {"ok": True}
 
-
 @app.get("/metrics")
 def metrics():
     return STATE
 
+@app.post("/kill")
+def kill():
+    STATE["kill"] = True
+    return {"ok": True}
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return f"""
-    <html>
-    <body style="background:black;color:#0f0;font-family:monospace">
-    <h2>🔥 FUND</h2>
-    Balance: {STATE["balance"]:.4f}<br>
-    PnL: {STATE["realized_pnl"]:.4f}<br>
-    DD: {STATE["max_drawdown"]:.2%}<br>
-    Positions: {len(STATE["positions"])}<br>
-    Strategies: {STATE["strategy_scores"]}
-    </body>
-    </html>
-    """
+@app.post("/resume")
+def resume():
+    STATE["kill"] = False
+    return {"ok": True}
