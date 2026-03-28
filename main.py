@@ -244,7 +244,7 @@ def dashboard():
     """
 
 # ================= API =================
-
+app = FastAPI(lifespan=lifespan)
 bot_task = None
 
 @asynccontextmanager
@@ -259,7 +259,6 @@ async def lifespan(app: FastAPI):
     await SESSION.close()
     bot_task.cancel()
 
-app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
