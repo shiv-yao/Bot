@@ -31,8 +31,8 @@ async def real_alpha(mint: str) -> float:
                     "inputMint": sol,
                     "outputMint": mint,
                     "amount": "1000000",
-                    "slippageBps": 100
-                }
+                    "slippageBps": 100,
+                },
             )
 
             if r1.status_code != 200:
@@ -50,8 +50,8 @@ async def real_alpha(mint: str) -> float:
                     "inputMint": sol,
                     "outputMint": mint,
                     "amount": "1000000",
-                    "slippageBps": 100
-                }
+                    "slippageBps": 100,
+                },
             )
 
             if r2.status_code != 200:
@@ -111,7 +111,10 @@ async def bot_loop():
                 if has_position(mint):
                     continue
 
-                alpha = fake_alpha(mint)
+                if mint.startswith("TEST_"):
+                    continue
+
+                alpha = await real_alpha(mint)
 
                 if alpha < 120:
                     continue
