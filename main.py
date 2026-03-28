@@ -244,8 +244,10 @@ async def simulate_buy(mint: str, size: float):
         STATE["last_action"] = f"skip_illiquid:{mint}:{impact:.3f}"
         return None
 
-    # 動態滑點：impact 越大，成交越差
-    slippage = impact * random.uniform(1.2, 2.0)
+    # 加入最低市場摩擦，避免 impact=0 時完全沒滑點
+    base_slippage = random.uniform(0.002, 0.02)  # 0.2% ~ 2%
+    slippage = max(base_slippage, impact * random.uniform(1.2, 2.0))
+
     fill_price = price * (1 + slippage)
 
     # 模擬成交失敗
@@ -280,8 +282,10 @@ async def simulate_sell(pos: dict, reason: str):
     price = quote["price"]
     impact = quote["impact"]
 
-    # 賣出也吃滑點
-    slippage = impact * random.uniform(1.0, 1.8)
+    # 賣出也加入最低市場摩擦
+    base_slippage = random.uniform(0.002, 0.015)  # 0.2% ~ 1.5%
+    slippage = max(base_slippage, impact * random.uniform(1.0, 1.8))
+
     fill_price = price * (1 - slippage)
 
     entry_price = pos["entry_price"]
