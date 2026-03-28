@@ -1,6 +1,6 @@
-# ================= v800_FUND_ENGINE =================
+# ================= v900_REAL_BATTLE =================
 
-import asyncio, time, aiohttp, base64, os, random
+import asyncio, time, aiohttp, base64, os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from solders.keypair import Keypair
@@ -9,18 +9,18 @@ from solders.transaction import VersionedTransaction
 # ================= CONFIG =================
 
 JUP = "https://lite-api.jup.ag"
-RPC = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
+HELIUS = os.getenv("HELIUS_API_KEY")
+RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS}"
+
+JITO = [
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://ny.block-engine.jito.wtf/api/v1/bundles"
+]
 
 INPUT = "So11111111111111111111111111111111111111112"
 
-MAX_POS = 5
-MIN_SIZE = 0.002
-MAX_SIZE = 0.02
-
-STOP_LOSS = -0.05
-TAKE_PROFIT = 0.25
-
-MAX_DRAWDOWN = -0.1
+MAX_POS = 3
+SIZE = 0.002
 
 # ================= KEY =================
 
@@ -32,34 +32,10 @@ SESSION=None
 
 STATE = {
     "positions": [],
-    "closed": [],
-
-    # 🔥 portfolio allocator
-    "weights":{
-        "wallet":0.25,
-        "flow":0.25,
-        "mempool":0.25,
-        "launch":0.25
-    },
-
-    "perf":{
-        "wallet":[],
-        "flow":[],
-        "mempool":[],
-        "launch":[]
-    },
-
-    "config":{
-        "alpha_threshold":100,
-        "size_multiplier":1.0
-    },
-
-    "equity":0,
-    "peak":0,
-
-    "daily_pnl":0,
-    "loss_streak":0,
-    "kill":False
+    "target_token": None,
+    "sniper": False,
+    "last_pump": 0,
+    "last_error": None
 }
 
 # ================= SAFE =================
@@ -78,145 +54,81 @@ async def post(url,data):
     except:
         return None
 
-# ================= REAL PRICE =================
+# ================= PUMP DETECT =================
 
-async def get_price():
+def extract_token(logs):
+    for l in logs:
+        for part in l.split(" "):
+            if len(part) > 30:
+                return part
+    return None
+
+async def pump_ws():
+    ws = RPC.replace("https","wss")
+
+    async with aiohttp.ClientSession() as s:
+        async with s.ws_connect(ws) as w:
+
+            await w.send_json({
+                "jsonrpc":"2.0",
+                "method":"logsSubscribe",
+                "params":[{"mentions":["pump"]},{"commitment":"processed"}]
+            })
+
+            async for msg in w:
+                data = msg.json()
+
+                if "params" in data:
+                    logs = data["params"]["result"]["value"]["logs"]
+
+                    if any("initialize" in l for l in logs):
+
+                        token = extract_token(logs)
+
+                        if token:
+                            STATE["target_token"] = token
+                            STATE["sniper"] = True
+                            STATE["last_pump"] = time.time()
+
+# ================= FLOW =================
+
+async def flow_alpha():
     r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount=10000000")
-    if not r: return None
-    route=r["data"][0]
-    return float(route["outAmount"])/float(route["inAmount"])
+    if not r: return 0
 
-# ================= SIGNAL =================
-
-async def compute_alpha():
-
-    flow = random.uniform(0,50)
-    mem = random.uniform(0,100)
-    wallet = random.uniform(0,80)
-    launch = random.choice([0,300])
-
-    return {
-        "wallet":wallet,
-        "flow":flow,
-        "mempool":mem,
-        "launch":launch
-    }
-
-# ================= PORTFOLIO =================
-
-def update_weights():
-
-    weights={}
-    total=0
-
-    for k,arr in STATE["perf"].items():
-
-        if len(arr)<5:
-            score=1
-        else:
-            avg=sum(arr)/len(arr)
-            win=sum(1 for x in arr if x>0)/len(arr)
-            score=max(0.1,avg*win*10)
-
-        weights[k]=score
-        total+=score
-
-    for k in weights:
-        STATE["weights"][k]=weights[k]/total
-
-# ================= SIZE =================
-
-def get_size(alpha):
-
-    size=0
-
-    for k,v in alpha.items():
-        size+=v/100 * STATE["weights"][k]
-
-    size*=0.03 * STATE["config"]["size_multiplier"]
-
-    if STATE["loss_streak"]>=2:
-        size*=0.5
-
-    return max(MIN_SIZE,min(size,MAX_SIZE))
+    impact = float(r["data"][0].get("priceImpactPct",0))
+    return max(0, 50-impact*100)
 
 # ================= EXEC =================
 
-async def execute(sz):
+async def send_jito(raw):
 
-    r=await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={INPUT}&amount={int(sz*1e9)}")
-    if not r: return None,None
+    await asyncio.gather(*[
+        post(u,{
+            "jsonrpc":"2.0",
+            "method":"sendBundle",
+            "params":[{"transactions":[raw],"encoding":"base64"}]
+        }) for u in JITO
+    ])
 
-    route=r["data"][0]
+async def buy(token):
 
-    swap=await post(JUP+"/v6/swap",{
+    r = await get(f"{JUP}/v6/quote?inputMint={INPUT}&outputMint={token}&amount={int(SIZE*1e9)}")
+    if not r: return
+
+    route = r["data"][0]
+
+    swap = await post(JUP+"/v6/swap",{
         "quoteResponse":route,
         "userPublicKey":str(keypair.pubkey())
     })
 
-    tx=VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
+    tx = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
     tx.sign([keypair])
 
-    raw=base64.b64encode(bytes(tx)).decode()
+    raw = base64.b64encode(bytes(tx)).decode()
 
-    await post(RPC,{
-        "jsonrpc":"2.0",
-        "method":"sendTransaction",
-        "params":[raw]
-    })
-
-    price=float(route["outAmount"])/float(route["inAmount"])
-    qty=sz/price
-
-    return price,qty
-
-# ================= MONITOR =================
-
-async def monitor():
-
-    price=await get_price()
-    if not price: return
-
-    new=[]
-    equity=0
-
-    for p in STATE["positions"]:
-
-        pnl=(price-p["entry"])*p["qty"]
-        pct=pnl/(p["entry"]*p["qty"])
-
-        equity+=pnl
-
-        if pct<STOP_LOSS or pct>TAKE_PROFIT:
-
-            for s in p["sources"]:
-                STATE["perf"][s].append(pnl)
-
-            STATE["daily_pnl"]+=pnl
-
-            if pnl>0:
-                STATE["loss_streak"]=0
-            else:
-                STATE["loss_streak"]+=1
-
-            STATE["closed"].append(p)
-            continue
-
-        new.append(p)
-
-    STATE["positions"]=new
-    STATE["equity"]=equity
-
-# ================= RISK =================
-
-def risk():
-
-    STATE["peak"]=max(STATE["peak"],STATE["equity"])
-
-    dd=STATE["equity"]-STATE["peak"]
-
-    if dd<MAX_DRAWDOWN:
-        STATE["kill"]=True
+    await send_jito(raw)
 
 # ================= LOOP =================
 
@@ -226,47 +138,33 @@ async def bot():
 
         try:
 
-            if STATE["kill"]:
-                await asyncio.sleep(5)
+            # sniper reset
+            if STATE["sniper"] and time.time()-STATE["last_pump"]>5:
+                STATE["sniper"]=False
+                STATE["target_token"]=None
+
+            if not STATE["target_token"]:
+                await asyncio.sleep(0.5)
                 continue
 
-            await monitor()
-            update_weights()
-            risk()
+            flow = await flow_alpha()
 
-            if STATE["daily_pnl"]<-0.1:
-                await asyncio.sleep(30)
+            # 🔥 entry condition
+            if flow < 10:
+                await asyncio.sleep(0.5)
                 continue
 
-            for _ in range(3):
+            await buy(STATE["target_token"])
 
-                if len(STATE["positions"])>=MAX_POS:
-                    break
+            STATE["positions"].append({
+                "token": STATE["target_token"],
+                "time": time.time()
+            })
 
-                alpha=await compute_alpha()
+        except Exception as e:
+            STATE["last_error"]=str(e)
 
-                total=sum(alpha.values())
-
-                if total<STATE["config"]["alpha_threshold"]:
-                    continue
-
-                size=get_size(alpha)
-
-                price,qty=await execute(size)
-
-                if not price:
-                    continue
-
-                STATE["positions"].append({
-                    "entry":price,
-                    "qty":qty,
-                    "sources":list(alpha.keys())
-                })
-
-        except:
-            pass
-
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
 
 # ================= APP =================
 
@@ -274,7 +172,10 @@ async def bot():
 async def lifespan(app:FastAPI):
     global SESSION
     SESSION=aiohttp.ClientSession()
+
     asyncio.create_task(bot())
+    asyncio.create_task(pump_ws())
+
     yield
     await SESSION.close()
 
@@ -283,8 +184,8 @@ app=FastAPI(lifespan=lifespan)
 @app.get("/")
 def root():
     return {
-        "pnl":STATE["daily_pnl"],
-        "equity":STATE["equity"],
-        "weights":STATE["weights"],
-        "positions":len(STATE["positions"])
+        "sniper": STATE["sniper"],
+        "token": STATE["target_token"],
+        "positions": len(STATE["positions"]),
+        "error": STATE["last_error"]
     }
