@@ -101,70 +101,61 @@ async def real_alpha(mint: str) -> float:
         sol = "So11111111111111111111111111111111111111112"
 
         async with httpx.AsyncClient(timeout=8) as client:
+
+            # STEP 1: SOL → TOKEN
             r1 = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
                     "inputMint": sol,
                     "outputMint": mint,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
+                    "amount": 1_000_000,
+                    "slippageBps": 100
+                }
             )
 
             if r1.status_code != 200:
-                return -999.0
+                return -999
 
             q1 = r1.json()
-            out1 = int(q1.get("outAmount", 0) or 0)
-            impact1 = float(q1.get("priceImpactPct", 1) or 1)
+            out_token = int(q1.get("outAmount", 0) or 0)
 
-            # 沒 route / 流動性太差 / impact 太高
-            if out1 <= 0:
-                return -999.0
-            if out1 < 1000:
-                return -999.0
-            if impact1 > 0.2:
-                return -999.0
+            if out_token <= 0:
+                return -999
 
-            await asyncio.sleep(0.2)
-
+            # STEP 2: TOKEN → SOL（回來）
             r2 = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
-                    "inputMint": sol,
-                    "outputMint": mint,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
+                    "inputMint": mint,
+                    "outputMint": sol,
+                    "amount": out_token,
+                    "slippageBps": 100
+                }
             )
 
             if r2.status_code != 200:
-                return -999.0
+                return -999
 
             q2 = r2.json()
-            out2 = int(q2.get("outAmount", 0) or 0)
+            back_sol = int(q2.get("outAmount", 0) or 0)
 
-            if out2 <= 0:
-                return -999.0
+            if back_sol <= 0:
+                return -999
 
-            strength = (out2 - out1) / out1
+            # =========================
+            # 核心：round-trip pnl
+            # =========================
+            pnl = (back_sol - 1_000_000) / 1_000_000
 
-            # 沒動能
-            if abs(strength) < 0.002:
-                return -50.0
+            impact = float(q1.get("priceImpactPct", 0.0))
+            liquidity_score = min(out_token / 100000, 3) * 25
 
-            # 下跌幣直接封殺
-            if strength < 0:
-                return -100.0
+            alpha = pnl * 3000 + liquidity_score - impact * 100
 
-            liquidity_score = min(out1 / 100000, 3) * 25
-            impact_penalty = impact1 * 100
-
-            alpha = strength * 4000 + liquidity_score - impact_penalty
             return round(alpha, 2)
 
-    except Exception:
-        return -999.0
+    except:
+        return -999
 async def scan_tokens():
     tokens = []
 
