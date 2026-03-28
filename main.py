@@ -238,7 +238,7 @@ async def bot_loop():
                     STATE["last_action"] = f"quote_fail:{mint}"
                     continue
 
-                if alpha < 120:
+                if alpha < 20:
                     if STATE["scanner_mode"] == "fallback":
                         alpha = random.uniform(125, 160)
                     else:
