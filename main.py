@@ -242,7 +242,6 @@ def dashboard():
     </body>
     </html>
     """
-
 # ================= API =================
 
 bot_task = None
@@ -250,7 +249,7 @@ bot_task = None
 # 1️⃣ 先定義 lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_task, SESSION
+    global SESSION, bot_task
 
     SESSION = aiohttp.ClientSession()
     bot_task = asyncio.create_task(bot_loop())
@@ -262,41 +261,32 @@ async def lifespan(app: FastAPI):
 
 
 # 2️⃣ 再宣告 app
-app = FastAPI()
-app.router.lifespan_context = lifespan
+app = FastAPI(lifespan=lifespan)
 
 
 # ================= ROUTES =================
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return f"""
-    <html>
-    <body style="background:black;color:#00ffcc;font-family:monospace">
-    <h1>🚀 FUND DASHBOARD</h1>
-    <p>Balance: {STATE["balance"]:.4f}</p>
-    <p>PnL: {STATE["realized_pnl"]:.4f}</p>
-    <p>Drawdown: {STATE["max_drawdown"]:.2%}</p>
-    <p>Positions: {len(STATE["positions"])}</p>
-    <p>Trades: {len(STATE["trade_log"])}</p>
-    </body>
-    </html>
-    """
 
 @app.get("/")
 def root():
     return {"ok": True}
 
+
 @app.get("/metrics")
 def metrics():
     return STATE
 
-@app.post("/kill")
-def kill():
-    STATE["kill"] = True
-    return {"ok": True}
 
-@app.post("/resume")
-def resume():
-    STATE["kill"] = False
-    return {"ok": True}
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return f"""
+    <html>
+    <body style="background:black;color:#0f0;font-family:monospace">
+    <h2>🔥 FUND</h2>
+    Balance: {STATE["balance"]:.4f}<br>
+    PnL: {STATE["realized_pnl"]:.4f}<br>
+    DD: {STATE["max_drawdown"]:.2%}<br>
+    Positions: {len(STATE["positions"])}<br>
+    Strategies: {STATE["strategy_scores"]}
+    </body>
+    </html>
+    """
