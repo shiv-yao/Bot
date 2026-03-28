@@ -17,21 +17,42 @@ STATE = {
     "candidates": [],
     "last_execution": None,
     "realized_pnl": 0.0,
+    "daily_pnl": 0.0,
+    "daily_trades": 0,
+    "last_reset": time.time(),
+    "scanner_mode": None,
+    "scanner_error": None,
+    "last_alpha": None,
+    "bot_version": "alpha_dual_engine_v3",
+    "candidate_count": 0,
 }
 
-MAX_POSITIONS = 3
+MAX_POSITIONS = 4
 MAX_DAILY_TRADES = 20
 MAX_HOLD_SECONDS = 120
 BASE_FAIL_RATE = 0.05
 GAS_COST = 0.000005
 
-STATE["daily_trades"] = 0
-STATE["last_reset"] = time.time()
+STOP_LOSS = -0.20
+TAKE_PROFIT = 0.50
+DAILY_STOP = -0.03
 
 # ================= HELPERS =================
 
 def has_position(mint: str) -> bool:
     return any(p.get("token") == mint for p in STATE["positions"])
+
+
+def is_valid_solana_mint(mint: str) -> bool:
+    if not mint:
+        return False
+    if len(mint) < 32 or len(mint) > 44:
+        return False
+    if any(c in mint for c in [".", "/", ":"]):
+        return False
+    if mint.startswith("0x"):
+        return False
+    return True
 
 
 async def get_quote(mint: str):
@@ -46,17 +67,17 @@ async def get_quote(mint: str):
                     "inputMint": sol,
                     "outputMint": mint,
                     "amount": str(amount_in),
-                    "slippageBps": 100
-                }
+                    "slippageBps": 100,
+                },
             )
 
             if r.status_code != 200:
                 return None
 
             data = r.json()
-            out = int(data.get("outAmount", 0))
+            out = int(data.get("outAmount", 0) or 0)
 
-            if out == 0:
+            if out <= 0:
                 return None
 
             price = amount_in / out
@@ -64,100 +85,78 @@ async def get_quote(mint: str):
 
             return {
                 "price": price,
-                "impact": impact
+                "impact": impact,
+                "out": out,
             }
 
-    except:
+    except Exception:
         return None
 
+
 async def has_jupiter_route(mint: str) -> bool:
-    try:
-        sol = "So11111111111111111111111111111111111111112"
+    q = await get_quote(mint)
+    return q is not None and q["out"] > 1000
 
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": sol,
-                    "outputMint": mint,
-                    "amount": "1000000",
-                    "slippageBps": 100,
-                },
-            )
-
-            if r.status_code != 200:
-                return False
-
-            data = r.json()
-            out = int(data.get("outAmount", 0) or 0)
-
-            return out > 1000
-
-    except Exception:
-        return False
 
 async def real_alpha(mint: str) -> float:
     try:
         sol = "So11111111111111111111111111111111111111112"
 
         async with httpx.AsyncClient(timeout=8) as client:
-
-            # STEP 1: SOL → TOKEN
+            # STEP 1: SOL -> TOKEN
             r1 = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
                     "inputMint": sol,
                     "outputMint": mint,
                     "amount": 1_000_000,
-                    "slippageBps": 100
-                }
+                    "slippageBps": 100,
+                },
             )
 
             if r1.status_code != 200:
-                return -999
+                return -999.0
 
             q1 = r1.json()
             out_token = int(q1.get("outAmount", 0) or 0)
 
             if out_token <= 0:
-                return -999
+                return -999.0
 
-            # STEP 2: TOKEN → SOL（回來）
+            # STEP 2: TOKEN -> SOL
             r2 = await client.get(
                 "https://lite-api.jup.ag/swap/v1/quote",
                 params={
                     "inputMint": mint,
                     "outputMint": sol,
                     "amount": out_token,
-                    "slippageBps": 100
-                }
+                    "slippageBps": 100,
+                },
             )
 
             if r2.status_code != 200:
-                return -999
+                return -999.0
 
             q2 = r2.json()
             back_sol = int(q2.get("outAmount", 0) or 0)
 
             if back_sol <= 0:
-                return -999
+                return -999.0
 
-            # =========================
-            # 核心：round-trip pnl
-            # =========================
             pnl = (back_sol - 1_000_000) / 1_000_000
-
-            impact = float(q1.get("priceImpactPct", 0.0))
+            impact = float(q1.get("priceImpactPct", 0.0) or 0.0)
             liquidity_score = min(out_token / 100000, 3) * 25
 
             alpha = pnl * 3000 + liquidity_score - impact * 100
-
             return round(alpha, 2)
 
-    except:
-        return -999
+    except Exception:
+        return -999.0
+
+
 async def scan_tokens():
     tokens = []
+    STATE["scanner_error"] = None
 
     try:
         async with httpx.AsyncClient(timeout=6) as client:
@@ -170,22 +169,27 @@ async def scan_tokens():
                 data = r.json()
                 pairs = data.get("pairs", [])[:30]
 
+                seen = set()
+
                 for p in pairs:
                     chain = p.get("chainId")
                     mint = p.get("baseToken", {}).get("address")
 
-                    # ✅ 只留 Solana
                     if chain != "solana":
                         continue
-
-                    # ✅ 過濾奇怪地址（非 mint）
-                    if not mint or len(mint) < 32:
+                    if not is_valid_solana_mint(mint):
+                        continue
+                    if mint in seen:
                         continue
 
+                    seen.add(mint)
                     tokens.append(mint)
 
                 STATE["scanner_mode"] = "dexscreener_filtered"
                 STATE["scanner_error"] = None
+            else:
+                STATE["scanner_mode"] = "fallback"
+                STATE["scanner_error"] = f"dex_status_{r.status_code}"
 
     except Exception as e:
         STATE["scanner_mode"] = "fallback"
@@ -193,17 +197,17 @@ async def scan_tokens():
 
     if not tokens:
         tokens = ["TEST_A", "TEST_B"]
+        STATE["scanner_mode"] = "fallback"
 
+    STATE["candidate_count"] = len(tokens)
     return tokens
 
-# =========================
-# ✅ 強制成交 BUY（100% 成功）
-# =========================
+
+# ================= EXECUTION =================
+
 async def simulate_buy(mint: str, size: float):
     try:
-        # 模擬價格（避免 0 或極端值）
         price = random.uniform(0.00001, 0.00002)
-
         token_qty = size / price
 
         result = {
@@ -213,25 +217,21 @@ async def simulate_buy(mint: str, size: float):
             "mark_price": price,
             "fill_price": price,
             "token_qty": token_qty,
-            "gas_cost": 0.000005,
+            "gas_cost": GAS_COST,
             "slippage": random.uniform(0, 0.01),
             "timestamp": time.time(),
         }
 
+        STATE["last_execution"] = result
         return result
 
-    except Exception as e:
+    except Exception:
         return None
 
 
-# =========================
-# ✅ 強制成交 SELL（搭配 monitor_positions）
-# =========================
 async def simulate_sell(position: dict):
     try:
-        # 模擬價格波動（±30%）
         price = position["entry_price"] * random.uniform(0.7, 1.3)
-
         token_qty = position["token_qty"]
 
         value = token_qty * price
@@ -240,20 +240,23 @@ async def simulate_sell(position: dict):
         pnl = value - entry_value
         pnl_pct = pnl / entry_value
 
-        return {
+        result = {
             "ok": True,
             "price": price,
             "value": value,
             "pnl": pnl,
             "pnl_pct": pnl_pct,
-            "gas_cost": 0.000005,
+            "gas_cost": GAS_COST,
             "timestamp": time.time(),
+            "token": position["token"],
+            "engine": position.get("engine"),
         }
+
+        STATE["last_execution"] = result
+        return result
 
     except Exception:
         return None
-
-
 
 
 # ================= MONITOR =================
@@ -268,35 +271,70 @@ async def monitor_positions():
             continue
 
         pos["mark_price"] = result["price"]
+        pos["last_price"] = result["price"]
         pos["pnl_pct"] = result["pnl_pct"]
 
-        # 🔴 Stop Loss
-        if pos["pnl_pct"] < -0.2:
-            STATE["closed_trades"].append(pos)
+        if pos["pnl_pct"] < STOP_LOSS:
+            closed = dict(pos)
+            closed["exit_price"] = result["price"]
+            closed["exit_time"] = result["timestamp"]
+            closed["exit_reason"] = "stop_loss"
+            closed["realized_pnl"] = result["pnl"] - result["gas_cost"]
+
+            STATE["closed_trades"].append(closed)
+            STATE["realized_pnl"] += closed["realized_pnl"]
+            STATE["daily_pnl"] += closed["realized_pnl"]
             STATE["last_action"] = f"stop_loss:{pos['token']}"
             continue
 
-        # 🟢 Take Profit
-        if pos["pnl_pct"] > 0.5:
-            STATE["closed_trades"].append(pos)
+        if pos["pnl_pct"] > TAKE_PROFIT:
+            closed = dict(pos)
+            closed["exit_price"] = result["price"]
+            closed["exit_time"] = result["timestamp"]
+            closed["exit_reason"] = "take_profit"
+            closed["realized_pnl"] = result["pnl"] - result["gas_cost"]
+
+            STATE["closed_trades"].append(closed)
+            STATE["realized_pnl"] += closed["realized_pnl"]
+            STATE["daily_pnl"] += closed["realized_pnl"]
             STATE["last_action"] = f"take_profit:{pos['token']}"
+            continue
+
+        if time.time() - pos["entry_time"] > MAX_HOLD_SECONDS:
+            closed = dict(pos)
+            closed["exit_price"] = result["price"]
+            closed["exit_time"] = result["timestamp"]
+            closed["exit_reason"] = "timeout"
+            closed["realized_pnl"] = result["pnl"] - result["gas_cost"]
+
+            STATE["closed_trades"].append(closed)
+            STATE["realized_pnl"] += closed["realized_pnl"]
+            STATE["daily_pnl"] += closed["realized_pnl"]
+            STATE["last_action"] = f"timeout_exit:{pos['token']}"
             continue
 
         new_positions.append(pos)
 
     STATE["positions"] = new_positions
 
+
 # ================= BOT LOOP =================
 
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v2"
+            STATE["bot_version"] = "alpha_dual_engine_v3"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
                 STATE["daily_trades"] = 0
+                STATE["daily_pnl"] = 0.0
                 STATE["last_reset"] = now
+
+            if STATE["daily_pnl"] < DAILY_STOP:
+                STATE["last_action"] = "daily_stop"
+                await asyncio.sleep(10)
+                continue
 
             STATE["signals"] += 1
             STATE["last_action"] = "scan"
@@ -306,13 +344,12 @@ async def bot_loop():
             stable_tokens = []
             degen_tokens = []
 
-            # =========================
-            # 分流：有 Jupiter route = stable
-            # 沒 route / 太早期 = degen
-            # =========================
             async with httpx.AsyncClient(timeout=4) as client:
                 for mint in raw_tokens:
                     try:
+                        if not is_valid_solana_mint(mint):
+                            continue
+
                         r = await client.get(
                             "https://lite-api.jup.ag/swap/v1/quote",
                             params={
@@ -336,11 +373,12 @@ async def bot_loop():
                         degen_tokens.append(mint)
 
             STATE["candidates"] = stable_tokens + degen_tokens
+            STATE["candidate_count"] = len(STATE["candidates"])
 
             await monitor_positions()
 
             # =========================
-            # 🟢 ENGINE 1：穩定賺（只打有 route）
+            # ENGINE 1: STABLE
             # =========================
             for mint in stable_tokens:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
@@ -355,18 +393,9 @@ async def bot_loop():
                     STATE["last_action"] = f"already_have:{mint}"
                     continue
 
-                if not mint or len(mint) < 32:
-                    STATE["last_action"] = f"bad_mint:{mint}"
-                    continue
-
-                if any(c in mint for c in [".", "/", ":"]):
-                    STATE["last_action"] = f"weird_mint:{mint}"
-                    continue
-
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                # 穩定引擎：垃圾幣直接跳過
                 if alpha == -999:
                     STATE["last_action"] = f"stable_skip_bad:{mint}"
                     continue
@@ -401,7 +430,7 @@ async def bot_loop():
                 STATE["last_action"] = f"stable_buy:{mint}"
 
             # =========================
-            # 🔴 ENGINE 2：打仗（早期幣）
+            # ENGINE 2: DEGEN
             # =========================
             for mint in degen_tokens[:3]:
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
@@ -416,18 +445,13 @@ async def bot_loop():
                     STATE["last_action"] = f"already_have:{mint}"
                     continue
 
-                if not mint or len(mint) < 32:
+                if not is_valid_solana_mint(mint):
                     STATE["last_action"] = f"bad_mint:{mint}"
-                    continue
-
-                if any(c in mint for c in [".", "/", ":"]):
-                    STATE["last_action"] = f"weird_mint:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                # 🔥 關鍵：early coin fallback
                 if alpha == -999:
                     alpha = round(random.uniform(20, 60), 2)
                     STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
@@ -464,6 +488,7 @@ async def bot_loop():
 
         await asyncio.sleep(2)
 
+
 # ================= FASTAPI =================
 
 bot_task = None
@@ -475,17 +500,21 @@ async def lifespan(app: FastAPI):
     yield
     if bot_task:
         bot_task.cancel()
+
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 async def root():
     return {"ok": True, "status": "running"}
 
+
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# 👉 就放在這裡 👇
+
 @app.get("/metrics")
 async def metrics():
     return {
@@ -497,6 +526,7 @@ async def metrics():
         "candidates": STATE["candidates"],
         "last_execution": STATE["last_execution"],
         "realized_pnl": STATE["realized_pnl"],
+        "daily_pnl": STATE["daily_pnl"],
         "daily_trades": STATE["daily_trades"],
         "last_reset": STATE["last_reset"],
         "scanner_mode": STATE.get("scanner_mode"),
