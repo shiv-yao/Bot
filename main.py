@@ -239,8 +239,8 @@ async def bot_loop():
                     continue
 
                 if alpha < 20:
-                    if STATE["scanner_mode"] == "fallback":
-                        alpha = random.uniform(125, 160)
+                    STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
+                        continue
                     else:
                         STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                         continue
