@@ -29,6 +29,14 @@ def has_position(mint: str) -> bool:
     return any(p.get("token") == mint for p in STATE["positions"])
 
 
+def is_solana_mint(addr: str) -> bool:
+    if not isinstance(addr, str):
+        return False
+    if addr.startswith("0x"):
+        return False
+    return 32 <= len(addr) <= 44
+
+
 async def real_alpha(mint: str) -> float:
     try:
         sol = "So11111111111111111111111111111111111111112"
@@ -83,23 +91,46 @@ async def real_alpha(mint: str) -> float:
         return 0.0
 
 
+async def get_real_price(mint: str):
+    try:
+        sol = "So11111111111111111111111111111111111111112"
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params={
+                    "inputMint": sol,
+                    "outputMint": mint,
+                    "amount": "1000000",
+                    "slippageBps": 100,
+                },
+            )
+
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            out = int(data.get("outAmount", 0) or 0)
+
+            if out <= 0:
+                return None
+
+            return out / 1_000_000
+
+    except Exception:
+        return None
+
+
 async def scan_tokens():
     tokens = []
     STATE["scanner_error"] = None
     STATE["dex_pairs"] = 0
 
-    def is_solana_mint(addr: str) -> bool:
-        if not isinstance(addr, str):
-            return False
-        if addr.startswith("0x"):
-            return False
-        return 32 <= len(addr) <= 44
-
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
                 "https://api.dexscreener.com/latest/dex/search",
-                params={"q": "solana"}
+                params={"q": "solana"},
             )
 
             if r.status_code == 200:
@@ -119,7 +150,7 @@ async def scan_tokens():
                     try:
                         liquidity = float(liquidity)
                     except Exception:
-                        liquidity = 0
+                        liquidity = 0.0
 
                     if not is_solana_mint(mint):
                         continue
@@ -150,18 +181,18 @@ async def scan_tokens():
     return tokens[:20]
 
 
-def fake_price_walk(entry_price: float) -> float:
-    move = random.uniform(-0.06, 0.10)
-    return round(entry_price * (1 + move), 8)
-
-
 async def monitor_positions():
     while True:
         try:
             still_open = []
 
             for pos in STATE["positions"]:
-                current_price = fake_price_walk(pos["entry_price"])
+                current_price = await get_real_price(pos["token"])
+
+                if current_price is None:
+                    still_open.append(pos)
+                    continue
+
                 pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
 
                 pos["last_price"] = current_price
@@ -203,6 +234,7 @@ async def monitor_positions():
 
         await asyncio.sleep(3)
 
+
 async def bot_loop():
     while True:
         try:
@@ -242,7 +274,11 @@ async def bot_loop():
                     continue
 
                 size = min(0.01, 0.1 / (len(STATE["positions"]) + 1))
-                entry_price = round(random.uniform(0.00001, 0.00002), 8)
+
+                entry_price = await get_real_price(mint)
+                if entry_price is None:
+                    STATE["last_action"] = f"entry_price_fail:{mint}"
+                    continue
 
                 STATE["positions"].append({
                     "token": mint,
@@ -304,6 +340,7 @@ async def metrics():
         "signals": STATE["signals"],
         "errors": STATE["errors"],
         "last_action": STATE["last_action"],
+        "last_alpha": STATE["last_alpha"],
         "candidates": STATE["candidates"],
         "scanner_mode": STATE.get("scanner_mode"),
         "scanner_error": STATE.get("scanner_error"),
