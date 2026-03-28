@@ -244,7 +244,10 @@ def dashboard():
     """
 
 # ================= API =================
-app = FastAPI(lifespan=lifespan)
+
+app = FastAPI()
+app.router.lifespan_context = lifespan
+
 bot_task = None
 
 @asynccontextmanager
