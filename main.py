@@ -16,6 +16,7 @@ STATE = {
     "scanner_error": None,
     "dex_pairs": 0,
     "realized_pnl": 0.0,
+    "last_alpha": None,
 }
 
 MAX_POSITIONS = 3
