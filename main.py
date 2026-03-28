@@ -272,7 +272,8 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            # reset daily
+            STATE["bot_version"] = "alpha20_v2"
+
             now = time.time()
             if now - STATE["last_reset"] > 86400:
                 STATE["daily_trades"] = 0
@@ -287,25 +288,23 @@ async def bot_loop():
             await monitor_positions()
 
             for mint in tokens:
-
                 if STATE["daily_trades"] >= MAX_DAILY_TRADES:
                     STATE["last_action"] = "daily_limit_hit"
                     break
 
                 if len(STATE["positions"]) >= MAX_POSITIONS:
+                    STATE["last_action"] = "position_limit"
                     break
 
                 if has_position(mint):
+                    STATE["last_action"] = f"already_have:{mint}"
                     continue
 
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                if alpha < 120:
+                if alpha < 20:
                     STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
-                    continue
-
-                if mint.startswith("TEST_"):
                     continue
 
                 result = await simulate_buy(mint, 0.01)
@@ -317,9 +316,12 @@ async def bot_loop():
                     "alpha": alpha,
                     "size": result["size"],
                     "entry_price": result["fill_price"],
+                    "mark_price": result["mark_price"],
+                    "last_price": result["fill_price"],
                     "token_qty": result["token_qty"],
                     "entry_time": time.time(),
-                    "entry_gas_cost": GAS_COST
+                    "entry_gas_cost": result["gas_cost"],
+                    "pnl_pct": 0.0,
                 })
 
                 STATE["daily_trades"] += 1
@@ -369,4 +371,5 @@ async def metrics():
         "scanner_mode": STATE.get("scanner_mode"),
         "scanner_error": STATE.get("scanner_error"),
         "last_alpha": STATE.get("last_alpha"),
+        "bot_version": STATE.get("bot_version"),
     }
