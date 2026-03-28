@@ -1,12 +1,6 @@
 fastapi
-uvicorn[standard]
-httpx
-websockets
-numpy
-base58
-pynacl
-python-dotenv
-fastapi
+uvicorn
 aiohttp
-solana
-solders
+streamlit
+pandas
+plotly
