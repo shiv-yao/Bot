@@ -23,9 +23,11 @@ STATE = {
     "scanner_mode": None,
     "scanner_error": None,
     "last_alpha": None,
-    "bot_version": "alpha_dual_engine_v3",
+    "bot_version": "alpha_dual_engine_v3_risk_tuned",
     "candidate_count": 0,
 }
+
+# ================= CONFIG =================
 
 MAX_POSITIONS = 4
 MAX_DAILY_TRADES = 20
@@ -33,8 +35,9 @@ MAX_HOLD_SECONDS = 120
 BASE_FAIL_RATE = 0.05
 GAS_COST = 0.000005
 
-STOP_LOSS = -0.20
-TAKE_PROFIT = 0.50
+BASE_SIZE = 0.003
+STOP_LOSS = -0.10
+TAKE_PROFIT = 0.20
 DAILY_STOP = -0.03
 
 # ================= HELPERS =================
@@ -207,6 +210,7 @@ async def scan_tokens():
 
 async def simulate_buy(mint: str, size: float):
     try:
+        # 模擬成交，保證系統能測試完整流程
         price = random.uniform(0.00001, 0.00002)
         token_qty = size / price
 
@@ -323,7 +327,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha_dual_engine_v3"
+            STATE["bot_version"] = "alpha_dual_engine_v3_risk_tuned"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -404,7 +408,7 @@ async def bot_loop():
                     STATE["last_action"] = f"stable_alpha_skip:{mint}:{alpha}"
                     continue
 
-                exec_result = await simulate_buy(mint, 0.01)
+                exec_result = await simulate_buy(mint, 0.006)
                 if not exec_result:
                     continue
 
@@ -461,7 +465,7 @@ async def bot_loop():
                     STATE["last_action"] = f"degen_alpha_skip:{mint}:{alpha}"
                     continue
 
-                exec_result = await simulate_buy(mint, 0.005)
+                exec_result = await simulate_buy(mint, 0.002)
                 if not exec_result:
                     continue
 
