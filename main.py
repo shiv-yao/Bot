@@ -1,4 +1,4 @@
-# v47_fund_accounting_full
+# v46_infra_hardened
 
 import asyncio
 import random
@@ -25,9 +25,8 @@ MAX_POSITIONS = 5
 MAX_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
-TAKE_PROFIT = 0.3
-
 KILL_SWITCH = 5
+
 BASE_SLIPPAGE = 150
 
 # ================= KEY =================
@@ -50,22 +49,15 @@ SESSION = None
 
 STATE = {
     "positions": [],
-    "trade_log": [],
-    "equity_curve": [],
-    "balance": 1.0,
-    "peak_balance": 1.0,
-    "max_drawdown": 0.0,
-
+    "wallet_history": [],
     "flow_history": [],
     "realized_pnl": 0.0,
     "loss_streak": 0,
-
     "errors": 0,
     "last_error": None,
     "kill": False,
     "last_heartbeat": time.time(),
-
-    "bot_version": "v47_fund_accounting"
+    "bot_version": "v46_infra_hardened"
 }
 
 # ================= SAFE =================
@@ -88,6 +80,24 @@ async def safe_post(url, data):
         STATE["last_error"] = str(e)
         return None
 
+# ================= WALLET INTEL =================
+
+async def fetch_wallets():
+    return [
+        {
+            "winrate": random.uniform(0.4,0.8),
+            "pnl": random.uniform(-1,1),
+            "size": random.uniform(0,1)
+        }
+        for _ in range(10)
+    ]
+
+def wallet_score(wallets):
+    return sum(
+        w["winrate"]*0.5 + w["pnl"]*0.3 + w["size"]*0.2
+        for w in wallets
+    ) / len(wallets)
+
 # ================= FLOW =================
 
 async def update_flow():
@@ -105,69 +115,14 @@ def flow_acceleration():
 # ================= ALPHA =================
 
 async def compute_alpha():
-    flow = random.uniform(0,1)
+    wallets = await fetch_wallets()
+    flow = wallet_score(wallets)
 
     accel = flow_acceleration()
     mem = random.uniform(0,1)
     launch = random.random() < 0.1
 
     return flow*50 + accel*80 + mem*60 + (80 if launch else 0)
-
-# ================= ACCOUNTING =================
-
-def record_trade(entry, exit, size, alpha):
-    pnl = (exit - entry) * size
-    pnl_pct = pnl / (entry * size)
-
-    STATE["realized_pnl"] += pnl
-    STATE["balance"] += pnl
-
-    STATE["equity_curve"].append({
-        "time": time.time(),
-        "balance": STATE["balance"]
-    })
-
-    STATE["peak_balance"] = max(STATE["peak_balance"], STATE["balance"])
-
-    dd = (STATE["peak_balance"] - STATE["balance"]) / STATE["peak_balance"]
-    STATE["max_drawdown"] = max(STATE["max_drawdown"], dd)
-
-    STATE["trade_log"].append({
-        "entry": entry,
-        "exit": exit,
-        "pnl": pnl,
-        "pnl_pct": pnl_pct,
-        "alpha": alpha,
-        "time": time.time()
-    })
-
-    if pnl > 0:
-        STATE["loss_streak"] = 0
-    else:
-        STATE["loss_streak"] += 1
-
-# ================= POSITION UPDATE =================
-
-async def update_positions():
-    new_positions = []
-
-    for pos in STATE["positions"]:
-        price = pos["entry_price"] * random.uniform(0.7, 1.5)
-
-        pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
-
-        if pnl_pct < STOP_LOSS or pnl_pct > TAKE_PROFIT:
-            record_trade(
-                pos["entry_price"],
-                price,
-                1,
-                pos["alpha"]
-            )
-            continue
-
-        new_positions.append(pos)
-
-    STATE["positions"] = new_positions
 
 # ================= JUP =================
 
@@ -244,6 +199,7 @@ async def execute_real(amount, alpha):
 async def bot_loop():
     while True:
         try:
+            # 🔥 kill switch
             if STATE["kill"]:
                 await asyncio.sleep(2)
                 continue
@@ -253,7 +209,6 @@ async def bot_loop():
                 continue
 
             await update_flow()
-            await update_positions()
 
             for _ in range(5):
                 if len(STATE["positions"]) >= MAX_POSITIONS:
@@ -282,6 +237,7 @@ async def bot_loop():
             STATE["errors"] += 1
             STATE["last_error"] = str(e)
 
+        # 🔥 heartbeat（Railway 保活）
         STATE["last_heartbeat"] = time.time()
 
         await asyncio.sleep(1)
@@ -312,21 +268,19 @@ def root():
 def metrics():
     return STATE
 
-@app.get("/analytics")
-def analytics():
-    trades = STATE["trade_log"]
-
-    if not trades:
-        return {"msg": "no trades"}
-
-    wins = [t for t in trades if t["pnl"] > 0]
-
+@app.get("/health")
+def health():
     return {
-        "trades": len(trades),
-        "winrate": len(wins)/len(trades),
+        "status": "alive",
+        "errors": STATE["errors"]
+    }
+
+@app.get("/status")
+def status():
+    return {
+        "positions": len(STATE["positions"]),
         "pnl": STATE["realized_pnl"],
-        "balance": STATE["balance"],
-        "max_drawdown": STATE["max_drawdown"]
+        "heartbeat": STATE["last_heartbeat"]
     }
 
 @app.post("/kill")
