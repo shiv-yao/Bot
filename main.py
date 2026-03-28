@@ -1,4 +1,4 @@
-# v45_onchain_intelligence
+# v48_alpha_brain_dashboard
 
 import asyncio
 import random
@@ -9,6 +9,7 @@ import os
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
@@ -25,13 +26,17 @@ MAX_POSITIONS = 5
 MAX_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
-KILL_SWITCH = 5
+TAKE_PROFIT = 0.3
 
+KILL_SWITCH = 5
 BASE_SLIPPAGE = 150
 
 # ================= KEY =================
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+
+if not PRIVATE_KEY:
+    raise RuntimeError("PRIVATE_KEY not set")
 
 if PRIVATE_KEY.startswith("["):
     keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
@@ -46,12 +51,24 @@ SESSION = None
 
 STATE = {
     "positions": [],
-    "wallet_history": [],
+    "trade_log": [],
+    "equity_curve": [],
+    "balance": 1.0,
+    "peak_balance": 1.0,
+    "max_drawdown": 0.0,
+
+    "alpha_memory": [],
+
     "flow_history": [],
     "realized_pnl": 0.0,
     "loss_streak": 0,
+
     "errors": 0,
-    "bot_version": "v45_onchain_intelligence"
+    "last_error": None,
+    "kill": False,
+    "last_heartbeat": time.time(),
+
+    "bot_version": "v48_alpha_brain_dashboard"
 }
 
 # ================= SAFE =================
@@ -70,30 +87,6 @@ async def safe_post(url, data):
     except:
         return None
 
-# ================= WALLET INTEL =================
-
-async def fetch_wallets():
-    # 👉 未接 API → 模擬
-    wallets = []
-
-    for _ in range(10):
-        wallets.append({
-            "winrate": random.uniform(0.4,0.8),
-            "pnl": random.uniform(-1,1),
-            "size": random.uniform(0,1)
-        })
-
-    return wallets
-
-def wallet_score(wallets):
-    scores = []
-
-    for w in wallets:
-        score = w["winrate"]*0.5 + w["pnl"]*0.3 + w["size"]*0.2
-        scores.append(score)
-
-    return sum(scores)/len(scores)
-
 # ================= FLOW =================
 
 async def update_flow():
@@ -106,118 +99,106 @@ async def update_flow():
 def flow_acceleration():
     if len(STATE["flow_history"]) < 2:
         return 0
-
     return STATE["flow_history"][-1] - STATE["flow_history"][-2]
 
-# ================= MEMPOOL =================
+# ================= ALPHA AI =================
 
-def mempool_pressure():
-    return random.uniform(0,1)
+def alpha_edge(alpha):
+    mem = STATE["alpha_memory"]
 
-# ================= LAUNCH =================
+    if not mem:
+        return 1.0
 
-def detect_launch():
-    return random.random() < 0.1
+    similar = [p for a,p in mem if abs(a-alpha)<10]
 
-# ================= ALPHA =================
+    if not similar:
+        return 1.0
+
+    avg = sum(similar)/len(similar)
+
+    return max(0.5, min(2.0, 1 + avg*5))
 
 async def compute_alpha():
-    wallets = await fetch_wallets()
-    flow = wallet_score(wallets)
+    flow = random.uniform(0,1)
 
     accel = flow_acceleration()
-    mem = mempool_pressure()
-    launch = detect_launch()
+    mem = random.uniform(0,1)
+    launch = random.random() < 0.1
 
-    alpha = (
-        flow * 50 +
-        accel * 80 +
-        mem * 60 +
-        (80 if launch else 0)
-    )
+    base = flow*50 + accel*80 + mem*60 + (80 if launch else 0)
 
-    return alpha
+    return base * alpha_edge(base)
 
-# ================= JUP =================
+# ================= ACCOUNTING =================
 
-async def get_quote(amount, slippage):
-    url = (
-        f"{JUP_API}/v6/quote"
-        f"?inputMint=So11111111111111111111111111111111111111112"
-        f"&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        f"&amount={int(amount*1e9)}"
-        f"&slippageBps={slippage}"
-    )
-    return await safe_get(url)
+def record_trade(entry, exit, size, alpha):
+    pnl = (exit - entry) * size
 
-async def get_swap(route):
-    return await safe_post(
-        f"{JUP_API}/v6/swap",
-        {
-            "quoteResponse": route,
-            "userPublicKey": str(keypair.pubkey()),
-            "wrapAndUnwrapSol": True
-        }
-    )
+    STATE["realized_pnl"] += pnl
+    STATE["balance"] += pnl
 
-# ================= JITO =================
+    STATE["equity_curve"].append({
+        "time": time.time(),
+        "balance": STATE["balance"]
+    })
 
-async def send_bundle_multi(tx):
-    bundle = {
-        "jsonrpc":"2.0",
-        "id":1,
-        "method":"sendBundle",
-        "params":[{"transactions":[tx],"encoding":"base64"}]
-    }
+    STATE["peak_balance"] = max(STATE["peak_balance"], STATE["balance"])
 
-    tasks = [safe_post(url, bundle) for url in JITO_ENDPOINTS]
-    results = await asyncio.gather(*tasks)
+    dd = (STATE["peak_balance"] - STATE["balance"]) / STATE["peak_balance"]
+    STATE["max_drawdown"] = max(STATE["max_drawdown"], dd)
 
-    for r in results:
-        if r and "result" in r:
-            return r["result"]
+    STATE["trade_log"].append({
+        "entry": entry,
+        "exit": exit,
+        "pnl": pnl,
+        "alpha": alpha
+    })
 
-    return None
+    STATE["alpha_memory"].append((alpha, pnl))
+
+    if pnl > 0:
+        STATE["loss_streak"] = 0
+    else:
+        STATE["loss_streak"] += 1
+
+# ================= POSITION =================
+
+async def update_positions():
+    new_positions = []
+
+    for pos in STATE["positions"]:
+        price = pos["entry_price"] * random.uniform(0.7,1.5)
+
+        pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
+
+        if pnl_pct < STOP_LOSS or pnl_pct > TAKE_PROFIT:
+            record_trade(pos["entry_price"], price, 1, pos["alpha"])
+            continue
+
+        new_positions.append(pos)
+
+    STATE["positions"] = new_positions
 
 # ================= EXEC =================
 
 async def execute_real(amount, alpha):
-    slippage = BASE_SLIPPAGE + int(alpha*2)
-
-    quote = await get_quote(amount, slippage)
-
-    if not quote or "data" not in quote or not quote["data"]:
-        return None
-
-    route = quote["data"][0]
-
-    swap = await get_swap(route)
-
-    if not swap or "swapTransaction" not in swap:
-        return None
-
-    tx = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
-    tx.sign([keypair])
-
-    raw = base64.b64encode(bytes(tx)).decode()
-
-    sig = await send_bundle_multi(raw)
-
-    if sig:
-        return float(route["outAmount"]) / float(route["inAmount"])
-
-    return None
+    return random.uniform(0.00001,0.00002)
 
 # ================= LOOP =================
 
 async def bot_loop():
     while True:
         try:
+            if STATE["kill"]:
+                await asyncio.sleep(2)
+                continue
+
             if STATE["loss_streak"] >= KILL_SWITCH:
                 await asyncio.sleep(5)
                 continue
 
             await update_flow()
+            await update_positions()
 
             for _ in range(5):
                 if len(STATE["positions"]) >= MAX_POSITIONS:
@@ -232,20 +213,35 @@ async def bot_loop():
 
                 price = await execute_real(size, alpha)
 
-                if not price:
-                    continue
-
                 STATE["positions"].append({
-                    "token": f"TOKEN{random.randint(1,9999)}",
                     "entry_price": price,
-                    "alpha": alpha,
-                    "time": time.time()
+                    "alpha": alpha
                 })
 
         except Exception as e:
             STATE["errors"] += 1
+            STATE["last_error"] = str(e)
+
+        STATE["last_heartbeat"] = time.time()
 
         await asyncio.sleep(1)
+
+# ================= DASHBOARD =================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return f"""
+    <html>
+    <body style="background:black;color:#00ffcc;font-family:monospace">
+    <h1>🚀 FUND DASHBOARD</h1>
+    <p>Balance: {STATE["balance"]:.4f}</p>
+    <p>PnL: {STATE["realized_pnl"]:.4f}</p>
+    <p>Drawdown: {STATE["max_drawdown"]:.2%}</p>
+    <p>Positions: {len(STATE["positions"])}</p>
+    <p>Trades: {len(STATE["trade_log"])}</p>
+    </body>
+    </html>
+    """
 
 # ================= API =================
 
@@ -272,3 +268,13 @@ def root():
 @app.get("/metrics")
 def metrics():
     return STATE
+
+@app.post("/kill")
+def kill():
+    STATE["kill"] = True
+    return {"ok": True}
+
+@app.post("/resume")
+def resume():
+    STATE["kill"] = False
+    return {"ok": True}
