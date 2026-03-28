@@ -177,14 +177,23 @@ async def scan_tokens():
 
             if r.status_code == 200:
                 data = r.json()
-                pairs = data.get("pairs", [])[:20]
+                pairs = data.get("pairs", [])[:30]
 
                 for p in pairs:
+                    chain = p.get("chainId")
                     mint = p.get("baseToken", {}).get("address")
-                    if mint:
-                        tokens.append(mint)
 
-                STATE["scanner_mode"] = "dexscreener"
+                    # ✅ 只留 Solana
+                    if chain != "solana":
+                        continue
+
+                    # ✅ 過濾奇怪地址（非 mint）
+                    if not mint or len(mint) < 32:
+                        continue
+
+                    tokens.append(mint)
+
+                STATE["scanner_mode"] = "dexscreener_filtered"
                 STATE["scanner_error"] = None
 
     except Exception as e:
@@ -314,7 +323,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha100_slipcheck_v1"
+            STATE["bot_version"] = "alpha60_fallbackbuy_v2"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -346,19 +355,36 @@ async def bot_loop():
                     STATE["last_action"] = f"already_have:{mint}"
                     continue
 
+                # =========================
+                # 防垃圾 token / 非 Solana weird address
+                # =========================
+                if not mint or len(mint) < 32:
+                    STATE["last_action"] = f"bad_mint:{mint}"
+                    continue
+
+                if any(c in mint for c in [".", "/", ":"]):
+                    STATE["last_action"] = f"weird_mint:{mint}"
+                    continue
+
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                if alpha < 80:
-                    STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
-                    continue
+                # 如果今天還沒開過單，稍微放寬，避免完全不出手
+                if STATE["daily_trades"] == 0 and alpha > 30:
+                    STATE["last_action"] = f"fallback_buy:{mint}:{alpha}"
+                else:
+                    if alpha < 60:
+                        STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
+                        continue
 
                 exec_result = await simulate_buy(mint, 0.01)
                 if not exec_result:
                     continue
 
                 if exec_result["slippage"] > 0.01:
-                    STATE["last_action"] = f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
+                    STATE["last_action"] = (
+                        f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
+                    )
                     continue
 
                 STATE["positions"].append({
