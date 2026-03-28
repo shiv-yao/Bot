@@ -6,3 +6,7 @@ numpy
 base58
 pynacl
 python-dotenv
+fastapi
+aiohttp
+solana
+solders
