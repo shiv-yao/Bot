@@ -5,7 +5,7 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"ok": True, "msg": "THIS IS MAIN.PY"}
+    return {"ok": True, "status": "running"}
 
 @app.get("/health")
 async def health():
@@ -14,3 +14,11 @@ async def health():
 @app.get("/data")
 async def data():
     return JSONResponse({"ok": True, "status": "running"})
+
+@app.get("/metrics")
+async def metrics():
+    return {
+        "positions": [],
+        "signals": 0,
+        "errors": 0
+    }
