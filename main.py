@@ -259,35 +259,32 @@ async def simulate_sell(position: dict):
 # ================= MONITOR =================
 
 async def monitor_positions():
-    for pos in STATE["positions"][:]:
-        quote = await get_quote(pos["token"])
-        if not quote:
+    new_positions = []
+
+    for pos in STATE["positions"]:
+        result = await simulate_sell(pos)
+        if not result:
+            new_positions.append(pos)
             continue
 
-        price = quote["price"]
-        pos["last_price"] = price
+        pos["mark_price"] = result["price"]
+        pos["pnl_pct"] = result["pnl_pct"]
 
-        entry = pos["entry_price"]
-        pnl_pct = (price - entry) / entry
-        pos["pnl_pct"] = pnl_pct
+        # 🔴 Stop Loss
+        if pos["pnl_pct"] < -0.2:
+            STATE["closed_trades"].append(pos)
+            STATE["last_action"] = f"stop_loss:{pos['token']}"
+            continue
 
-        hold_time = time.time() - pos["entry_time"]
+        # 🟢 Take Profit
+        if pos["pnl_pct"] > 0.5:
+            STATE["closed_trades"].append(pos)
+            STATE["last_action"] = f"take_profit:{pos['token']}"
+            continue
 
-        reason = None
+        new_positions.append(pos)
 
-        if pnl_pct > 0.1:
-            reason = "take_profit"
-        elif pnl_pct < -0.05:
-            reason = "stop_loss"
-        elif hold_time > MAX_HOLD_SECONDS:
-            reason = "timeout_exit"
-
-        if reason:
-            result = await simulate_sell(pos, reason)
-            if result:
-                STATE["closed_trades"].append(result)
-                STATE["positions"].remove(pos)
-                STATE["realized_pnl"] += result["net_pnl"]
+    STATE["positions"] = new_positions
 
 # ================= BOT LOOP =================
 
