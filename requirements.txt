@@ -5,3 +5,4 @@ websockets
 numpy
 base58
 pynacl
+python-dotenv
