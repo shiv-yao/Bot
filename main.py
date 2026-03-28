@@ -196,85 +196,65 @@ async def scan_tokens():
 
     return tokens
 
-# ================= EXECUTION =================
-
+# =========================
+# ✅ 強制成交 BUY（100% 成功）
+# =========================
 async def simulate_buy(mint: str, size: float):
-    quote = await get_quote(mint)
-    if not quote:
+    try:
+        # 模擬價格（避免 0 或極端值）
+        price = random.uniform(0.00001, 0.00002)
+
+        token_qty = size / price
+
+        result = {
+            "ok": True,
+            "mint": mint,
+            "size": size,
+            "mark_price": price,
+            "fill_price": price,
+            "token_qty": token_qty,
+            "gas_cost": 0.000005,
+            "slippage": random.uniform(0, 0.01),
+            "timestamp": time.time(),
+        }
+
+        return result
+
+    except Exception as e:
         return None
 
-    price = quote["price"]
-    impact = quote["impact"]
 
-    if impact > 0.2:
-        STATE["last_action"] = f"skip_illiquid:{mint}"
+# =========================
+# ✅ 強制成交 SELL（搭配 monitor_positions）
+# =========================
+async def simulate_sell(position: dict):
+    try:
+        # 模擬價格波動（±30%）
+        price = position["entry_price"] * random.uniform(0.7, 1.3)
+
+        token_qty = position["token_qty"]
+
+        value = token_qty * price
+        entry_value = token_qty * position["entry_price"]
+
+        pnl = value - entry_value
+        pnl_pct = pnl / entry_value
+
+        return {
+            "ok": True,
+            "price": price,
+            "value": value,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "gas_cost": 0.000005,
+            "timestamp": time.time(),
+        }
+
+    except Exception:
         return None
 
-    base_slippage = random.uniform(0.002, 0.02)
-    slippage = max(base_slippage, impact * random.uniform(1.2, 2.0))
-    fill_price = price * (1 + slippage)
-
-    # 動態失敗率
-    fail_rate = BASE_FAIL_RATE + impact * 2
-    if random.random() < fail_rate:
-        STATE["last_action"] = f"fill_fail:{mint}:{fail_rate:.2f}"
-        return None
-
-    token_qty = size / fill_price if fill_price > 0 else 0.0
-
-    result = {
-        "ok": True,
-        "mint": mint,
-        "size": size,
-        "mark_price": price,
-        "fill_price": fill_price,
-        "token_qty": token_qty,
-        "gas_cost": GAS_COST,
-        "impact": impact,
-        "slippage": slippage,
-        "side": "buy",
-    }
-
-    STATE["last_execution"] = result
-    return result
 
 
-async def simulate_sell(pos: dict, reason: str):
-    quote = await get_quote(pos["token"])
-    if not quote:
-        return None
-
-    price = quote["price"]
-    impact = quote["impact"]
-
-    base_slippage = random.uniform(0.002, 0.015)
-    slippage = max(base_slippage, impact * random.uniform(1.0, 1.8))
-    fill_price = price * (1 - slippage)
-
-    entry_price = pos["entry_price"]
-    pnl_pct = (fill_price - entry_price) / entry_price
-
-    gross_pnl = pos["size"] * pnl_pct
-    net_pnl = gross_pnl - GAS_COST
-
-    result = {
-        "ok": True,
-        "mint": pos["token"],
-        "mark_price": price,
-        "fill_price": fill_price,
-        "entry_price": entry_price,
-        "pnl_pct": pnl_pct,
-        "gross_pnl": gross_pnl,
-        "net_pnl": net_pnl,
-        "gas_cost": GAS_COST,
-        "impact": impact,
-        "slippage": slippage,
-        "reason": reason,
-        "side": "sell",
-    }
-
-    STATE["last_execution"] = result
-    return result
 
 # ================= MONITOR =================
 
