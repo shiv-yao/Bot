@@ -314,7 +314,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha60_liquiditycheck_v1"
+            STATE["bot_version"] = "alpha15_fallback10_v1"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -346,7 +346,6 @@ async def bot_loop():
                     STATE["last_action"] = f"already_have:{mint}"
                     continue
 
-                # 防垃圾 token / weird address
                 if not mint or len(mint) < 32:
                     STATE["last_action"] = f"bad_mint:{mint}"
                     continue
@@ -355,7 +354,7 @@ async def bot_loop():
                     STATE["last_action"] = f"weird_mint:{mint}"
                     continue
 
-                # Jupiter liquidity / route check
+                # 先做 route / liquidity check
                 try:
                     async with httpx.AsyncClient(timeout=4) as client:
                         r = await client.get(
@@ -373,7 +372,6 @@ async def bot_loop():
                             continue
 
                         q = r.json()
-
                         if int(q.get("outAmount", 0) or 0) <= 0:
                             STATE["last_action"] = f"no_liquidity:{mint}"
                             continue
@@ -385,6 +383,7 @@ async def bot_loop():
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
+                # 第一筆單放寬
                 if STATE["daily_trades"] == 0 and alpha > 10:
                     STATE["last_action"] = f"fallback_buy:{mint}:{alpha}"
                 else:
@@ -397,9 +396,7 @@ async def bot_loop():
                     continue
 
                 if exec_result["slippage"] > 0.01:
-                    STATE["last_action"] = (
-                        f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
-                    )
+                    STATE["last_action"] = f"slippage_skip:{mint}:{exec_result['slippage']:.4f}"
                     continue
 
                 STATE["positions"].append({
