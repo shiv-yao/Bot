@@ -94,7 +94,7 @@ async def real_alpha(mint: str) -> float:
 async def get_real_price(mint: str):
     try:
         sol = "So11111111111111111111111111111111111111112"
-        amount_in = 1_000_000  # 0.001 SOL
+        amount_in = 10_000_000  # 0.001 SOL
 
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -236,7 +236,7 @@ async def monitor_positions():
             STATE["errors"] += 1
             STATE["last_action"] = f"monitor_error:{str(e)}"
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
 
 async def bot_loop():
