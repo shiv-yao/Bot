@@ -323,7 +323,7 @@ async def monitor_positions():
 async def bot_loop():
     while True:
         try:
-            STATE["bot_version"] = "alpha60_fallbackbuy_v2"
+            STATE["bot_version"] = "alpha60_liquiditycheck_v1"
 
             now = time.time()
             if now - STATE["last_reset"] > 86400:
@@ -355,9 +355,7 @@ async def bot_loop():
                     STATE["last_action"] = f"already_have:{mint}"
                     continue
 
-                # =========================
-                # 防垃圾 token / 非 Solana weird address
-                # =========================
+                # 防垃圾 token / weird address
                 if not mint or len(mint) < 32:
                     STATE["last_action"] = f"bad_mint:{mint}"
                     continue
@@ -366,10 +364,36 @@ async def bot_loop():
                     STATE["last_action"] = f"weird_mint:{mint}"
                     continue
 
+                # Jupiter liquidity / route check
+                try:
+                    async with httpx.AsyncClient(timeout=4) as client:
+                        r = await client.get(
+                            "https://lite-api.jup.ag/swap/v1/quote",
+                            params={
+                                "inputMint": "So11111111111111111111111111111111111111112",
+                                "outputMint": mint,
+                                "amount": 1000000,
+                                "slippageBps": 100,
+                            },
+                        )
+
+                        if r.status_code != 200:
+                            STATE["last_action"] = f"no_route:{mint}"
+                            continue
+
+                        q = r.json()
+
+                        if int(q.get("outAmount", 0) or 0) <= 0:
+                            STATE["last_action"] = f"no_liquidity:{mint}"
+                            continue
+
+                except Exception:
+                    STATE["last_action"] = f"quote_fail:{mint}"
+                    continue
+
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                # 如果今天還沒開過單，稍微放寬，避免完全不出手
                 if STATE["daily_trades"] == 0 and alpha > 30:
                     STATE["last_action"] = f"fallback_buy:{mint}:{alpha}"
                 else:
