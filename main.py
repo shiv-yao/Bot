@@ -247,9 +247,10 @@ def dashboard():
 
 bot_task = None
 
+# 1️⃣ 先定義 lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_task, SESSION
+    global SESSION, bot_task
 
     SESSION = aiohttp.ClientSession()
     bot_task = asyncio.create_task(bot_loop())
@@ -259,6 +260,8 @@ async def lifespan(app: FastAPI):
     await SESSION.close()
     bot_task.cancel()
 
+
+# 2️⃣ 再宣告 app
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
