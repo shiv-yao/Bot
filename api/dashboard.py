@@ -1,85 +1,120 @@
-import streamlit as st
+import os
+import time
 import requests
 import pandas as pd
-import plotly.express as px
+import streamlit as st
 
-# 👉 改成你的 API
-API_URL = "https://你的-railway-url/metrics"
+API_BASE = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
 
-st.set_page_config(layout="wide")
+st.set_page_config(
+    page_title="V90 Fund System",
+    layout="wide",
+)
 
-st.title("🚀 Trading AI Dashboard (Fund Level)")
+st.title("💀 V90 Fund System")
+st.caption("Fund-style control panel for your FastAPI trading backend")
 
-# ================= FETCH =================
-
-def fetch():
+def fetch_json(path: str):
+    url = f"{API_BASE}{path}"
     try:
-        return requests.get(API_URL).json()
-    except:
-        return None
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
 
-data = fetch()
+with st.sidebar:
+    st.header("Connection")
+    st.write(f"API: `{API_BASE}`")
+    refresh_sec = st.slider("Refresh (sec)", min_value=1, max_value=30, value=3)
 
-if not data:
-    st.error("API 無法連線")
-    st.stop()
+placeholder = st.empty()
 
-# ================= SUMMARY =================
+while True:
+    metrics, metrics_err = fetch_json("/metrics")
+    brain, brain_err = fetch_json("/brain")
 
-col1, col2, col3, col4 = st.columns(4)
+    with placeholder.container():
+        if metrics_err or brain_err:
+            st.error(f"API error: {metrics_err or brain_err}")
+        else:
+            positions = metrics.get("positions", [])
+            closed = metrics.get("closed", [])
+            alpha_scores = metrics.get("alpha_scores", [])
+            allocator = metrics.get("allocator", {})
+            alpha_models = brain.get("alpha_models", {})
+            daily_pnl = metrics.get("daily_pnl", 0)
+            loss_streak = metrics.get("loss_streak", 0)
+            daily_trades = metrics.get("daily_trades", 0)
+            last_error = metrics.get("last_error")
 
-col1.metric("PnL", round(data["realized_pnl"], 4))
-col2.metric("Positions", len(data["positions"]))
-col3.metric("Errors", data["errors"])
-col4.metric("Version", data["bot_version"])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Daily PnL", f"{daily_pnl:.4f}")
+            c2.metric("Open Positions", len(positions))
+            c3.metric("Daily Trades", daily_trades)
+            c4.metric("Loss Streak", loss_streak)
 
-# ================= POSITIONS =================
+            left, right = st.columns([2, 1])
 
-st.subheader("📌 Open Positions")
+            with left:
+                st.subheader("Alpha Curve")
+                if alpha_scores:
+                    df_alpha = pd.DataFrame({"alpha": alpha_scores})
+                    st.line_chart(df_alpha, height=260)
+                else:
+                    st.info("No alpha data yet.")
 
-if data["positions"]:
-    df = pd.DataFrame(data["positions"])
-    st.dataframe(df, use_container_width=True)
-else:
-    st.info("No positions")
+            with right:
+                st.subheader("Allocator")
+                if allocator:
+                    df_alloc = pd.DataFrame(
+                        {"source": list(allocator.keys()), "weight": list(allocator.values())}
+                    ).set_index("source")
+                    st.bar_chart(df_alloc, height=260)
+                else:
+                    st.info("No allocator data yet.")
 
-# ================= CLOSED =================
+            st.subheader("Alpha Models")
+            if alpha_models:
+                rows = []
+                for name, model in alpha_models.items():
+                    hist = model.get("history", [])
+                    rows.append({
+                        "model": name,
+                        "score": model.get("score", 0),
+                        "samples": len(hist),
+                        "avg_pnl": (sum(hist) / len(hist)) if hist else 0,
+                        "winrate": (sum(1 for x in hist if x > 0) / len(hist)) if hist else 0,
+                    })
+                df_models = pd.DataFrame(rows).set_index("model")
+                st.dataframe(df_models, use_container_width=True)
+            else:
+                st.info("No alpha model data yet.")
 
-st.subheader("💰 Closed Trades")
+            col_a, col_b = st.columns(2)
 
-if "closed_trades" in data and data["closed_trades"]:
-    df = pd.DataFrame(data["closed_trades"])
+            with col_a:
+                st.subheader("Open Positions")
+                if positions:
+                    df_pos = pd.DataFrame(positions)
+                    st.dataframe(df_pos, use_container_width=True, height=320)
+                else:
+                    st.info("No open positions.")
 
-    st.dataframe(df, use_container_width=True)
+            with col_b:
+                st.subheader("Closed Positions")
+                if closed:
+                    df_closed = pd.DataFrame(closed[-30:])
+                    st.dataframe(df_closed, use_container_width=True, height=320)
+                else:
+                    st.info("No closed positions yet.")
 
-    if "pnl" in df:
-        fig = px.histogram(df, x="pnl", nbins=30, title="PnL Distribution")
-        st.plotly_chart(fig, use_container_width=True)
+            st.subheader("System Status")
+            st.json({
+                "last_error": last_error,
+                "api_base": API_BASE,
+                "positions": len(positions),
+                "closed_count": len(closed),
+            })
 
-# ================= EQUITY =================
-
-st.subheader("📈 Equity Curve")
-
-if "closed_trades" in data and data["closed_trades"]:
-    pnl_series = [t["pnl"] for t in data["closed_trades"] if "pnl" in t]
-
-    if pnl_series:
-        equity = pd.Series(pnl_series).cumsum()
-
-        fig = px.line(equity, title="Equity Curve")
-        st.plotly_chart(fig, use_container_width=True)
-
-# ================= RISK =================
-
-st.subheader("⚠️ Risk Monitor")
-
-if data["loss_streak"] >= 3:
-    st.warning(f"⚠️ Loss streak: {data['loss_streak']}")
-
-if data["loss_streak"] >= 5:
-    st.error("🚨 Kill switch zone")
-
-# ================= RAW =================
-
-with st.expander("🔍 Raw JSON"):
-    st.json(data)
+    time.sleep(refresh_sec)
