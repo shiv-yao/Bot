@@ -14,24 +14,27 @@ STATE = {
 MAX_POSITIONS = 3
 
 
+import httpx
+
 async def scan_tokens():
-    # 先用假資料測流程，之後再換真 scanner
-    sample = [
-        "TOKEN_A",
-        "TOKEN_B",
-        "TOKEN_C",
-        "TOKEN_D",
-    ]
-    random.shuffle(sample)
-    return sample[:2]
+    tokens = []
 
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get("https://frontend-api.pump.fun/coins")
 
-def has_position(mint: str) -> bool:
-    return any(p["token"] == mint for p in STATE["positions"])
+            if r.status_code == 200:
+                data = r.json()
 
+                for item in data[:10]:
+                    mint = item.get("mint")
+                    if mint:
+                        tokens.append(mint)
 
-def fake_alpha(mint: str) -> float:
-    return random.uniform(80, 180)
+    except Exception:
+        pass
+
+    return tokens
 
 
 async def bot_loop():
