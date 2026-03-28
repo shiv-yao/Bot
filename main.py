@@ -273,4 +273,3 @@ def root():
 def metrics():
     return STATE
 
-📊「實盤監控 + 控制台（基金級 UI）」
