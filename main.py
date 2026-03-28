@@ -96,53 +96,63 @@ async def real_alpha(mint: str) -> float:
 
 async def scan_tokens():
     tokens = []
+    STATE["scanner_error"] = None
 
-    # ===== Pump.fun =====
+    # 先打 Dexscreener search
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get("https://frontend-api.pump.fun/coins")
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://api.dexscreener.com/latest/dex/search",
+                params={"q": "solana"},
+            )
 
             if r.status_code == 200:
                 data = r.json()
+                pairs = data.get("pairs", []) or []
 
-                for item in data[:20]:
-                    mint = item.get("mint")
+                seen = set()
+                for p in pairs:
+                    if p.get("chainId") != "solana":
+                        continue
 
-                    # 🚨 過濾垃圾 token
-                    if mint and len(mint) > 30:
-                        tokens.append(mint)
+                    mint = p.get("baseToken", {}).get("address")
+                    if not mint:
+                        continue
+
+                    if mint.startswith("0x"):
+                        continue
+
+                    if len(mint) < 32 or len(mint) > 44:
+                        continue
+
+                    liq = p.get("liquidity", {}).get("usd", 0) or 0
+                    try:
+                        liq = float(liq)
+                    except Exception:
+                        liq = 0.0
+
+                    if liq < 20000:
+                        continue
+
+                    if mint in seen:
+                        continue
+
+                    seen.add(mint)
+                    tokens.append(mint)
+
+                if tokens:
+                    STATE["scanner_mode"] = "dexscreener"
+                    return tokens[:20]
+
+            else:
+                STATE["scanner_error"] = f"dex_status_{r.status_code}"
 
     except Exception as e:
-        STATE["scanner_error"] = str(e)
+        STATE["scanner_error"] = f"dex_error:{e}"
 
-    # ===== 如果 pump 壞了 → fallback dex =====
-    if not tokens:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get("https://api.dexscreener.com/latest/dex/pairs/solana")
-
-                if r.status_code == 200:
-                    data = r.json().get("pairs", [])
-
-                    for p in data[:20]:
-                        mint = p.get("baseToken", {}).get("address")
-                        if mint:
-                            tokens.append(mint)
-
-            STATE["scanner_mode"] = "dexscreener"
-
-        except Exception as e:
-            STATE["scanner_error"] = str(e)
-
-    else:
-        STATE["scanner_mode"] = "pump"
-
-    # 🚨 最後 fallback
-    if not tokens:
-        tokens = ["TEST_A", "TEST_B"]
-        STATE["scanner_mode"] = "fallback"
-
-    return tokens
+    # 最後 fallback
+    STATE["scanner_mode"] = "fallback"
+    return ["TEST_A", "TEST_B"]
 
 # ================= EXECUTION =================
 
