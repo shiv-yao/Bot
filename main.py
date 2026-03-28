@@ -1,4 +1,4 @@
-# v31.3_real_signing_stable
+# v31.4_real_signing_final
 
 import asyncio
 import random
@@ -26,17 +26,28 @@ MAX_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
 
-# ================= PRIVATE KEY LOAD（🔥已修）=================
+# ================= PRIVATE KEY =================
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+
+if not PRIVATE_KEY:
+    raise RuntimeError("PRIVATE_KEY not set")
 
 try:
+    # list format
     if PRIVATE_KEY.startswith("["):
-        private_key_bytes = bytes(eval(PRIVATE_KEY))
-    else:
-        private_key_bytes = bytes(int(x) for x in PRIVATE_KEY.split(",") if x.strip())
+        keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
 
-    keypair = Keypair.from_bytes(private_key_bytes)
+    # csv format
+    elif "," in PRIVATE_KEY:
+        keypair = Keypair.from_bytes(
+            bytes(int(x) for x in PRIVATE_KEY.split(","))
+        )
+
+    # base58 format ✅
+    else:
+        keypair = Keypair.from_base58_string(PRIVATE_KEY)
+
 except Exception as e:
     raise RuntimeError(f"PRIVATE_KEY format error: {e}")
 
@@ -52,7 +63,7 @@ STATE = {
     "realized_pnl": 0.0,
     "errors": 0,
     "last_error": None,
-    "bot_version": "v31.3_real_signing_stable"
+    "bot_version": "v31.4_real_signing_final"
 }
 
 # ================= ALPHA =================
@@ -73,7 +84,6 @@ async def get_quote(amount):
 
     async with SESSION.get(url) as res:
         return await res.json()
-
 
 async def get_swap_tx(route):
     async with SESSION.post(
@@ -117,7 +127,6 @@ async def send_tx(tx_base64):
         STATE["last_error"] = str(e)
         return None
 
-
 async def execute_real_trade(amount):
     try:
         quote = await get_quote(amount)
@@ -134,8 +143,7 @@ async def execute_real_trade(amount):
 
         tx = swap["swapTransaction"]
 
-        # 🔥 retry
-        for _ in range(3):
+        for _ in range(3):  # retry
             result = await send_tx(tx)
 
             if result and "result" in result:
