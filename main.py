@@ -96,7 +96,6 @@ async def has_jupiter_route(mint: str) -> bool:
     except Exception:
         return False
 
-
 async def real_alpha(mint: str) -> float:
     try:
         sol = "So11111111111111111111111111111111111111112"
@@ -149,6 +148,15 @@ async def real_alpha(mint: str) -> float:
                 return -999.0
 
             strength = (out2 - out1) / out1
+
+            # 沒動能
+            if abs(strength) < 0.002:
+                return -50.0
+
+            # 下跌幣直接封殺
+            if strength < 0:
+                return -100.0
+
             liquidity_score = min(out1 / 100000, 3) * 25
             impact_penalty = impact1 * 100
 
@@ -381,7 +389,7 @@ async def bot_loop():
                 alpha = await real_alpha(mint)
                 STATE["last_alpha"] = {"mint": mint, "alpha": alpha}
 
-                if alpha < 100:
+                if alpha < 80:
                     STATE["last_action"] = f"alpha_skip:{mint}:{alpha}"
                     continue
 
