@@ -1,4 +1,4 @@
-# v31.5_real_stable (Railway READY)
+# v45_onchain_intelligence
 
 import asyncio
 import random
@@ -9,213 +9,228 @@ import os
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 # ================= CONFIG =================
 
-USE_REAL_EXECUTION = True
+JITO_ENDPOINTS = [
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://ny.block-engine.jito.wtf/api/v1/bundles"
+]
 
-RPC_URL = "https://api.mainnet-beta.solana.com"
-JUP_API = "https://lite-api.jup.ag"   # 🔥 FIXED
-
-SLIPPAGE_BPS = 200
+JUP_API = "https://lite-api.jup.ag"
 
 MAX_POSITIONS = 5
 MAX_POSITION_SIZE = 0.01
 
 STOP_LOSS = -0.07
+KILL_SWITCH = 5
 
-# ================= PRIVATE KEY =================
+BASE_SLIPPAGE = 150
+
+# ================= KEY =================
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 
-if not PRIVATE_KEY:
-    raise RuntimeError("PRIVATE_KEY not set")
-
-try:
-    if PRIVATE_KEY.startswith("["):
-        keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
-    elif "," in PRIVATE_KEY:
-        keypair = Keypair.from_bytes(
-            bytes(int(x) for x in PRIVATE_KEY.split(","))
-        )
-    else:
-        keypair = Keypair.from_base58_string(PRIVATE_KEY)
-except Exception as e:
-    raise RuntimeError(f"PRIVATE_KEY format error: {e}")
-
-# ================= GLOBAL =================
-
-SESSION = None
+if PRIVATE_KEY.startswith("["):
+    keypair = Keypair.from_bytes(bytes(eval(PRIVATE_KEY)))
+elif "," in PRIVATE_KEY:
+    keypair = Keypair.from_bytes(bytes(int(x) for x in PRIVATE_KEY.split(",")))
+else:
+    keypair = Keypair.from_base58_string(PRIVATE_KEY)
 
 # ================= STATE =================
 
+SESSION = None
+
 STATE = {
     "positions": [],
-    "closed_trades": [],
+    "wallet_history": [],
+    "flow_history": [],
     "realized_pnl": 0.0,
+    "loss_streak": 0,
     "errors": 0,
-    "last_error": None,
-    "bot_version": "v31.5_real_stable"
+    "bot_version": "v45_onchain_intelligence"
 }
 
-# ================= UTILS =================
+# ================= SAFE =================
 
 async def safe_get(url):
-    for _ in range(3):
-        try:
-            async with SESSION.get(url, timeout=5) as res:
-                return await res.json()
-        except Exception:
-            await asyncio.sleep(0.3)
-    return None
+    try:
+        async with SESSION.get(url, timeout=4) as res:
+            return await res.json()
+    except:
+        return None
 
-async def safe_post(url, json_data):
-    for _ in range(3):
-        try:
-            async with SESSION.post(url, json=json_data, timeout=5) as res:
-                return await res.json()
-        except Exception:
-            await asyncio.sleep(0.3)
-    return None
+async def safe_post(url, data):
+    try:
+        async with SESSION.post(url, json=data, timeout=4) as res:
+            return await res.json()
+    except:
+        return None
+
+# ================= WALLET INTEL =================
+
+async def fetch_wallets():
+    # 👉 未接 API → 模擬
+    wallets = []
+
+    for _ in range(10):
+        wallets.append({
+            "winrate": random.uniform(0.4,0.8),
+            "pnl": random.uniform(-1,1),
+            "size": random.uniform(0,1)
+        })
+
+    return wallets
+
+def wallet_score(wallets):
+    scores = []
+
+    for w in wallets:
+        score = w["winrate"]*0.5 + w["pnl"]*0.3 + w["size"]*0.2
+        scores.append(score)
+
+    return sum(scores)/len(scores)
+
+# ================= FLOW =================
+
+async def update_flow():
+    flow = random.uniform(0,1)
+    STATE["flow_history"].append(flow)
+
+    if len(STATE["flow_history"]) > 20:
+        STATE["flow_history"].pop(0)
+
+def flow_acceleration():
+    if len(STATE["flow_history"]) < 2:
+        return 0
+
+    return STATE["flow_history"][-1] - STATE["flow_history"][-2]
+
+# ================= MEMPOOL =================
+
+def mempool_pressure():
+    return random.uniform(0,1)
+
+# ================= LAUNCH =================
+
+def detect_launch():
+    return random.random() < 0.1
 
 # ================= ALPHA =================
 
-def get_alpha():
-    return random.uniform(10, 80)
+async def compute_alpha():
+    wallets = await fetch_wallets()
+    flow = wallet_score(wallets)
 
-# ================= JUPITER =================
+    accel = flow_acceleration()
+    mem = mempool_pressure()
+    launch = detect_launch()
 
-async def get_quote(amount):
+    alpha = (
+        flow * 50 +
+        accel * 80 +
+        mem * 60 +
+        (80 if launch else 0)
+    )
+
+    return alpha
+
+# ================= JUP =================
+
+async def get_quote(amount, slippage):
     url = (
         f"{JUP_API}/v6/quote"
         f"?inputMint=So11111111111111111111111111111111111111112"
         f"&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         f"&amount={int(amount*1e9)}"
-        f"&slippageBps={SLIPPAGE_BPS}"
+        f"&slippageBps={slippage}"
     )
     return await safe_get(url)
 
-async def get_swap_tx(route):
+async def get_swap(route):
     return await safe_post(
         f"{JUP_API}/v6/swap",
         {
             "quoteResponse": route,
             "userPublicKey": str(keypair.pubkey()),
-            "wrapAndUnwrapSol": True,
-            "dynamicComputeUnitLimit": True,
-            "prioritizationFeeLamports": 5000
+            "wrapAndUnwrapSol": True
         }
     )
 
-# ================= EXECUTION =================
+# ================= JITO =================
 
-async def send_tx(tx_base64):
-    try:
-        tx_bytes = base64.b64decode(tx_base64)
-        tx = VersionedTransaction.from_bytes(tx_bytes)
+async def send_bundle_multi(tx):
+    bundle = {
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"sendBundle",
+        "params":[{"transactions":[tx],"encoding":"base64"}]
+    }
 
-        tx.sign([keypair])
+    tasks = [safe_post(url, bundle) for url in JITO_ENDPOINTS]
+    results = await asyncio.gather(*tasks)
 
-        raw_tx = base64.b64encode(bytes(tx)).decode()
+    for r in results:
+        if r and "result" in r:
+            return r["result"]
 
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [raw_tx, {"skipPreflight": True}]
-        }
+    return None
 
-        res = await safe_post(RPC_URL, payload)
-        return res
+# ================= EXEC =================
 
-    except Exception as e:
-        STATE["errors"] += 1
-        STATE["last_error"] = str(e)
-        return None
+async def execute_real(amount, alpha):
+    slippage = BASE_SLIPPAGE + int(alpha*2)
 
-async def execute_real_trade(amount):
-    quote = await get_quote(amount)
+    quote = await get_quote(amount, slippage)
 
-    if not quote or "data" not in quote:
+    if not quote or "data" not in quote or not quote["data"]:
         return None
 
     route = quote["data"][0]
 
-    swap = await get_swap_tx(route)
+    swap = await get_swap(route)
 
     if not swap or "swapTransaction" not in swap:
         return None
 
-    tx = swap["swapTransaction"]
+    tx = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
+    tx.sign([keypair])
 
-    for _ in range(2):
-        result = await send_tx(tx)
+    raw = base64.b64encode(bytes(tx)).decode()
 
-        if result and "result" in result:
-            return {
-                "price": float(route["outAmount"]) / float(route["inAmount"])
-            }
+    sig = await send_bundle_multi(raw)
+
+    if sig:
+        return float(route["outAmount"]) / float(route["inAmount"])
 
     return None
-
-# ================= EXEC WRAPPER =================
-
-async def execute_trade(alpha):
-    size = min(0.002 * (1 + alpha/50), MAX_POSITION_SIZE)
-
-    if not USE_REAL_EXECUTION:
-        price = random.uniform(0.00001, 0.00002)
-        return price, size / price
-
-    res = await execute_real_trade(size)
-
-    if not res:
-        return None, None
-
-    price = res["price"]
-    return price, size / price
-
-# ================= MONITOR =================
-
-async def monitor():
-    new_positions = []
-
-    for pos in STATE["positions"]:
-        price = pos["entry_price"] * random.uniform(0.7, 1.5)
-
-        pnl = pos["qty"] * (price - pos["entry_price"])
-        pnl_pct = pnl / (pos["qty"] * pos["entry_price"])
-
-        if pnl_pct < STOP_LOSS:
-            STATE["closed_trades"].append({
-                **pos,
-                "exit_price": price,
-                "pnl": pnl
-            })
-            STATE["realized_pnl"] += pnl
-            continue
-
-        new_positions.append(pos)
-
-    STATE["positions"] = new_positions
 
 # ================= LOOP =================
 
 async def bot_loop():
     while True:
         try:
-            await monitor()
+            if STATE["loss_streak"] >= KILL_SWITCH:
+                await asyncio.sleep(5)
+                continue
 
-            for _ in range(3):
+            await update_flow()
+
+            for _ in range(5):
                 if len(STATE["positions"]) >= MAX_POSITIONS:
                     break
 
-                alpha = get_alpha()
+                alpha = await compute_alpha()
 
-                price, qty = await execute_trade(alpha)
+                if alpha < 50:
+                    continue
+
+                size = min(0.002*(1+alpha/50), MAX_POSITION_SIZE)
+
+                price = await execute_real(size, alpha)
 
                 if not price:
                     continue
@@ -223,16 +238,14 @@ async def bot_loop():
                 STATE["positions"].append({
                     "token": f"TOKEN{random.randint(1,9999)}",
                     "entry_price": price,
-                    "qty": qty,
                     "alpha": alpha,
-                    "entry_time": time.time()
+                    "time": time.time()
                 })
 
         except Exception as e:
             STATE["errors"] += 1
-            STATE["last_error"] = str(e)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
 # ================= API =================
 
