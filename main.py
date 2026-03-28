@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 # ================= CONFIG =================
 
-USE_REAL_EXECUTION = False   # 👉 改 True 上鏈
+USE_REAL_EXECUTION = True   # 👉 改 True 上鏈
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 
