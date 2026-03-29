@@ -51,6 +51,23 @@ def init_engine():
     if not hasattr(engine, "bot_error"):
         engine.bot_error = ""
 
+    if not hasattr(engine, "engine_stats"):
+        engine.engine_stats = {
+            "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
+        }
+
+    if not hasattr(engine, "engine_allocator"):
+        engine.engine_allocator = {
+            "stable": 0.4,
+            "degen": 0.4,
+            "sniper": 0.2,
+        }
+
+    if not hasattr(engine, "candidate_count"):
+        engine.candidate_count = 0
+
 
 # ================= BOT =================
 
@@ -62,7 +79,6 @@ async def start_bot():
 
     try:
         from bot import bot_loop
-
         BOT_TASK = asyncio.create_task(bot_loop())
 
         engine.bot_ok = True
@@ -92,17 +108,9 @@ app = FastAPI(lifespan=lifespan)
 # ================= HELPERS =================
 
 def normalize_position(p: dict):
-    entry = (
-        p.get("entry_price")
-        if p.get("entry_price") is not None
-        else p.get("entry", 0)
-    )
+    entry = p.get("entry_price", p.get("entry", 0))
     last = p.get("last_price", entry)
-    peak = (
-        p.get("peak_price")
-        if p.get("peak_price") is not None
-        else p.get("peak", entry)
-    )
+    peak = p.get("peak_price", p.get("peak", entry))
 
     pnl_pct = p.get("pnl_pct")
     if pnl_pct is None:
@@ -143,11 +151,14 @@ def data():
         "last_signal": engine.last_signal,
         "last_trade": engine.last_trade,
         "positions": positions,
-        "logs": list(engine.logs)[-50:],
+        "logs": list(engine.logs)[-80:],
         "stats": dict(engine.stats),
         "trade_history": list(engine.trade_history)[-100:],
         "bot_ok": engine.bot_ok,
         "bot_error": engine.bot_error,
+        "engine_stats": dict(getattr(engine, "engine_stats", {})),
+        "engine_allocator": dict(getattr(engine, "engine_allocator", {})),
+        "candidate_count": getattr(engine, "candidate_count", 0),
     }
 
 
@@ -171,7 +182,7 @@ body {
   margin: 0;
 }
 .wrap {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
 }
 .grid {
@@ -201,6 +212,10 @@ h2 {
 pre {
   white-space: pre-wrap;
   word-break: break-word;
+  margin: 0;
+}
+.row {
+  margin-bottom: 8px;
 }
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr 1fr; }
@@ -214,11 +229,34 @@ pre {
 </head>
 <body>
 <div class="wrap">
-  <h2>Quant Dashboard</h2>
+  <h2>Quant Dashboard v1300</h2>
   <div id="main"></div>
 </div>
 
 <script>
+function renderEngineStats(es) {
+  const keys = ["stable", "degen", "sniper"];
+  return keys.map(k => {
+    const v = es?.[k] || {};
+    return `
+      <div class="row">
+        <b>${k}</b><br>
+        pnl=${Number(v.pnl || 0).toFixed(6)} |
+        trades=${v.trades ?? 0} |
+        wins=${v.wins ?? 0}
+      </div>
+    `;
+  }).join("");
+}
+
+function renderAllocator(a) {
+  const keys = ["stable", "degen", "sniper"];
+  return keys.map(k => {
+    const v = a?.[k] ?? 0;
+    return `<div class="row"><b>${k}</b>: ${Number(v).toFixed(3)}</div>`;
+  }).join("");
+}
+
 async function load() {
   const d = await fetch('/data').then(r => r.json());
 
@@ -266,15 +304,6 @@ async function load() {
         <div>${d.bot_ok ? 'OK' : 'ERROR'}</div>
       </div>
 
-      <div class="card two">
-        <div class="small">Last Signal</div>
-        <div>${d.last_signal || '-'}</div>
-      </div>
-      <div class="card two">
-        <div class="small">Last Trade</div>
-        <div>${d.last_trade || '-'}</div>
-      </div>
-
       <div class="card">
         <div class="small">Signals</div>
         <div>${d.stats?.signals ?? 0}</div>
@@ -290,6 +319,29 @@ async function load() {
       <div class="card">
         <div class="small">Errors</div>
         <div>${d.stats?.errors ?? 0}</div>
+      </div>
+
+      <div class="card">
+        <div class="small">Candidates</div>
+        <div>${d.candidate_count ?? 0}</div>
+      </div>
+      <div class="card two">
+        <div class="small">Last Signal</div>
+        <div>${d.last_signal || '-'}</div>
+      </div>
+      <div class="card">
+        <div class="small">Last Trade</div>
+        <div>${d.last_trade || '-'}</div>
+      </div>
+
+      <div class="card two">
+        <div class="small">Engine Allocator</div>
+        <div>${renderAllocator(d.engine_allocator)}</div>
+      </div>
+
+      <div class="card two">
+        <div class="small">Engine Stats</div>
+        <div>${renderEngineStats(d.engine_stats)}</div>
       </div>
 
       <div class="card two">
