@@ -1,4 +1,4 @@
-# ================= v1306_RESTORED_PLUS_FUSION_TRADABLE_BOT =================
+# ================= v1307_FIX_RESTORED_PLUS_FUSION_BOT =================
 import asyncio
 import time
 import random
@@ -39,14 +39,39 @@ SMART_WALLETS = []
 AUTO_DISCOVER_WALLETS = True
 MAX_SMART_WALLETS = 20
 
-# ================= v1306 PARAMS =================
-# 保留原本功能，只修參數
-LIQ_MIN_OUT = 1000         # 原本 5000，放寬到 1000
-LIQ_MAX_IMPACT = 0.85      # 原本 0.60，放寬到 0.85
-ENTRY_THRESHOLD = 0.0008   # 原本 0.002，降低進場門檻
-ALPHA_MULTIPLIER = 5.0     # 原本 1.2，放大動能
-FORCE_BOOTSTRAP_BUY = True # 冷啟動時強制打一單，避免永遠 0 buys
-FORCE_BOOTSTRAP_COOLDOWN = 180
+# ================= v1307 FIX AI PARAM ADAPTER =================
+AI_PARAMS = {
+    "entry_threshold": 0.002,
+    "size_multiplier": 1.0,
+    "slippage": 0.005,  # 預留，之後接真下單可直接使用
+}
+
+def ai_adapt():
+    trades = list(getattr(engine, "trade_history", []))[-20:]
+
+    if not trades:
+        return
+
+    closed = [t for t in trades if isinstance(t, dict) and t.get("pnl_pct") is not None]
+    if not closed:
+        return
+
+    wins = [t for t in closed if t.get("pnl_pct", 0) > 0]
+    winrate = len(wins) / len(closed) if closed else 0.0
+    avg_pnl = sum(t.get("pnl_pct", 0) for t in closed) / len(closed)
+
+    if winrate > 0.6:
+        AI_PARAMS["entry_threshold"] *= 0.95
+        AI_PARAMS["size_multiplier"] *= 1.05
+    elif winrate < 0.4:
+        AI_PARAMS["entry_threshold"] *= 1.05
+        AI_PARAMS["size_multiplier"] *= 0.95
+
+    if avg_pnl < 0:
+        AI_PARAMS["entry_threshold"] *= 1.05
+
+    AI_PARAMS["entry_threshold"] = max(0.001, min(0.01, AI_PARAMS["entry_threshold"]))
+    AI_PARAMS["size_multiplier"] = max(0.5, min(2.0, AI_PARAMS["size_multiplier"]))
 
 # ================= STATE =================
 CANDIDATES = set()
@@ -171,7 +196,7 @@ async def get_price(mint):
 
     data, status = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
     )
 
     if status != 200 or not isinstance(data, dict):
@@ -186,7 +211,7 @@ async def get_price(mint):
 async def liquidity_ok(mint):
     data, _ = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"}
+        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"},
     )
     if not isinstance(data, dict):
         return False
@@ -194,12 +219,12 @@ async def liquidity_ok(mint):
     out_amount = ensure_int(data.get("outAmount"))
     impact = ensure_float(data.get("priceImpactPct"), 1.0)
 
-    return out_amount > LIQ_MIN_OUT and impact < LIQ_MAX_IMPACT
+    return out_amount > 1000 and impact < 0.85
 
 async def anti_rug(mint):
     data, _ = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
     )
     return isinstance(data, dict) and ensure_int(data.get("outAmount")) > 0
 
@@ -385,17 +410,15 @@ async def refresh_universe():
 
 # ================= STRATEGY =================
 async def alpha(mint):
-    # 保留原本結構，但讓 alpha 不再長期 0
     p1 = await get_price(mint)
     await asyncio.sleep(1.2)
     p2 = await get_price(mint)
 
     if p1 and p2 and p1 > 0:
-        raw = ((p2 - p1) / p1) * ALPHA_MULTIPLIER
+        raw = ((p2 - p1) / p1) * 5.0
         if raw > 0:
             return max(0.0, min(raw, 0.12))
 
-    # fallback alpha，避免因 API 平台噪音太小永遠 0
     base = random.uniform(0.0008, 0.006)
     if mint not in {SOL, USDC, USDT, BONK, JUP}:
         base *= 1.4
@@ -431,11 +454,13 @@ async def buy(mint, a):
     w_score = wallet_score(mint)
     combo = a + min(w_score * 0.01, 0.05)
 
-    size = MAX_POSITION_SOL * max(0.2, combo * 8)
+    size = MAX_POSITION_SOL * max(0.2, combo * 8) * AI_PARAMS["size_multiplier"]
     size = max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
     amount = size / price if price > 0 else 0.0
 
-    engine.positions.append({
+    ts = now()
+
+    pos = {
         "token": mint,
         "entry_price": price,
         "last_price": price,
@@ -444,14 +469,33 @@ async def buy(mint, a):
         "amount": amount,
         "engine": "degen",
         "alpha": combo,
+        "entry_ts": ts,
+    }
+    engine.positions.append(pos)
+
+    engine.trade_history.append({
+        "side": "BUY",
+        "token": mint,
+        "entry_price": price,
+        "exit_price": None,
+        "pnl_pct": 0.0,
+        "alpha": combo,
+        "engine": "degen",
+        "entry_ts": ts,
+        "exit_ts": None,
+        "holding_time": None,
     })
+    engine.trade_history = engine.trade_history[-300:]
 
     TOKEN_COOLDOWN[mint] = now()
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:6]}"
     engine.last_signal = f"BUY_ALPHA {combo:.4f}"
 
-    log(f"BUY {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f} size={size:.6f}")
+    log(
+        f"BUY {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} "
+        f"combo={combo:.4f} size={size:.6f} thr={AI_PARAMS['entry_threshold']:.4f}"
+    )
     return True
 
 async def sell(p):
@@ -470,6 +514,15 @@ async def sell(p):
         return False
 
     pnl = (price - entry) / entry
+    exit_ts = now()
+
+    for t in reversed(engine.trade_history):
+        if t.get("token") == token and t.get("exit_price") is None:
+            t["exit_price"] = price
+            t["pnl_pct"] = pnl
+            t["exit_ts"] = exit_ts
+            t["holding_time"] = exit_ts - t.get("entry_ts", exit_ts)
+            break
 
     try:
         engine.positions.remove(p)
@@ -478,18 +531,6 @@ async def sell(p):
             x for x in engine.positions
             if not (isinstance(x, dict) and x.get("token") == token)
         ]
-
-    engine.trade_history.append({
-        "side": "SELL",
-        "token": token,
-        "entry_price": entry,
-        "exit_price": price,
-        "pnl_pct": pnl,
-        "alpha": ensure_float(p.get("alpha"), 0.0),
-        "engine": p.get("engine", "degen"),
-        "ts": now(),
-    })
-    engine.trade_history = engine.trade_history[-300:]
 
     engine.stats["sells"] += 1
     engine.last_trade = f"SELL {token[:6]}"
@@ -517,7 +558,9 @@ async def monitor():
                 pnl = (price - entry) / entry
 
                 p["last_price"] = price
-                p["peak_price"] = max(ensure_float(p.get("peak_price"), price), price)
+                old_peak = ensure_float(p.get("peak_price"), price)
+                if price > old_peak:
+                    p["peak_price"] = price
                 p["pnl_pct"] = pnl
 
                 if pnl > 0.18 or pnl < -0.10:
@@ -532,27 +575,17 @@ async def monitor():
 async def maybe_force_bootstrap_buy():
     global LAST_FORCE_BUY_TS
 
-    if not FORCE_BOOTSTRAP_BUY:
-        return
-
-    if engine.positions:
-        return
-
-    if now() - LAST_FORCE_BUY_TS < FORCE_BOOTSTRAP_COOLDOWN:
-        return
-
-    tradable = [m for m in CANDIDATES if valid_mint(m) and m not in {SOL, USDC, USDT}]
-    if not tradable:
-        return
-
-    mint = random.choice(tradable)
-    LAST_FORCE_BUY_TS = now()
-    log(f"FORCE_BUY {mint[:6]}")
-    await buy(mint, 0.01)
+    if not engine.positions and now() - LAST_FORCE_BUY_TS >= 180:
+        tradable = [m for m in CANDIDATES if valid_mint(m) and m not in {SOL, USDC, USDT}]
+        if tradable:
+            mint = random.choice(tradable)
+            LAST_FORCE_BUY_TS = now()
+            log(f"FORCE_BUY {mint[:6]}")
+            await buy(mint, 0.01)
 
 # ================= MAIN =================
 async def main():
-    log("🚀 v1306 RESTORED + FUSION BOT START")
+    log("🚀 v1307 FIX BOT START")
     await inject_fallback(reason="boot")
 
     asyncio.create_task(pump_scanner())
@@ -564,6 +597,7 @@ async def main():
     while True:
         try:
             repair()
+            ai_adapt()
             await refresh_universe()
             await refresh_wallet_discovery()
 
@@ -587,14 +621,19 @@ async def main():
                 w_score = wallet_score(mint)
                 combo = a + min(w_score * 0.01, 0.05)
 
-                engine.last_signal = f"{mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f}"
+                engine.last_signal = (
+                    f"{mint[:6]} alpha={a:.4f} wallet={w_score:.2f} "
+                    f"combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}"
+                )
                 log_once(
                     f"combo_{mint}",
-                    f"SIGNAL {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f}",
+                    f"SIGNAL {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} "
+                    f"combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
                     cooldown=90,
                 )
 
-                if combo > ENTRY_THRESHOLD:
+                threshold = AI_PARAMS["entry_threshold"]
+                if combo > threshold:
                     await buy(mint, a)
 
             await maybe_force_bootstrap_buy()
