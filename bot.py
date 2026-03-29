@@ -137,6 +137,7 @@ AI_PARAMS = {
 }
 
 # ================= STATE =================
+IN_FLIGHT = set()
 CANDIDATES = set()
 TOKEN_COOLDOWN = defaultdict(float)
 PRICE_CACHE = {}
@@ -1450,3 +1451,183 @@ async def main():
 # ================= ENTRY =================
 async def bot_loop():
     await main()
+
+# ================= PATCH v1314.1 (NO FEATURE REMOVED) =================
+
+# ===== 防重複下單 =====
+IN_FLIGHT_BUY = set()
+IN_FLIGHT_SELL = set()
+
+# ===== 安全 JUP =====
+async def safe_jupiter_order(input_mint, output_mint, amount):
+    for _ in range(3):
+        data = await jupiter_order(input_mint, output_mint, amount)
+        if data and data.get("transaction"):
+            return data
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def safe_jupiter_execute(order):
+    for _ in range(2):
+        try:
+            return await jupiter_execute(order)
+        except Exception:
+            await asyncio.sleep(0.5)
+    raise RuntimeError("EXECUTE_FAIL_RETRY")
+
+
+# ================= PATCH BUY =================
+_original_buy = buy
+
+async def buy(m, a, combo, w, s):
+    if m in IN_FLIGHT_BUY:
+        return
+    IN_FLIGHT_BUY.add(m)
+
+    try:
+        repair()
+
+        if not can_buy(m):
+            return
+
+        engine_type = pick_engine(combo)
+        if not STRATEGY_ENABLED.get(engine_type, True):
+            return
+
+        size = position_size(combo) * AI_PARAMS["size_multiplier"]
+
+        if engine_type == "sniper":
+            size *= 1.4
+        elif engine_type == "stable":
+            size *= 0.7
+
+        alloc = engine.engine_allocator.get(engine_type, 0.33)
+        size *= alloc
+        size = capital_scale(size)
+        size = max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
+
+        price = await get_price(m)
+        if not price:
+            return
+
+        tx_sig = None
+        tx_meta = None
+        raw_token_amount = None
+        trade_mode = "REAL" if real_trading_ready() else "PAPER"
+
+        if real_trading_ready():
+            lamports_in = int(size * 1e9)
+
+            order = await safe_jupiter_order(SOL, m, lamports_in)
+            if not order:
+                return
+
+            raw_token_amount = ensure_int(order.get("outAmount"), 0)
+
+            try:
+                exec_result = await safe_jupiter_execute(order)
+                tx_sig = exec_result.get("signature")
+                tx_meta = exec_result.get("result")
+
+                if USE_JITO and exec_result.get("signed_transaction"):
+                    asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
+
+            except Exception:
+                return
+
+            if tx_sig:
+                await confirm_signature(tx_sig)
+
+        pos = {
+            "token": m,
+            "entry_price": price,
+            "last_price": price,
+            "peak_price": price,
+            "pnl_pct": 0.0,
+            "amount": size / price,
+            "raw_token_amount": raw_token_amount,
+            "engine": engine_type,
+            "alpha": a,
+            "entry_ts": now(),
+            "wallet_score": w,
+            "sniper_score": s,
+            "combo": combo,
+            "trade_mode": trade_mode,
+            "entry_signature": tx_sig,
+            "entry_tx_meta": tx_meta,
+        }
+
+        engine.positions.append(pos)
+
+        TOKEN_COOLDOWN[m] = now()
+        engine.stats["buys"] += 1
+        engine.last_trade = f"BUY {m[:6]}"
+
+    finally:
+        IN_FLIGHT_BUY.discard(m)
+
+
+# ================= PATCH SELL =================
+_original_sell = sell
+
+async def sell(p):
+    m = p["token"]
+
+    if m in IN_FLIGHT_SELL:
+        return
+
+    IN_FLIGHT_SELL.add(m)
+
+    try:
+        repair()
+
+        price = await get_price(m)
+        if not price:
+            return
+
+        pnl = (price - p["entry_price"]) / p["entry_price"]
+
+        tx_sig = None
+        tx_meta = None
+
+        if real_trading_ready():
+            raw_amount = ensure_int(p.get("raw_token_amount"), 0)
+
+            if raw_amount <= 0:
+                raw_amount = int(
+                    max(0, ensure_float(p.get("amount"), 0.0)) * (10 ** token_decimals(m))
+                )
+
+            order = await safe_jupiter_order(m, SOL, raw_amount)
+
+            if order:
+                try:
+                    exec_result = await safe_jupiter_execute(order)
+                    tx_sig = exec_result.get("signature")
+                    tx_meta = exec_result.get("result")
+
+                    if USE_JITO and exec_result.get("signed_transaction"):
+                        asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
+
+                    if tx_sig:
+                        await confirm_signature(tx_sig)
+
+                except Exception:
+                    pass
+
+        try:
+            engine.positions.remove(p)
+        except ValueError:
+            return
+
+        engine.trade_history.append({
+            "token": m,
+            "pnl_pct": pnl,
+            "ts": now(),
+        })
+
+        engine.stats["sells"] += 1
+
+    finally:
+        IN_FLIGHT_SELL.discard(m)
