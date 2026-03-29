@@ -540,7 +540,47 @@ async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int)
 
     params = {k: v for k, v in params.items() if v is not None}
     return await http_get_json(JUP_ORDER_API, params=params, headers=jup_headers())
+    # ===== PRIMARY FAIL → FALLBACK =====
+    if not data or data.get("errorCode") or data.get("error"):
+        log_once("jup_fallback", f"JUP_FALLBACK {input_mint[:4]}->{output_mint[:4]}", 10)
 
+        try:
+            quote_url = "https://quote-api.jup.ag/v6/quote"
+
+            quote_params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(int(amount_smallest)),
+                "slippageBps": AI_PARAMS["slippage_bps"],
+            }
+
+            quote = await http_get_json(quote_url, params=quote_params)
+
+            if not quote or not quote.get("data"):
+                return data  # fallback fail → keep original
+
+            route = quote["data"][0]
+
+            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_payload = {
+                "quoteResponse": route,
+                "userPublicKey": wallet_pubkey_str() if real_trading_ready() else None,
+                "wrapAndUnwrapSol": True,
+            }
+
+            swap = await http_post_json(swap_url, swap_payload)
+
+            if swap and swap.get("swapTransaction"):
+                return {
+                    "transaction": swap["swapTransaction"],
+                    "requestId": "fallback",
+                    "outAmount": route.get("outAmount"),
+                }
+
+        except Exception as e:
+            log_once("jup_fallback_err", f"FALLBACK_ERR {e}", 20)
+
+    return data
 
 def sign_transaction_base64(tx_b64: str) -> str:
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
