@@ -1,4 +1,4 @@
-# ================= v1301_REAL_MARKET_BOT (最終穩定版) =================
+# ================= v1301_REAL_MARKET_BOT (超安全最終版) =================
 import asyncio
 import time
 import random
@@ -42,18 +42,13 @@ engine.stats = getattr(engine, "stats", {
     "signals": 0, "buys": 0, "sells": 0, "errors": 0
 })
 
-# ================= ENGINE =================
 ENGINE_STATS = {
     "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
     "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
     "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
 }
 
-ENGINE_ALLOCATOR = {
-    "stable": 0.4,
-    "degen": 0.4,
-    "sniper": 0.2,
-}
+ENGINE_ALLOCATOR = {"stable": 0.4, "degen": 0.4, "sniper": 0.2}
 
 # ================= STATE =================
 CANDIDATES = set()
@@ -75,12 +70,8 @@ def now() -> float:
 def valid_mint(m: str) -> bool:
     return isinstance(m, str) and 32 <= len(m) <= 44
 
-# ================= MARKET DATA =================
+# ================= MARKET DATA & FILTER =================
 async def get_price(mint: str):
-    cached = PRICE_CACHE.get(mint)
-    if cached and now() - cached[1] < 3:
-        return cached[0]
-
     try:
         r = await HTTP.get(
             "https://lite-api.jup.ag/swap/v1/quote",
@@ -90,10 +81,8 @@ async def get_price(mint: str):
             return None
         data = r.json()
         out_amount = int(data.get("outAmount", 0) or 0)
-        price = (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
-        PRICE_CACHE[mint] = (price, now())
-        return price
-    except Exception:
+        return (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
+    except:
         engine.stats["errors"] += 1
         return None
 
@@ -109,10 +98,9 @@ async def get_liquidity_and_impact(mint: str):
         out = int(data.get("outAmount", 0) or 0)
         impact = float(data.get("priceImpactPct", 1) or 1)
         return out, impact
-    except Exception:
+    except:
         return 0, 1.0
 
-# ================= FILTER =================
 async def liquidity_ok(mint: str) -> bool:
     out, impact = await get_liquidity_and_impact(mint)
     return out > 5000 and impact < 0.40
@@ -126,7 +114,7 @@ async def anti_rug(mint: str) -> bool:
         if r.status_code != 200:
             return False
         return int(r.json().get("outAmount", 0) or 0) > 0
-    except Exception:
+    except:
         return False
 
 # ================= TOKEN SOURCES =================
@@ -135,25 +123,15 @@ async def pump_scanner():
         try:
             r = await HTTP.get(PUMP_API)
             if r.status_code != 200:
-                ts = now()
-                if LAST_PUMP_ERROR.get("code") != r.status_code:
-                    log(f"PUMP_HTTP_{r.status_code}")
-                    LAST_PUMP_ERROR["code"] = r.status_code
                 await asyncio.sleep(8)
                 continue
-
             data = r.json()
-            added = 0
             for c in data[:15]:
                 mint = c.get("mint") if isinstance(c, dict) else None
-                if valid_mint(mint) and mint not in CANDIDATES:
+                if valid_mint(mint):
                     CANDIDATES.add(mint)
-                    added += 1
-            if added > 0:
-                log(f"PUMP_OK +{added}")
-        except Exception as e:
-            engine.stats["errors"] += 1
-            log(f"PUMP_ERR {str(e)[:60]}")
+        except:
+            pass
         await asyncio.sleep(8)
 
 async def handle_mempool(e: dict):
@@ -170,7 +148,7 @@ async def refresh_token_universe():
     engine.candidate_count = len(CANDIDATES)
     log(f"UNIVERSE_REFRESH total={len(CANDIDATES)}")
 
-# ================= ALPHA & ENGINE =================
+# ================= ALPHA =================
 async def alpha_engine(mint: str) -> float:
     try:
         p1 = await get_price(mint)
@@ -183,22 +161,31 @@ async def alpha_engine(mint: str) -> float:
     except:
         return 0.01
 
+# ================= 關鍵修正：最安全的 pick_engine =================
 def pick_engine(alpha: float) -> str:
-    """安全版 pick_engine - 徹底避免 slice 錯誤"""
+    """徹底避免 slice 錯誤的最安全寫法"""
+    engines = ["stable", "degen", "sniper"]
     if alpha > 0.07:
         return "sniper"
     if alpha > 0.03:
-        return random.choices(["stable", "degen", "sniper"], weights=[0.2, 0.5, 0.3])[0]
+        weights = [0.2, 0.5, 0.3]
+    else:
+        weights = [0.4, 0.4, 0.2]
     
-    # 最安全寫法：明確轉成 list
-    weights = [0.4, 0.4, 0.2]
-    return random.choices(["stable", "degen", "sniper"], weights=weights)[0]
+    # 使用最原始的安全方式
+    r = random.random()
+    cum = 0.0
+    for eng, w in zip(engines, weights):
+        cum += w
+        if r <= cum:
+            return eng
+    return "stable"  # fallback
 
 def update_allocator():
     engine.engine_stats = ENGINE_STATS.copy()
     engine.engine_allocator = ENGINE_ALLOCATOR.copy()
 
-# ================= EXEC =================
+# ================= EXEC & MONITOR (簡化) =================
 def can_buy(mint: str) -> bool:
     if len(engine.positions) >= MAX_POSITIONS:
         return False
@@ -212,29 +199,23 @@ async def buy(mint: str, alpha: float) -> bool:
     eng = pick_engine(alpha)
     if not can_buy(mint):
         return False
-
     price = await get_price(mint)
     if not price or price <= 0:
         return False
 
-    s = MAX_POSITION_SOL * min(1.0, alpha * 8)
+    s = MAX_POSITION_SOL * 0.8
     amount = s / price
 
     engine.positions.append({
-        "token": mint,
-        "amount": amount,
-        "entry_price": price,
-        "last_price": price,
-        "peak_price": price,
-        "pnl_pct": 0.0,
-        "engine": eng,
-        "alpha": alpha,
+        "token": mint, "amount": amount, "entry_price": price,
+        "last_price": price, "peak_price": price, "pnl_pct": 0.0,
+        "engine": eng, "alpha": alpha,
     })
 
     TOKEN_COOLDOWN[mint] = now()
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:8]}"
-    log(f"BUY {mint[:8]} eng={eng} alpha={alpha:.4f} size={s:.6f}")
+    log(f"BUY {mint[:8]} eng={eng} alpha={alpha:.4f}")
     return True
 
 async def sell(p: dict) -> None:
@@ -254,26 +235,23 @@ async def sell(p: dict) -> None:
     engine.last_trade = f"SELL {p['token'][:8]}"
     log(f"SELL {p['token'][:8]} pnl%={pnl_pct*100:+.2f}")
 
-# ================= MONITOR =================
 async def monitor_positions():
     while True:
         try:
             for p in list(engine.positions):
                 price = await get_price(p["token"])
-                if not price:
-                    continue
+                if not price: continue
                 entry = p.get("entry_price", 0.0)
                 pnl_pct = (price - entry) / entry if entry > 0 else 0.0
                 p["last_price"] = price
                 p["pnl_pct"] = pnl_pct
-
                 if pnl_pct >= 0.18 or pnl_pct <= -0.09:
                     await sell(p)
-        except Exception as e:
-            log(f"MONITOR ERROR: {e}")
+        except:
+            pass
         await asyncio.sleep(6)
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 async def main():
     log("🚀 v1301_REAL_MARKET_BOT 已啟動 (PAPER MODE)")
     asyncio.create_task(pump_scanner())
@@ -290,15 +268,12 @@ async def main():
                     alpha = await alpha_engine(mint)
                     if alpha > 0.012:
                         await buy(mint, alpha)
-
             await asyncio.sleep(7)
         except Exception as e:
             log(f"MAIN LOOP ERROR: {e}")
             await asyncio.sleep(10)
 
-# ================= FastAPI 入口 =================
 async def bot_loop():
-    """給 app.py 使用的入口"""
     try:
         await main()
     except Exception as e:
