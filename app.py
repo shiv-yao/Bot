@@ -1,20 +1,20 @@
 import os
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from state import engine
 
-BOT_STATUS = {"ok": False, "error": ""}
+BOT_TASK = None
 
-# ================= INIT FIX =================
+
+# ================= INIT =================
 
 def init_engine():
     engine.running = True
     engine.mode = getattr(engine, "mode", "PAPER")
-    engine.bot_ok = True
-    engine.bot_error = ""
 
     if not hasattr(engine, "positions"):
         engine.positions = []
@@ -45,34 +45,31 @@ def init_engine():
     if not hasattr(engine, "sol_balance"):
         engine.sol_balance = 1.0
 
+    engine.bot_ok = True
+    engine.bot_error = ""
 
-# ================= BOT START =================
 
-BOT_TASK = None
+# ================= BOT =================
 
 async def start_bot():
     global BOT_TASK
 
+    if BOT_TASK:
+        return  # ✅ 防止重複啟動
+
     try:
         from bot import bot_loop
-
-        if BOT_TASK is None:
-            BOT_TASK = asyncio.create_task(bot_loop())
-
-        BOT_STATUS["ok"] = True
-        BOT_STATUS["error"] = ""
+        BOT_TASK = asyncio.create_task(bot_loop())
 
         engine.bot_ok = True
         engine.bot_error = ""
 
-    except Exception as e:
-        BOT_STATUS["ok"] = False
-        BOT_STATUS["error"] = str(e)
+        engine.logs.append("BOT_STARTED")
 
+    except Exception as e:
         engine.bot_ok = False
         engine.bot_error = str(e)
-
-        engine.logs.append(f"BOT_START_ERROR {str(e)}")
+        engine.logs.append(f"BOT_ERROR {str(e)}")
 
 
 # ================= LIFESPAN =================
@@ -86,26 +83,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 # ================= API =================
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "bot_ok": BOT_STATUS["ok"],
-        "bot_error": BOT_STATUS["error"],
+        "bot_ok": engine.bot_ok,
+        "bot_error": engine.bot_error,
     }
 
 
 @app.get("/data")
 def data():
 
-    # 👉 UI 對齊修正
     positions = []
+
     for p in engine.positions:
         entry = p.get("entry", 0)
         peak = p.get("peak", entry)
-
         last = p.get("last_price", peak)
 
         pnl_pct = 0
@@ -141,7 +138,8 @@ def data():
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """<!DOCTYPE html>
+    return """
+<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -153,7 +151,7 @@ body { background:#0b1020;color:#fff;font-family:sans-serif;padding:20px;}
 </head>
 <body>
 
-<h2>🚀 Quant Dashboard</h2>
+<h2>⚔️ Quant Dashboard</h2>
 
 <div id="main"></div>
 
@@ -162,16 +160,22 @@ async function load(){
   const d = await fetch('/data').then(r=>r.json());
 
   document.getElementById('main').innerHTML = `
-  <div class="card">Capital: ${d.capital}</div>
+  <div class="card">Mode: ${d.mode}</div>
+  <div class="card">Capital: ${d.capital.toFixed(6)}</div>
   <div class="card">Last Trade: ${d.last_trade}</div>
-  <div class="card">Signals: ${d.stats.signals}</div>
-  <div class="card">Buys: ${d.stats.buys}</div>
-  <div class="card">Sells: ${d.stats.sells}</div>
+
+  <div class="card">
+    Signals: ${d.stats.signals} |
+    Buys: ${d.stats.buys} |
+    Sells: ${d.stats.sells} |
+    Errors: ${d.stats.errors}
+  </div>
 
   <div class="card">
     Positions:<br>
-    ${d.positions.map(p=>`
-      ${p.token?.slice(0,6)} pnl=${(p.pnl_pct*100).toFixed(2)}%
+    ${(d.positions||[]).map(p=>`
+      ${p.token?.slice(0,6)} 
+      pnl=${(p.pnl_pct*100).toFixed(2)}%
     `).join("<br>")}
   </div>
 
@@ -187,4 +191,12 @@ load()
 </script>
 
 </body>
-</html>"""
+</html>
+"""
+
+
+# ================= RUN =================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
