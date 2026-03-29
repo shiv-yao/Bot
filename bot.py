@@ -73,11 +73,19 @@ WS_BACKOFF_MIN = int(os.environ.get("WS_BACKOFF_MIN", "2"))
 WS_BACKOFF_MAX = int(os.environ.get("WS_BACKOFF_MAX", "20"))
 
 EARLY_LIQ_MIN_OUT = int(os.environ.get("EARLY_LIQ_MIN_OUT", "1"))
-EARLY_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("EARLY_LIQ_MAX_PRICE_IMPACT", "0.60"))
-STRICT_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("STRICT_LIQ_MAX_PRICE_IMPACT", "0.30"))
+EARLY_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("EARLY_LIQ_MAX_PRICE_IMPACT", "0.85"))
+STRICT_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("STRICT_LIQ_MAX_PRICE_IMPACT", "0.55"))
 
 FORCE_EARLY_ENTRY = os.environ.get("FORCE_EARLY_ENTRY", "true").lower() == "true"
 EARLY_ENTRY_BONUS = float(os.environ.get("EARLY_ENTRY_BONUS", "0.012"))
+SNIPER_RECENT_WINDOW_SEC = int(os.environ.get("SNIPER_RECENT_WINDOW_SEC", "90"))
+EARLY_SOURCE_WINDOW_SEC = int(os.environ.get("EARLY_SOURCE_WINDOW_SEC", "120"))
+FAKE_SIGNAL_MAX_AGE_SEC = int(os.environ.get("FAKE_SIGNAL_MAX_AGE_SEC", "240"))
+
+MIN_STRICT_LIQ_OUT = int(os.environ.get("MIN_STRICT_LIQ_OUT", "50"))
+MIN_SELLBACK_OUT = int(os.environ.get("MIN_SELLBACK_OUT", "1"))
+ENABLE_MEMPOOL_LOGS = os.environ.get("ENABLE_MEMPOOL_LOGS", "true").lower() == "true"
+ENABLE_MEMPOOL_STREAM = os.environ.get("ENABLE_MEMPOOL_STREAM", "true").lower() == "true"
 
 HTTP = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
 
@@ -155,9 +163,10 @@ STRATEGY_LOCAL_STATS = {
 }
 
 # ================= MEMPOOL / EARLY LIQ STATE =================
-SNIPER_CACHE = set()
+SNIPER_CACHE = {}
 RECENT_MEMPOOL_MINTS = {}
 EARLY_LIQ_CACHE = {}
+CANDIDATE_META = {}
 WATCH_PROGRAMS = set(filter(None, [
     os.environ.get("WATCH_PROGRAM_1", ""),
     os.environ.get("WATCH_PROGRAM_2", ""),
@@ -311,6 +320,96 @@ async def _maybe_await(x):
     if asyncio.iscoroutine(x):
         return await x
     return x
+
+
+def candidate_meta(m):
+    if m not in CANDIDATE_META:
+        CANDIDATE_META[m] = {
+            "first_seen": 0.0,
+            "last_seen": 0.0,
+            "hits": 0,
+            "sources": set(),
+            "source_last_seen": {},
+        }
+    return CANDIDATE_META[m]
+
+
+def candidate_age_sec(m) -> float:
+    meta = CANDIDATE_META.get(m)
+    if not meta or not meta.get("last_seen"):
+        return 10**9
+    return now() - meta["last_seen"]
+
+
+def candidate_recent_source(m, source: str, max_age: int) -> bool:
+    meta = CANDIDATE_META.get(m, {})
+    ts = meta.get("source_last_seen", {}).get(source, 0.0)
+    return (now() - ts) <= max_age if ts else False
+
+
+def source_quality_score(m: str) -> float:
+    meta = CANDIDATE_META.get(m, {})
+    sources = meta.get("sources", set())
+
+    score = 0.0
+    if "logs_sub" in sources:
+        score += 0.018
+    if "mempool" in sources:
+        score += 0.020
+    if "pump" in sources:
+        score += 0.010
+    if "jup" in sources:
+        score += 0.004
+
+    if len(sources) >= 2:
+        score += 0.006
+    if len(sources) >= 3:
+        score += 0.006
+
+    age = candidate_age_sec(m)
+    if age <= 30:
+        score += 0.015
+    elif age <= 90:
+        score += 0.008
+    elif age > FAKE_SIGNAL_MAX_AGE_SEC:
+        score -= 0.015
+
+    return score
+
+
+def is_fresh_sniper_candidate(m: str) -> bool:
+    age = candidate_age_sec(m)
+    return (
+        age <= SNIPER_RECENT_WINDOW_SEC
+        or candidate_recent_source(m, "mempool", SNIPER_RECENT_WINDOW_SEC)
+        or candidate_recent_source(m, "logs_sub", SNIPER_RECENT_WINDOW_SEC)
+        or candidate_recent_source(m, "pump", EARLY_SOURCE_WINDOW_SEC)
+    )
+
+
+async def signal_quality_ok(m: str, combo: float, a: float, w: float, s: float, liq_ok: bool, early_ok: bool):
+    if m in {SOL, USDC, USDT}:
+        return False, "BASE_TOKEN"
+
+    age = candidate_age_sec(m)
+
+    # 太舊而且沒有強來源，不做 sniper 類進場
+    if age > FAKE_SIGNAL_MAX_AGE_SEC and w < 1.2 and not early_ok:
+        return False, "STALE"
+
+    # 沒流動性也沒早期流動性，直接拒絕
+    if not liq_ok and not early_ok:
+        return False, "NO_LIQ"
+
+    # 新幣但沒有近期來源，容易是假訊號
+    if m not in STATIC_UNIVERSE and not is_fresh_sniper_candidate(m) and w < 1.3:
+        return False, "NO_FRESH_SOURCE"
+
+    # alpha 很弱又沒有其他支持，跳過
+    if combo < AI_PARAMS["entry_threshold"] and a <= 0 and s < 0.01 and w < 1.2:
+        return False, "WEAK"
+
+    return True, "OK"
 
 # ================= HTTP =================
 def jup_headers():
@@ -571,7 +670,8 @@ async def early_liquidity_ok(m):
     if cache and now() - cache["ts"] < 15:
         return cache["ok"]
 
-    test_sizes = [500_000, 1_000_000, 2_000_000]
+    # 更早期、更小額，盡量不要一開始就 NO_LIQ
+    test_sizes = [100_000, 250_000, 500_000, 1_000_000, 2_000_000]
 
     ok = False
     for amt in test_sizes:
@@ -597,7 +697,8 @@ async def liquidity_ok(m):
     if cache and now() - cache["ts"] < 15:
         return cache["ok"]
 
-    test_sizes = [2_000_000, 5_000_000, 10_000_000]
+    # 改成多段探測，避免 0.01 SOL 才測，導致新池一直 NO_LIQ
+    test_sizes = [250_000, 500_000, 1_000_000, 2_000_000, 5_000_000]
 
     ok = False
     for amt in test_sizes:
@@ -610,7 +711,7 @@ async def liquidity_ok(m):
         out_amount = ensure_int(data.get("outAmount"), 0)
         price_impact = ensure_float(data.get("priceImpactPct"), 999)
 
-        if out_amount > 0 and price_impact < STRICT_LIQ_MAX_PRICE_IMPACT:
+        if out_amount >= MIN_STRICT_LIQ_OUT and price_impact < STRICT_LIQ_MAX_PRICE_IMPACT:
             ok = True
             break
 
@@ -619,12 +720,24 @@ async def liquidity_ok(m):
 
 
 async def anti_rug(m):
-    data = await jupiter_order(m, SOL, 1_000_000)
-    if not data:
+    # 兩段式檢查：能買到、也能小額賣回
+    buy_side = await early_liquidity_ok(m)
+    if not buy_side:
         return False
-    if data.get("errorCode") or data.get("error"):
-        return False
-    return ensure_int(data.get("outAmount"), 0) > 0
+
+    test_sizes = [1, 10, 1000]
+    for amt in test_sizes:
+        data = await jupiter_order(m, SOL, amt)
+        if not data:
+            continue
+        if data.get("errorCode") or data.get("error"):
+            continue
+
+        out_amount = ensure_int(data.get("outAmount"), 0)
+        if out_amount >= MIN_SELLBACK_OUT:
+            return True
+
+    return False
 
 # ================= WALLET GRAPH =================
 async def build_wallet_graph():
@@ -658,6 +771,10 @@ def wallet_score(m):
 
 # ================= TRUE MEMPOOL SNIPER =================
 async def mempool_decode_loop():
+    if not ENABLE_MEMPOOL_STREAM:
+        log_once("mempool_stream_disabled", "MEMPOOL_STREAM_DISABLED", 3600)
+        return
+
     backoff = 3
     while True:
         try:
@@ -678,7 +795,12 @@ async def mempool_decode_loop():
 
 
 async def mempool_logs_subscribe_loop():
+    if not ENABLE_MEMPOOL_LOGS:
+        log_once("mempool_logs_disabled", "MEMPOOL_LOGS_DISABLED", 3600)
+        return
+
     if not WATCH_PROGRAMS:
+        log_once("mempool_logs_no_watch", "MEMPOOL_LOGS_NO_WATCH_PROGRAMS", 3600)
         return
 
     backoff = WS_BACKOFF_MIN
@@ -711,8 +833,18 @@ async def mempool_logs_subscribe_loop():
                     }
                     await ws.send(json.dumps(req))
                     resp = json.loads(await ws.recv())
+
+                    if "error" in resp:
+                        log_once("mempool_logs_method", f"LOGS_SUB_METHOD_ERR {resp['error']}", 300)
+                        await asyncio.sleep(60)
+                        break
+
                     if "result" in resp:
                         sub_ids.append(resp["result"])
+
+                if not sub_ids:
+                    await asyncio.sleep(30)
+                    continue
 
                 log_once("mempool_logs_ready", f"LOGS_SUB_READY {len(sub_ids)} via={ws_url}", 30)
                 backoff = WS_BACKOFF_MIN
@@ -743,22 +875,33 @@ async def mempool_logs_subscribe_loop():
 
 
 async def sniper_bonus(m):
-    if m in SNIPER_CACHE:
-        return 0.0
+    cache = SNIPER_CACHE.get(m)
+    if cache and now() - cache["ts"] < 8:
+        return cache["value"]
 
     bonus = 0.0
-    if m not in STATIC_UNIVERSE:
-        bonus += 0.01 + random.random() * 0.01
 
-    if m in RECENT_MEMPOOL_MINTS and now() - RECENT_MEMPOOL_MINTS[m] < 30:
-        bonus += 0.02
+    if m not in STATIC_UNIVERSE:
+        bonus += 0.006
+
+    if candidate_recent_source(m, "mempool", SNIPER_RECENT_WINDOW_SEC):
+        bonus += 0.020
+    if candidate_recent_source(m, "logs_sub", SNIPER_RECENT_WINDOW_SEC):
+        bonus += 0.018
+    if candidate_recent_source(m, "pump", EARLY_SOURCE_WINDOW_SEC):
+        bonus += 0.010
+
+    bonus += source_quality_score(m)
 
     if FORCE_EARLY_ENTRY and await early_liquidity_ok(m):
         bonus += EARLY_ENTRY_BONUS
 
-    if bonus > 0:
-        SNIPER_CACHE.add(m)
+    age = candidate_age_sec(m)
+    if age > FAKE_SIGNAL_MAX_AGE_SEC:
+        bonus -= 0.020
 
+    bonus = max(0.0, bonus)
+    SNIPER_CACHE[m] = {"value": bonus, "ts": now()}
     return bonus
 
 # ================= ALPHA =================
@@ -790,8 +933,19 @@ def position_size(combo):
 
 
 async def rank_candidates():
+    # 優先最近看到、來源較強的候選
+    pool = list(CANDIDATES)
+
+    def sort_key(m):
+        meta = CANDIDATE_META.get(m, {})
+        last_seen = meta.get("last_seen", 0.0)
+        hits = meta.get("hits", 0)
+        return (last_seen, hits)
+
+    pool.sort(key=sort_key, reverse=True)
     ranked = []
-    for m in list(CANDIDATES)[-40:]:
+
+    for m in pool[:60]:
         try:
             a = await alpha(m)
             w = wallet_score(m)
@@ -1139,10 +1293,24 @@ async def ai_loop():
 
 # ================= SOURCES =================
 async def add_candidate(m, source="unknown"):
-    if valid_mint(m):
-        CANDIDATES.add(m)
-        engine.stats["adds"] += 1
-        log_once(f"cand_{m}", f"ADD {m[:6]} src={source}", 120)
+    if not valid_mint(m):
+        return
+
+    CANDIDATES.add(m)
+    engine.stats["adds"] += 1
+
+    meta = candidate_meta(m)
+    if not meta["first_seen"]:
+        meta["first_seen"] = now()
+    meta["last_seen"] = now()
+    meta["hits"] += 1
+    meta["sources"].add(source)
+    meta["source_last_seen"][source] = now()
+
+    if source in {"mempool", "logs_sub"}:
+        RECENT_MEMPOOL_MINTS[m] = now()
+
+    log_once(f"cand_{m}", f"ADD {m[:6]} src={source}", 120)
 
 
 async def pump():
@@ -1233,6 +1401,23 @@ async def main():
                     continue
 
                 effective_combo = combo + (EARLY_ENTRY_BONUS if early_ok and not liq_ok else 0.0)
+
+                ok_signal, reason = await signal_quality_ok(
+                    m=m,
+                    combo=effective_combo,
+                    a=a,
+                    w=w,
+                    s=s,
+                    liq_ok=liq_ok,
+                    early_ok=early_ok,
+                )
+                if not ok_signal:
+                    log_once(
+                        f"skip_fake_{m}",
+                        f"SKIP {m[:6]} SIGNAL_{reason} combo={effective_combo:.4f}",
+                        30,
+                    )
+                    continue
 
                 engine.last_signal = (
                     f"{m[:6]} a={a:.4f} w={w:.2f} s={s:.4f} "
