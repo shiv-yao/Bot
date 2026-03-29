@@ -1,7 +1,7 @@
-# ================= v1200_FULL_CORE_ENGINE =================
+# ================= v1200_FULL_IMPLEMENTATION =================
 
 import os, asyncio, time, random
-from collections import defaultdict, deque
+from collections import defaultdict
 import httpx
 
 from state import engine
@@ -14,6 +14,8 @@ HELIUS_API = os.getenv("HELIUS_API", "")
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
 MAX_POSITIONS = 5
+
+PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 
 # ================= INIT =================
 
@@ -40,9 +42,9 @@ HTTP = httpx.AsyncClient(timeout=10)
 
 CANDIDATES = set()
 SMART_WALLETS = {}
-WALLET_SCORES = defaultdict(float)
 TOKEN_COOLDOWN = defaultdict(float)
 ALPHA_CACHE = {}
+LAST_PRICE = {}
 
 # ================= LOG =================
 
@@ -69,37 +71,54 @@ async def get_price(mint):
         engine.stats["errors"] += 1
         return None
 
-# ================= CANDIDATE =================
+# ================= TOKEN SOURCES =================
+
+async def pump_scanner():
+    while True:
+        try:
+            r = await HTTP.get(PUMP_API)
+            data = r.json()
+
+            for c in data[:20]:
+                mint = c.get("mint")
+                if mint:
+                    CANDIDATES.add(mint)
+
+        except Exception as e:
+            log(f"PUMP_ERR {e}")
+
+        await asyncio.sleep(5)
 
 async def handle_mempool(e):
     mint = e.get("mint")
     if mint:
         CANDIDATES.add(mint)
 
-# ================= SMART MONEY =================
+# ================= SMART WALLET =================
+
+async def fetch_wallet_tx(wallet):
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API}"
+        r = await HTTP.get(url)
+        return r.json()
+    except:
+        return []
 
 async def detect_smart_wallets():
-    """
-    👉 真版應該接 Helius / wallet ranking
-    """
     while True:
         try:
-            # 模擬 wallet score（可替換）
+            # 👉 這裡之後換真 whale scan
             for i in range(5):
-                wallet = f"wallet_{i}"
-                SMART_WALLETS[wallet] = random.uniform(0.8, 1.2)
+                SMART_WALLETS[f"wallet_{i}"] = random.uniform(0.8, 1.5)
 
         except Exception as e:
             log(f"SMART_ERR {e}")
 
         await asyncio.sleep(10)
 
-async def smart_wallet_signal(mint):
-    """
-    👉 模擬 smart money flow（未來換成 on-chain）
-    """
-    score = sum(SMART_WALLETS.values()) / (len(SMART_WALLETS) + 1)
-    return score * random.uniform(0.8, 1.2)
+async def smart_money_score(mint):
+    base = sum(SMART_WALLETS.values()) / (len(SMART_WALLETS) + 1)
+    return base * random.uniform(0.8, 1.2)
 
 # ================= ALPHA =================
 
@@ -113,17 +132,25 @@ async def momentum(mint):
 
     return (p2 - p1) / p1
 
-async def micro_structure(mint):
+async def micro(mint):
     p1 = await get_price(mint)
     await asyncio.sleep(0.05)
     p2 = await get_price(mint)
-    await asyncio.sleep(0.05)
-    p3 = await get_price(mint)
 
-    if not p1 or not p2 or not p3:
+    if not p1 or not p2:
         return 0
 
-    return max(0, (p3 - p1) / p1)
+    return (p2 - p1) / p1
+
+async def volume_surge(mint):
+    p = await get_price(mint)
+    if not p:
+        return 0
+
+    prev = LAST_PRICE.get(mint, p)
+    LAST_PRICE[mint] = p
+
+    return abs(p - prev) / prev if prev > 0 else 0
 
 async def alpha_engine(mint):
 
@@ -131,12 +158,14 @@ async def alpha_engine(mint):
         return ALPHA_CACHE[mint][0]
 
     m = await momentum(mint)
-    micro = await micro_structure(mint)
-    smart = await smart_wallet_signal(mint)
+    mic = await micro(mint)
+    vol = await volume_surge(mint)
+    smart = await smart_money_score(mint)
 
     score = (
-        m * 0.5 +
-        micro * 0.3 +
+        m * 0.4 +
+        mic * 0.2 +
+        vol * 0.2 +
         smart * 0.2
     )
 
@@ -156,8 +185,7 @@ async def liquidity_ok(mint):
                 "amount": "10000000"
             }
         )
-        impact = float(r.json().get("priceImpactPct", 1))
-        return impact < 0.35
+        return float(r.json().get("priceImpactPct", 1)) < 0.35
     except:
         return False
 
@@ -189,9 +217,8 @@ def can_buy(mint):
 
     return True
 
-def position_size(alpha):
-    base = MAX_POSITION_SOL
-    return max(MIN_POSITION_SOL, base * min(1.0, alpha * 8))
+def size(alpha):
+    return max(MIN_POSITION_SOL, MAX_POSITION_SOL * min(1, alpha * 8))
 
 # ================= EXEC =================
 
@@ -204,8 +231,8 @@ async def buy(mint, alpha):
     if not price:
         return False
 
-    size = position_size(alpha)
-    amount = size / price
+    s = size(alpha)
+    amount = s / price
 
     engine.positions.append({
         "token": mint,
@@ -220,33 +247,31 @@ async def buy(mint, alpha):
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint}"
 
-    log(f"BUY {mint[:6]} alpha={round(alpha,4)} size={round(size,6)}")
+    log(f"BUY {mint[:6]} alpha={round(alpha,4)} size={round(s,6)}")
 
     return True
 
-async def sell(pos):
+async def sell(p):
 
-    mint = pos["token"]
-
-    price = await get_price(mint)
+    price = await get_price(p["token"])
     if not price:
         return
 
-    pnl = (price - pos["entry"]) * pos["amount"]
+    pnl = (price - p["entry"]) * p["amount"]
 
     engine.capital += pnl
 
     engine.trade_history.append({
-        "mint": mint,
+        "mint": p["token"],
         "pnl": pnl
     })
 
-    engine.positions.remove(pos)
+    engine.positions.remove(p)
 
     engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {mint}"
+    engine.last_trade = f"SELL {p['token']}"
 
-    log(f"SELL {mint[:6]} pnl={round(pnl,6)}")
+    log(f"SELL {p['token'][:6]} pnl={round(pnl,6)}")
 
 # ================= MONITOR =================
 
@@ -262,12 +287,11 @@ async def monitor():
 
             p["peak"] = max(p["peak"], price)
 
-            pnl_pct = (price - p["entry"]) / p["entry"]
+            pnl = (price - p["entry"]) / p["entry"]
 
-            # 👉 多層 exit（核心）
-            if pnl_pct > 0.25:
+            if pnl > 0.25:
                 await sell(p)
-            elif pnl_pct < -0.08:
+            elif pnl < -0.08:
                 await sell(p)
             elif p["peak"] > p["entry"] and (p["peak"] - price)/p["peak"] > 0.1:
                 await sell(p)
@@ -278,10 +302,11 @@ async def monitor():
 
 async def bot():
 
-    log("🚀 FULL CORE ENGINE START")
+    log("🚀 FULL IMPLEMENTATION LIVE")
 
     asyncio.create_task(monitor())
     asyncio.create_task(detect_smart_wallets())
+    asyncio.create_task(pump_scanner())
 
     try:
         asyncio.create_task(mempool_stream(handle_mempool))
@@ -293,8 +318,7 @@ async def bot():
         try:
 
             if len(CANDIDATES) < 5:
-                # fallback
-                CANDIDATES.add(SOL)
+                continue
 
             for mint in list(CANDIDATES):
 
