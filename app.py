@@ -2,33 +2,91 @@ import os
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
 from state import engine
 
 BOT_STATUS = {"ok": False, "error": ""}
 
+# ================= INIT FIX =================
+
+def init_engine():
+    engine.running = True
+    engine.mode = getattr(engine, "mode", "PAPER")
+    engine.bot_ok = True
+    engine.bot_error = ""
+
+    if not hasattr(engine, "positions"):
+        engine.positions = []
+
+    if not hasattr(engine, "logs"):
+        engine.logs = []
+
+    if not hasattr(engine, "trade_history"):
+        engine.trade_history = []
+
+    if not hasattr(engine, "stats"):
+        engine.stats = {
+            "signals": 0,
+            "buys": 0,
+            "sells": 0,
+            "errors": 0
+        }
+
+    if not hasattr(engine, "last_trade"):
+        engine.last_trade = ""
+
+    if not hasattr(engine, "last_signal"):
+        engine.last_signal = ""
+
+    if not hasattr(engine, "capital"):
+        engine.capital = 1.0
+
+    if not hasattr(engine, "sol_balance"):
+        engine.sol_balance = 1.0
+
+
+# ================= BOT START =================
+
+BOT_TASK = None
 
 async def start_bot():
+    global BOT_TASK
+
     try:
         from bot import bot_loop
-        asyncio.create_task(bot_loop())
+
+        if BOT_TASK is None:
+            BOT_TASK = asyncio.create_task(bot_loop())
+
         BOT_STATUS["ok"] = True
         BOT_STATUS["error"] = ""
+
+        engine.bot_ok = True
+        engine.bot_error = ""
+
     except Exception as e:
         BOT_STATUS["ok"] = False
         BOT_STATUS["error"] = str(e)
-        engine.log(f"BOT START ERROR: {e}")
 
+        engine.bot_ok = False
+        engine.bot_error = str(e)
+
+        engine.logs.append(f"BOT_START_ERROR {str(e)}")
+
+
+# ================= LIFESPAN =================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_engine()
     await start_bot()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
 
+# ================= API =================
 
 @app.get("/health")
 def health():
@@ -41,6 +99,28 @@ def health():
 
 @app.get("/data")
 def data():
+
+    # 👉 UI 對齊修正
+    positions = []
+    for p in engine.positions:
+        entry = p.get("entry", 0)
+        peak = p.get("peak", entry)
+
+        last = p.get("last_price", peak)
+
+        pnl_pct = 0
+        if entry > 0:
+            pnl_pct = (last - entry) / entry
+
+        positions.append({
+            "token": p.get("token"),
+            "amount": p.get("amount"),
+            "entry_price": entry,
+            "last_price": last,
+            "peak_price": peak,
+            "pnl_pct": pnl_pct
+        })
+
     return {
         "running": engine.running,
         "mode": engine.mode,
@@ -48,7 +128,7 @@ def data():
         "capital": engine.capital,
         "last_signal": engine.last_signal,
         "last_trade": engine.last_trade,
-        "positions": list(engine.positions),
+        "positions": positions,
         "logs": list(engine.logs)[-50:],
         "stats": dict(engine.stats),
         "trade_history": list(engine.trade_history)[-100:],
@@ -57,214 +137,54 @@ def data():
     }
 
 
+# ================= UI =================
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
-<!DOCTYPE html>
-<html lang="zh-Hant">
+    return """<!DOCTYPE html>
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Quant Dashboard</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      background: #0b1020;
-      color: #e5e7eb;
-      padding: 20px;
-    }
-    .wrap {
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-    .title {
-      font-size: 28px;
-      font-weight: 700;
-      margin-bottom: 18px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 14px;
-    }
-    .card {
-      background: #121a2f;
-      border: 1px solid #1f2a44;
-      border-radius: 14px;
-      padding: 16px;
-      overflow: auto;
-    }
-    .full { grid-column: 1 / -1; }
-    .two { grid-column: span 2; }
-    .label {
-      color: #93a3b8;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-    .value {
-      font-size: 24px;
-      font-weight: 700;
-    }
-    ul { margin: 0; padding-left: 18px; }
-    li { margin-bottom: 6px; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
-    th, td {
-      border-bottom: 1px solid #22304f;
-      text-align: left;
-      padding: 8px 6px;
-      vertical-align: top;
-    }
-    @media (max-width: 1000px) {
-      .grid { grid-template-columns: 1fr 1fr; }
-      .two { grid-column: span 2; }
-    }
-    @media (max-width: 520px) {
-      .grid { grid-template-columns: 1fr; }
-      .two, .full { grid-column: auto; }
-    }
-  </style>
+<meta charset="UTF-8">
+<title>Quant Dashboard</title>
+<style>
+body { background:#0b1020;color:#fff;font-family:sans-serif;padding:20px;}
+.card {background:#121a2f;padding:12px;margin:6px;border-radius:10px;}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="title">⚔️ Quant Dashboard</div>
 
-    <div class="grid">
-      <div class="card">
-        <div class="label">模式</div>
-        <div class="value" id="mode">-</div>
-      </div>
-      <div class="card">
-        <div class="label">SOL 餘額</div>
-        <div class="value" id="sol_balance">0</div>
-      </div>
-      <div class="card">
-        <div class="label">資金</div>
-        <div class="value" id="capital">0</div>
-      </div>
-      <div class="card">
-        <div class="label">最後交易</div>
-        <div class="value" id="last_trade" style="font-size:16px;">-</div>
-      </div>
+<h2>🚀 Quant Dashboard</h2>
 
-      <div class="card">
-        <div class="label">訊號數</div>
-        <div class="value" id="signals">0</div>
-      </div>
-      <div class="card">
-        <div class="label">買入數</div>
-        <div class="value" id="buys">0</div>
-      </div>
-      <div class="card">
-        <div class="label">賣出數</div>
-        <div class="value" id="sells">0</div>
-      </div>
-      <div class="card">
-        <div class="label">錯誤數</div>
-        <div class="value" id="errors">0</div>
-      </div>
+<div id="main"></div>
 
-      <div class="card full">
-        <div class="label">最新訊號</div>
-        <div id="last_signal">-</div>
-      </div>
+<script>
+async function load(){
+  const d = await fetch('/data').then(r=>r.json());
 
-      <div class="card two">
-        <div class="label">持倉</div>
-        <div id="positions">無持倉</div>
-      </div>
+  document.getElementById('main').innerHTML = `
+  <div class="card">Capital: ${d.capital}</div>
+  <div class="card">Last Trade: ${d.last_trade}</div>
+  <div class="card">Signals: ${d.stats.signals}</div>
+  <div class="card">Buys: ${d.stats.buys}</div>
+  <div class="card">Sells: ${d.stats.sells}</div>
 
-      <div class="card two">
-        <div class="label">Logs</div>
-        <ul id="logs"></ul>
-      </div>
-
-      <div class="card full">
-        <div class="label">Trade History</div>
-        <div id="history">暫無資料</div>
-      </div>
-    </div>
+  <div class="card">
+    Positions:<br>
+    ${d.positions.map(p=>`
+      ${p.token?.slice(0,6)} pnl=${(p.pnl_pct*100).toFixed(2)}%
+    `).join("<br>")}
   </div>
 
-  <script>
-    async function load() {
-      const res = await fetch('/data');
-      const d = await res.json();
+  <div class="card">
+    Logs:<br>
+    ${(d.logs||[]).slice(-10).join("<br>")}
+  </div>
+  `;
+}
 
-      document.getElementById('mode').textContent = d.mode || '-';
-      document.getElementById('sol_balance').textContent = Number(d.sol_balance || 0).toFixed(6);
-      document.getElementById('capital').textContent = Number(d.capital || 0).toFixed(6);
-      document.getElementById('last_trade').textContent = d.last_trade || '-';
-      document.getElementById('last_signal').textContent = d.last_signal || '-';
-      document.getElementById('signals').textContent = d.stats?.signals ?? 0;
-      document.getElementById('buys').textContent = d.stats?.buys ?? 0;
-      document.getElementById('sells').textContent = d.stats?.sells ?? 0;
-      document.getElementById('errors').textContent = d.stats?.errors ?? 0;
+setInterval(load,2000)
+load()
+</script>
 
-      const pos = document.getElementById('positions');
-      if (!d.positions || d.positions.length === 0) {
-        pos.textContent = '無持倉';
-      } else {
-        pos.innerHTML = '<ul>' + d.positions.map(
-          p => `<li>
-            ${p.token || '-'} |
-            amount=${p.amount ?? 0} |
-            entry=${p.entry_price ?? 0} |
-            last=${p.last_price ?? 0} |
-            peak=${p.peak_price ?? 0} |
-            pnl=${((p.pnl_pct ?? 0) * 100).toFixed(2)}%
-          </li>`
-        ).join('') + '</ul>';
-      }
-
-      const logs = document.getElementById('logs');
-      logs.innerHTML = '';
-      (d.logs || []).slice().reverse().forEach(line => {
-        const li = document.createElement('li');
-        li.textContent = line;
-        logs.appendChild(li);
-      });
-
-      const hist = document.getElementById('history');
-      const rows = d.trade_history || [];
-      if (rows.length === 0) {
-        hist.textContent = '暫無資料';
-      } else {
-        hist.innerHTML = `
-          <table>
-            <thead>
-              <tr>
-                <th>Side</th>
-                <th>Mint</th>
-                <th>Result</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows.map(r => `
-                <tr>
-                  <td>${r.side ?? ''}</td>
-                  <td>${(r.mint ?? '').slice(0, 12)}</td>
-                  <td><pre style="white-space:pre-wrap;">${JSON.stringify(r.result ?? {}, null, 2)}</pre></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        `;
-      }
-    }
-
-    load();
-    setInterval(load, 2000);
-  </script>
 </body>
-</html>
-    """
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+</html>"""
