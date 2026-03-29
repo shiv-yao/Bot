@@ -1,5 +1,6 @@
 import os
 import asyncio
+import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,87 +11,144 @@ from state import engine
 BOT_TASK = None
 
 
+# ================= SAFE HELPERS =================
+
+def ensure_list(x):
+    return x if isinstance(x, list) else []
+
+def ensure_dict(x):
+    return x if isinstance(x, dict) else {}
+
+def ensure_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def ensure_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def ensure_str(x, default=""):
+    try:
+        return str(x)
+    except Exception:
+        return default
+
+
 # ================= INIT =================
 
 def init_engine():
-    engine.running = True
-    engine.mode = getattr(engine, "mode", "PAPER")
+    engine.running = bool(getattr(engine, "running", True))
+    engine.mode = ensure_str(getattr(engine, "mode", "PAPER"), "PAPER")
 
-    if not hasattr(engine, "positions"):
-        engine.positions = []
+    engine.positions = ensure_list(getattr(engine, "positions", []))
+    engine.logs = ensure_list(getattr(engine, "logs", []))
+    engine.trade_history = ensure_list(getattr(engine, "trade_history", []))
 
-    if not hasattr(engine, "logs"):
-        engine.logs = []
+    raw_stats = ensure_dict(getattr(engine, "stats", {}))
+    engine.stats = {
+        "signals": ensure_int(raw_stats.get("signals", 0)),
+        "buys": ensure_int(raw_stats.get("buys", 0)),
+        "sells": ensure_int(raw_stats.get("sells", 0)),
+        "errors": ensure_int(raw_stats.get("errors", 0)),
+    }
 
-    if not hasattr(engine, "trade_history"):
-        engine.trade_history = []
+    engine.last_trade = ensure_str(getattr(engine, "last_trade", ""))
+    engine.last_signal = ensure_str(getattr(engine, "last_signal", ""))
 
-    if not hasattr(engine, "stats"):
-        engine.stats = {
-            "signals": 0,
-            "buys": 0,
-            "sells": 0,
-            "errors": 0,
-        }
+    engine.capital = ensure_float(getattr(engine, "capital", 1.0), 1.0)
+    engine.sol_balance = ensure_float(getattr(engine, "sol_balance", 1.0), 1.0)
 
-    if not hasattr(engine, "last_trade"):
-        engine.last_trade = ""
+    engine.bot_ok = bool(getattr(engine, "bot_ok", True))
+    engine.bot_error = ensure_str(getattr(engine, "bot_error", ""))
 
-    if not hasattr(engine, "last_signal"):
-        engine.last_signal = ""
+    raw_engine_stats = ensure_dict(getattr(engine, "engine_stats", {}))
+    engine.engine_stats = {
+        "stable": {
+            "pnl": ensure_float(ensure_dict(raw_engine_stats.get("stable", {})).get("pnl", 0.0)),
+            "trades": ensure_int(ensure_dict(raw_engine_stats.get("stable", {})).get("trades", 0)),
+            "wins": ensure_int(ensure_dict(raw_engine_stats.get("stable", {})).get("wins", 0)),
+        },
+        "degen": {
+            "pnl": ensure_float(ensure_dict(raw_engine_stats.get("degen", {})).get("pnl", 0.0)),
+            "trades": ensure_int(ensure_dict(raw_engine_stats.get("degen", {})).get("trades", 0)),
+            "wins": ensure_int(ensure_dict(raw_engine_stats.get("degen", {})).get("wins", 0)),
+        },
+        "sniper": {
+            "pnl": ensure_float(ensure_dict(raw_engine_stats.get("sniper", {})).get("pnl", 0.0)),
+            "trades": ensure_int(ensure_dict(raw_engine_stats.get("sniper", {})).get("trades", 0)),
+            "wins": ensure_int(ensure_dict(raw_engine_stats.get("sniper", {})).get("wins", 0)),
+        },
+    }
 
-    if not hasattr(engine, "capital"):
-        engine.capital = 1.0
+    raw_allocator = ensure_dict(getattr(engine, "engine_allocator", {}))
+    engine.engine_allocator = {
+        "stable": ensure_float(raw_allocator.get("stable", 0.4), 0.4),
+        "degen": ensure_float(raw_allocator.get("degen", 0.4), 0.4),
+        "sniper": ensure_float(raw_allocator.get("sniper", 0.2), 0.2),
+    }
 
-    if not hasattr(engine, "sol_balance"):
-        engine.sol_balance = 1.0
+    engine.candidate_count = ensure_int(getattr(engine, "candidate_count", 0), 0)
 
-    if not hasattr(engine, "bot_ok"):
-        engine.bot_ok = True
+    engine.logs = [ensure_str(x) for x in engine.logs][-200:]
+    engine.trade_history = ensure_list(engine.trade_history)[-300:]
+    engine.positions = [p for p in engine.positions if isinstance(p, dict)][:50]
 
-    if not hasattr(engine, "bot_error"):
-        engine.bot_error = ""
 
-    if not hasattr(engine, "engine_stats"):
-        engine.engine_stats = {
-            "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
-            "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
-            "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
-        }
-
-    if not hasattr(engine, "engine_allocator"):
-        engine.engine_allocator = {
-            "stable": 0.4,
-            "degen": 0.4,
-            "sniper": 0.2,
-        }
-
-    if not hasattr(engine, "candidate_count"):
-        engine.candidate_count = 0
+def log(msg: str):
+    init_engine()
+    engine.logs.append(ensure_str(msg))
+    engine.logs = engine.logs[-200:]
+    print(f"[APP] {msg}")
 
 
 # ================= BOT =================
 
 async def start_bot():
     global BOT_TASK
+    init_engine()
 
     if BOT_TASK is not None and not BOT_TASK.done():
         return
 
     try:
         from bot import bot_loop
-        BOT_TASK = asyncio.create_task(bot_loop())
 
+        BOT_TASK = asyncio.create_task(bot_loop(), name="bot_loop_task")
         engine.bot_ok = True
         engine.bot_error = ""
 
-        if not any("BOT_STARTED" in x for x in engine.logs[-5:]):
-            engine.logs.append("BOT_STARTED")
+        recent_logs = ensure_list(engine.logs)[-10:]
+        if not any("BOT_STARTED" in ensure_str(x) for x in recent_logs):
+            log("BOT_STARTED")
 
     except Exception as e:
         engine.bot_ok = False
-        engine.bot_error = str(e)
-        engine.logs.append(f"BOT_ERROR {str(e)}")
+        engine.bot_error = ensure_str(e)
+        engine.stats["errors"] = ensure_int(engine.stats.get("errors", 0)) + 1
+        log(f"BOT_START_ERROR {e}")
+        log(traceback.format_exc()[:1000])
+
+
+async def stop_bot():
+    global BOT_TASK
+
+    if BOT_TASK is None:
+        return
+
+    if not BOT_TASK.done():
+        BOT_TASK.cancel()
+        try:
+            await BOT_TASK
+        except asyncio.CancelledError:
+            log("BOT_STOPPED")
+        except Exception as e:
+            log(f"BOT_STOP_ERROR {e}")
+
+    BOT_TASK = None
 
 
 # ================= LIFESPAN =================
@@ -99,7 +157,10 @@ async def start_bot():
 async def lifespan(app: FastAPI):
     init_engine()
     await start_bot()
-    yield
+    try:
+        yield
+    finally:
+        await stop_bot()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -108,23 +169,53 @@ app = FastAPI(lifespan=lifespan)
 # ================= HELPERS =================
 
 def normalize_position(p: dict):
-    entry = p.get("entry_price", p.get("entry", 0))
-    last = p.get("last_price", entry)
-    peak = p.get("peak_price", p.get("peak", entry))
+    if not isinstance(p, dict):
+        return {
+            "token": "",
+            "amount": 0.0,
+            "entry_price": 0.0,
+            "last_price": 0.0,
+            "peak_price": 0.0,
+            "pnl_pct": 0.0,
+            "engine": "",
+            "alpha": 0.0,
+        }
+
+    entry = ensure_float(p.get("entry_price", p.get("entry", 0)), 0.0)
+    last = ensure_float(p.get("last_price", entry), entry)
+    peak = ensure_float(p.get("peak_price", p.get("peak", entry)), entry)
 
     pnl_pct = p.get("pnl_pct")
     if pnl_pct is None:
-        pnl_pct = ((last - entry) / entry) if entry and entry > 0 else 0.0
+        pnl_pct = ((last - entry) / entry) if entry > 0 else 0.0
+    pnl_pct = ensure_float(pnl_pct, 0.0)
 
     return {
-        "token": p.get("token"),
-        "amount": p.get("amount", 0),
-        "entry_price": entry or 0,
-        "last_price": last or 0,
-        "peak_price": peak or 0,
-        "pnl_pct": pnl_pct or 0,
-        "engine": p.get("engine", ""),
-        "alpha": p.get("alpha", 0),
+        "token": ensure_str(p.get("token", "")),
+        "amount": ensure_float(p.get("amount", 0), 0.0),
+        "entry_price": entry,
+        "last_price": last,
+        "peak_price": peak,
+        "pnl_pct": pnl_pct,
+        "engine": ensure_str(p.get("engine", "")),
+        "alpha": ensure_float(p.get("alpha", 0), 0.0),
+    }
+
+
+def normalize_trade(x):
+    if not isinstance(x, dict):
+        return {"raw": ensure_str(x)}
+
+    return {
+        "token": ensure_str(x.get("token", x.get("mint", ""))),
+        "entry_price": ensure_float(x.get("entry_price", 0.0), 0.0),
+        "exit_price": ensure_float(x.get("exit_price", 0.0), 0.0),
+        "pnl_pct": ensure_float(x.get("pnl_pct", 0.0), 0.0),
+        "engine": ensure_str(x.get("engine", "")),
+        "alpha": ensure_float(x.get("alpha", 0.0), 0.0),
+        "side": ensure_str(x.get("side", "TRADE")),
+        "ts": x.get("ts"),
+        "raw": x,
     }
 
 
@@ -132,33 +223,50 @@ def normalize_position(p: dict):
 
 @app.get("/health")
 def health():
+    init_engine()
     return {
         "ok": True,
         "bot_ok": engine.bot_ok,
         "bot_error": engine.bot_error,
+        "task_running": BOT_TASK is not None and not BOT_TASK.done(),
     }
 
 
 @app.get("/data")
 def data():
-    positions = [normalize_position(p) for p in engine.positions]
+    init_engine()
+
+    positions = [normalize_position(p) for p in ensure_list(engine.positions)]
+    trade_history = [normalize_trade(x) for x in ensure_list(engine.trade_history)[-100:]]
 
     return {
-        "running": engine.running,
-        "mode": engine.mode,
-        "sol_balance": engine.sol_balance,
-        "capital": engine.capital,
-        "last_signal": engine.last_signal,
-        "last_trade": engine.last_trade,
+        "running": bool(engine.running),
+        "mode": ensure_str(engine.mode),
+        "sol_balance": ensure_float(engine.sol_balance, 0.0),
+        "capital": ensure_float(engine.capital, 0.0),
+        "last_signal": ensure_str(engine.last_signal),
+        "last_trade": ensure_str(engine.last_trade),
         "positions": positions,
-        "logs": list(engine.logs)[-80:],
-        "stats": dict(engine.stats),
-        "trade_history": list(engine.trade_history)[-100:],
+        "logs": [ensure_str(x) for x in ensure_list(engine.logs)[-80:]],
+        "stats": dict(ensure_dict(engine.stats)),
+        "trade_history": trade_history,
+        "bot_ok": bool(engine.bot_ok),
+        "bot_error": ensure_str(engine.bot_error),
+        "engine_stats": dict(ensure_dict(engine.engine_stats)),
+        "engine_allocator": dict(ensure_dict(engine.engine_allocator)),
+        "candidate_count": ensure_int(engine.candidate_count, 0),
+    }
+
+
+@app.post("/restart")
+async def restart_bot():
+    init_engine()
+    await stop_bot()
+    await start_bot()
+    return {
+        "ok": True,
         "bot_ok": engine.bot_ok,
         "bot_error": engine.bot_error,
-        "engine_stats": dict(getattr(engine, "engine_stats", {})),
-        "engine_allocator": dict(getattr(engine, "engine_allocator", {})),
-        "candidate_count": getattr(engine, "candidate_count", 0),
     }
 
 
@@ -172,7 +280,7 @@ def home():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Quant Dashboard</title>
+<title>Quant Dashboard v1302</title>
 <style>
 body {
   background: #0b1020;
@@ -217,6 +325,17 @@ pre {
 .row {
   margin-bottom: 8px;
 }
+button {
+  background: #1f6feb;
+  color: white;
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+button:hover {
+  opacity: 0.92;
+}
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr 1fr; }
   .two { grid-column: span 2; }
@@ -229,7 +348,10 @@ pre {
 </head>
 <body>
 <div class="wrap">
-  <h2>Quant Dashboard v1300</h2>
+  <h2>Quant Dashboard v1302</h2>
+  <div style="margin-bottom: 12px;">
+    <button onclick="restartBot()">Restart Bot</button>
+  </div>
   <div id="main"></div>
 </div>
 
@@ -257,6 +379,15 @@ function renderAllocator(a) {
   }).join("");
 }
 
+async function restartBot() {
+  try {
+    await fetch('/restart', { method: 'POST' });
+    setTimeout(load, 1000);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
 async function load() {
   const d = await fetch('/data').then(r => r.json());
 
@@ -280,8 +411,8 @@ async function load() {
     ? 'No trade history'
     : (d.trade_history || []).slice().reverse().map(x => `
       <div style="margin-bottom:8px;">
-        <b>${x.side || 'TRADE'}</b> ${(x.mint || '').slice(0, 12)}
-        <pre>${JSON.stringify(x.result || x, null, 2)}</pre>
+        <b>${x.side || 'TRADE'}</b> ${(x.token || '').slice(0, 12)}
+        <pre>${JSON.stringify(x.raw || x, null, 2)}</pre>
       </div>
     `).join('');
 
