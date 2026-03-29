@@ -422,22 +422,45 @@ def jup_headers():
 
 async def http_get_json(url, params=None, headers=None):
     last_err = None
+
     for attempt in range(RPC_RETRY):
         try:
             async with RPC_SEM:
-                r = await HTTP.get(url, params=params, headers=headers)
+                r = await HTTP.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=RPC_TIMEOUT,
+                )
 
+            # ===== 成功 =====
             if r.status_code == 200:
                 return r.json()
 
             last_err = f"GET {url} status={r.status_code}"
-            if r.status_code in (408, 425, 429, 500, 502, 503, 504):
+
+            # ===== 429 / rate limit =====
+            if r.status_code == 429:
+                await asyncio.sleep(1.5 + attempt)
+                continue
+
+            # ===== transient errors =====
+            if r.status_code in (408, 425, 500, 502, 503, 504):
                 await asyncio.sleep(min(1.5 * (attempt + 1), 5))
                 continue
+
             return None
 
         except Exception as e:
             last_err = str(e)
+
+            # ===== DNS error（Railway 常見）=====
+            if "No address associated with hostname" in last_err:
+                log_once("dns_err", f"DNS_FAIL {url}", 10)
+                await asyncio.sleep(2)
+                return None
+
+            # ===== timeout / connection =====
             await asyncio.sleep(min(1.2 * (attempt + 1), 5))
 
     log_once(f"http_get_{url}", f"HTTP_GET_ERR {last_err}", 20)
@@ -478,32 +501,56 @@ async def rpc_post(method: str, params, role: str = "default"):
             async with RPC_SEM:
                 r = await HTTP.post(
                     rpc_url,
-                    json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": method,
+                        "params": params,
+                    },
                     timeout=RPC_TIMEOUT,
                 )
 
+            # ===== 成功 =====
             if r.status_code == 200:
                 data = r.json()
+
+                # RPC error inside response
                 if "error" in data and data["error"]:
-                    err_txt = str(data["error"])
-                    if is_rate_limit_error_text(err_txt):
-                        mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
-                        await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+                    err_txt = str(data["error"]).lower()
+
+                    if "429" in err_txt or "rate limit" in err_txt:
+                        mark_rpc_bad(rpc_url, cooldown=30 + attempt * 10)
+                        await asyncio.sleep(1.5 + attempt)
                         continue
+
                 return data.get("result")
 
-            last_err = f"{rpc_url} status={r.status_code}"
-            if r.status_code in (408, 425, 429, 500, 502, 503, 504):
-                mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
-                await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+            # ===== HTTP 429 =====
+            if r.status_code == 429:
+                mark_rpc_bad(rpc_url, cooldown=60)
+                await asyncio.sleep(2 + attempt)
                 continue
 
+            # ===== transient =====
+            if r.status_code in (408, 425, 500, 502, 503, 504):
+                mark_rpc_bad(rpc_url, cooldown=30)
+                await asyncio.sleep(1.5 + attempt)
+                continue
+
+            last_err = f"{rpc_url} status={r.status_code}"
             return None
 
         except Exception as e:
             last_err = f"{rpc_url} {e}"
-            mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
-            await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+
+            # ===== DNS / network =====
+            if "No address associated with hostname" in last_err:
+                mark_rpc_bad(rpc_url, cooldown=60)
+                await asyncio.sleep(2)
+                continue
+
+            mark_rpc_bad(rpc_url, cooldown=30)
+            await asyncio.sleep(1.2 + attempt)
 
     log_once(f"rpc_{method}", f"RPC_ERR {method} {last_err}", 20)
     return None
