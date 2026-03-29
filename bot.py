@@ -1,4 +1,4 @@
-# ================= v960_FINAL_FULL =================
+# ================= v1000_GOD_MODE_ENGINE =================
 
 import os, asyncio, random, time
 from collections import defaultdict
@@ -15,9 +15,12 @@ SOL = "So11111111111111111111111111111111111111112"
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
 
+MAX_DRAWDOWN = 0.25
+LOSS_STREAK_LIMIT = 5
+
 SEED_TOKENS = [
     SOL,
-    "EPjFWdd5AufqSSqeM2q7KZ1xzy6h7Q5Gk1s7k9KkZx9"  # USDC
+    "EPjFWdd5AufqSSqeM2q7KZ1xzy6h7Q5Gk1s7k9KkZx9"
 ]
 
 # ================= INIT =================
@@ -29,7 +32,10 @@ engine.logs = []
 engine.capital = 1.0
 engine.sol_balance = 1.0
 
-# ================= ENGINE SYSTEM =================
+engine.loss_streak = 0
+engine.peak_capital = 1.0
+
+# ================= ENGINE =================
 
 ENGINE_STATS = {
     "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
@@ -49,22 +55,25 @@ ENGINE_BASE_SIZE = {
     "sniper": 0.0015,
 }
 
-ALPHA_MEMORY = {
-    "stable": [],
-    "degen": [],
-    "sniper": [],
-}
-
 MAX_POSITION_PER_ENGINE = 3
 
 # ================= STATE =================
 
 CANDIDATES = set(SEED_TOKENS)
+LAST_PRICE = {}
+LAST_SEEN = {}
+FAILED_TOKENS = set()
+TOKEN_COOLDOWN = defaultdict(float)
+
+ALPHA_CACHE = {}
 
 # ================= UTILS =================
 
 def clamp(v, lo, hi):
     return max(lo, min(v, hi))
+
+def now():
+    return time.time()
 
 # ================= PRICE =================
 
@@ -87,15 +96,62 @@ async def get_price(mint):
 
 # ================= ALPHA =================
 
-async def momentum(mint):
-    p1 = await get_price(mint)
-    await asyncio.sleep(0.2)
-    p2 = await get_price(mint)
+async def multi_momentum(mint):
+    prices = []
+    for _ in range(3):
+        p = await get_price(mint)
+        if not p:
+            return 0
+        prices.append(p)
+        await asyncio.sleep(0.08)
 
-    if not p1 or not p2 or p1 <= 0:
+    return (prices[-1] - prices[0]) / prices[0]
+
+
+async def flow_acceleration(mint):
+    v1 = await multi_momentum(mint)
+    await asyncio.sleep(0.1)
+    v2 = await multi_momentum(mint)
+
+    return max(0, v2 - v1)
+
+
+async def volume_surge(mint):
+    p = await get_price(mint)
+    if not p:
         return 0
 
-    return ((p2 - p1) / p1) * 5  # 🔥 強化 alpha
+    prev = LAST_PRICE.get(mint, p)
+    LAST_PRICE[mint] = p
+
+    return abs(p - prev) / prev if prev > 0 else 0
+
+
+async def alpha_confidence(alpha):
+    """👉 防假訊號"""
+    return 1 if alpha > 0.01 else 0
+
+
+async def alpha_fusion(mint):
+
+    if mint in ALPHA_CACHE and now() - ALPHA_CACHE[mint][1] < 2:
+        return ALPHA_CACHE[mint][0]
+
+    m = await multi_momentum(mint)
+    f = await flow_acceleration(mint)
+    v = await volume_surge(mint)
+
+    score = (
+        m * 0.4 +
+        f * 0.3 +
+        v * 0.3
+    )
+
+    ALPHA_CACHE[mint] = (score, now())
+
+    return score
+
+# ================= FILTER =================
 
 async def liquidity_ok(mint):
     try:
@@ -108,11 +164,11 @@ async def liquidity_ok(mint):
                     "amount": "10000000"
                 }
             )
-        j = r.json()
-        impact = float(j.get("priceImpactPct", 1))
-        return impact < 0.25
+        impact = float(r.json().get("priceImpactPct", 1))
+        return impact < 0.35
     except:
         return False
+
 
 async def anti_rug(mint):
     try:
@@ -125,63 +181,55 @@ async def anti_rug(mint):
                     "amount": "1000000"
                 }
             )
-        j = r.json()
-        return int(j.get("outAmount", 0)) > 0
+        return int(r.json().get("outAmount", 0)) > 0
     except:
         return False
 
-# ================= ENGINE LOGIC =================
-
-def update_alpha_memory(engine_name, alpha, pnl):
-    mem = ALPHA_MEMORY[engine_name]
-    mem.append((alpha, pnl))
-    if len(mem) > 100:
-        mem.pop(0)
-
-def get_alpha_edge(engine_name, alpha):
-    mem = ALPHA_MEMORY[engine_name]
-    if not mem:
-        return 1.0
-
-    sim = [p for a,p in mem if abs(a-alpha) < 0.01]
-    if not sim:
-        return 1.0
-
-    avg = sum(sim)/len(sim)
-    return clamp(1 + avg*5, 0.5, 2.0)
+# ================= ENGINE =================
 
 def pick_engine(alpha):
-    if alpha > 0.02:
+    if alpha > 0.05:
         return "sniper"
     return random.choices(
         ["stable","degen","sniper"],
-        weights=[
-            ENGINE_ALLOCATOR["stable"],
-            ENGINE_ALLOCATOR["degen"],
-            ENGINE_ALLOCATOR["sniper"]
-        ]
+        weights=list(ENGINE_ALLOCATOR.values())
     )[0]
+
 
 def engine_size(name, alpha):
     base = ENGINE_BASE_SIZE[name]
-    edge = get_alpha_edge(name, alpha)
-    size = base * (1 + alpha*10) * edge
-    return clamp(size, MIN_POSITION_SOL, MAX_POSITION_SOL)
+
+    # 👉 連敗降低風險
+    if engine.loss_streak >= 3:
+        base *= 0.5
+
+    return clamp(base * (1 + alpha*10), MIN_POSITION_SOL, MAX_POSITION_SOL)
 
 # ================= EXEC =================
 
 async def buy(mint, alpha):
+
+    if now() - TOKEN_COOLDOWN[mint] < 15:
+        return False
+
+    if mint in FAILED_TOKENS:
+        return False
 
     if any(p["token"] == mint for p in engine.positions):
         return False
 
     eng = pick_engine(alpha)
 
-    if sum(1 for p in engine.positions if p.get("engine") == eng) >= MAX_POSITION_PER_ENGINE:
+    if sum(1 for p in engine.positions if p.get("engine")==eng) >= MAX_POSITION_PER_ENGINE:
+        return False
+
+    confidence = await alpha_confidence(alpha)
+    if confidence == 0:
         return False
 
     price = await get_price(mint)
     if not price:
+        FAILED_TOKENS.add(mint)
         return False
 
     size = engine_size(eng, alpha)
@@ -196,11 +244,11 @@ async def buy(mint, alpha):
         "peak": price
     })
 
-    engine.logs.append(f"BUY {mint[:6]} {eng} α={round(alpha,5)}")
-    engine.logs = engine.logs[-100:]
+    TOKEN_COOLDOWN[mint] = now()
 
     print(f"🟢 BUY {mint[:6]} {eng}")
     return True
+
 
 async def sell(pos):
 
@@ -217,15 +265,13 @@ async def sell(pos):
 
     if pnl > 0:
         ENGINE_STATS[eng]["wins"] += 1
-
-    update_alpha_memory(eng, pos["alpha"], pnl)
+        engine.loss_streak = 0
+    else:
+        engine.loss_streak += 1
 
     engine.positions.remove(pos)
 
-    engine.logs.append(f"SELL {mint[:6]} pnl={round(pnl,6)}")
-    engine.logs = engine.logs[-100:]
-
-    print(f"🔴 SELL {mint[:6]}")
+    print(f"🔴 SELL {mint[:6]} pnl={round(pnl,6)}")
 
 # ================= MONITOR =================
 
@@ -241,10 +287,28 @@ async def monitor():
 
             pnl_pct = (price - p["entry"]) / p["entry"]
 
-            if pnl_pct > 0.15 or pnl_pct < -0.06:
+            if pnl_pct > 0.30 or pnl_pct < -0.10:
                 await sell(p)
 
         await asyncio.sleep(2)
+
+# ================= RISK =================
+
+def risk_check():
+
+    engine.peak_capital = max(engine.peak_capital, engine.capital)
+
+    dd = (engine.peak_capital - engine.capital) / engine.peak_capital
+
+    if dd > MAX_DRAWDOWN:
+        print("🛑 KILL SWITCH (drawdown)")
+        return False
+
+    if engine.loss_streak >= LOSS_STREAK_LIMIT:
+        print("🛑 KILL SWITCH (loss streak)")
+        return False
+
+    return True
 
 # ================= MEMPOOL =================
 
@@ -252,29 +316,21 @@ async def handle_mempool(e):
     mint = e.get("mint")
     if mint:
         CANDIDATES.add(mint)
+        LAST_SEEN[mint] = now()
 
-# ================= ALLOCATOR =================
+# ================= CLEANUP =================
 
-def update_allocator():
-    scores = {}
-    for e in ENGINE_STATS:
-        s = ENGINE_STATS[e]
-        if s["trades"] == 0:
-            scores[e] = 1
-        else:
-            win = s["wins"] / s["trades"]
-            scores[e] = max(0.1, s["pnl"] * win)
-
-    total = sum(scores.values()) + 1e-9
-
-    for k in scores:
-        ENGINE_ALLOCATOR[k] = scores[k] / total
+def cleanup():
+    cutoff = now() - 600
+    for m in list(CANDIDATES):
+        if LAST_SEEN.get(m, now()) < cutoff:
+            CANDIDATES.discard(m)
 
 # ================= MAIN =================
 
 async def bot():
 
-    print("🚀 V960 BOT START")
+    print("🚀 V1000 GOD MODE LIVE")
 
     asyncio.create_task(monitor())
 
@@ -287,18 +343,22 @@ async def bot():
 
         try:
 
-            if len(CANDIDATES) < 2:
+            if not risk_check():
+                await asyncio.sleep(5)
+                continue
+
+            cleanup()
+
+            if len(CANDIDATES) < 3:
                 CANDIDATES.update(SEED_TOKENS)
 
             for mint in list(CANDIDATES):
 
-                alpha = await momentum(mint)
+                alpha = await alpha_fusion(mint)
 
-                engine.logs.append(f"SCAN {mint[:6]} α={round(alpha,5)}")
-                engine.logs = engine.logs[-100:]
+                threshold = 0.01 + random.uniform(0, 0.004)
 
-                # 🔥 核心濾網
-                if alpha < 0.004:
+                if alpha < threshold:
                     continue
 
                 if not await liquidity_ok(mint):
@@ -309,19 +369,15 @@ async def bot():
 
                 await buy(mint, alpha)
 
-            update_allocator()
-
         except Exception as e:
             print("ERR", e)
 
         await asyncio.sleep(2)
 
-# ================= RAILWAY =================
+# ================= ENTRY =================
 
 async def bot_loop():
     await bot()
-
-# ================= LOCAL =================
 
 if __name__ == "__main__":
     asyncio.run(bot())
