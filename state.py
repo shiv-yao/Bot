@@ -2,6 +2,7 @@ import json
 import threading
 from collections import deque
 
+
 class EngineState:
     def __init__(self):
         self._lock = threading.Lock()
@@ -9,8 +10,8 @@ class EngineState:
         self.running = True
         self.mode = "PAPER"
 
-        self.sol_balance = 1.0
-        self.capital = 1.0
+        self.sol_balance = 30.0
+        self.capital = 30.0
 
         self.last_signal = ""
         self.last_trade = ""
@@ -18,7 +19,7 @@ class EngineState:
         self.positions = []
         self.trade_history = []
 
-        self.logs = deque(maxlen=300)
+        self.logs = deque(maxlen=500)
 
         self.stats = {
             "signals": 0,
@@ -28,16 +29,39 @@ class EngineState:
             "adds": 0,
         }
 
+        self.engine_stats = {
+            "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
+        }
+
+        self.engine_allocator = {
+            "stable": 0.33,
+            "degen": 0.33,
+            "sniper": 0.34,
+        }
+
+        self.candidate_count = 0
+
         self.bot_ok = True
         self.bot_error = ""
 
-        self.engine_stats = {}
-        self.engine_allocator = {}
-        self.candidate_count = 0
+    # ================= SAFE OPS =================
 
     def log(self, message: str):
         with self._lock:
             self.logs.append(str(message))
+
+    def set_error(self, message: str):
+        with self._lock:
+            self.bot_ok = False
+            self.bot_error = str(message)
+            self.logs.append(f"ERROR: {message}")
+
+    def clear_error(self):
+        with self._lock:
+            self.bot_ok = True
+            self.bot_error = ""
 
     def snapshot(self):
         with self._lock:
@@ -51,12 +75,16 @@ class EngineState:
                 "positions": list(self.positions),
                 "logs": list(self.logs),
                 "stats": dict(self.stats),
-                "trade_history": list(self.trade_history[-100:]),
+                "trade_history": list(self.trade_history[-200:]),
                 "bot_ok": self.bot_ok,
                 "bot_error": self.bot_error,
-                "engine_stats": self.engine_stats,
-                "engine_allocator": self.engine_allocator,
+                "engine_stats": dict(self.engine_stats),
+                "engine_allocator": dict(self.engine_allocator),
                 "candidate_count": self.candidate_count,
             }
+
+    def to_json(self):
+        return json.dumps(self.snapshot(), ensure_ascii=False)
+
 
 engine = EngineState()
