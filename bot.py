@@ -528,66 +528,53 @@ async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int)
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(int(amount_smallest)),
-        "taker": wallet_pubkey_str() if real_trading_ready() else None,
         "swapMode": "ExactIn",
         "slippageBps": AI_PARAMS["slippage_bps"],
         "priorityFeeLamports": AI_PARAMS["priority_fee_lamports"],
     }
 
+    if real_trading_ready():
+        params["taker"] = wallet_pubkey_str()
+
     if USE_JITO and AI_PARAMS["jito_tip_lamports"] > 0:
         params["jitoTipLamports"] = AI_PARAMS["jito_tip_lamports"]
 
-    params = {k: v for k, v in params.items() if v is not None}
-
-    # ===== PRIMARY ORDER =====
     data = await http_get_json(JUP_ORDER_API, params=params, headers=jup_headers())
 
-    # ===== SUCCESS =====
+    # ===== 成功 =====
     if data and not data.get("error") and not data.get("errorCode") and data.get("transaction"):
         return data
 
-    # ===== FALLBACK START =====
+    # ===== fallback（只給 quote，不可 execute）=====
     log_once("jup_fallback", f"JUP_FALLBACK {input_mint[:4]}->{output_mint[:4]}", 10)
 
     try:
-        quote_url = "https://quote-api.jup.ag/v6/quote"
-
-        quote_params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(int(amount_smallest)),
-            "slippageBps": AI_PARAMS["slippage_bps"],
-        }
-
-        quote = await http_get_json(quote_url, params=quote_params)
+        quote = await http_get_json(
+            "https://quote-api.jup.ag/v6/quote",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(int(amount_smallest)),
+                "slippageBps": AI_PARAMS["slippage_bps"],
+            },
+        )
 
         if not quote or not quote.get("data"):
-            return data
+            return None
 
         route = quote["data"][0]
 
-        swap_url = "https://quote-api.jup.ag/v6/swap"
-
-        swap_payload = {
-            "quoteResponse": route,
-            "userPublicKey": wallet_pubkey_str() if real_trading_ready() else None,
-            "wrapAndUnwrapSol": True,
+        return {
+            "_quote_only": True,  # ❗關鍵
+            "outAmount": route.get("outAmount"),
+            "priceImpactPct": route.get("priceImpactPct"),
+            "routePlan": route.get("routePlan"),
         }
-
-        swap = await http_post_json(swap_url, swap_payload)
-
-        if swap and swap.get("swapTransaction"):
-            return {
-                "transaction": swap["swapTransaction"],
-                "requestId": "fallback",
-                "outAmount": route.get("outAmount"),
-            }
 
     except Exception as e:
         log_once("jup_fallback_err", f"FALLBACK_ERR {e}", 20)
 
-    # ===== FINAL FAIL =====
-    return data
+    return None
 
 def sign_transaction_base64(tx_b64: str) -> str:
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
@@ -1490,13 +1477,16 @@ async def bot_loop():
 IN_FLIGHT_BUY = set()
 IN_FLIGHT_SELL = set()
 
-# ===== 安全 JUP =====
 async def safe_jupiter_order(input_mint, output_mint, amount):
     for _ in range(3):
         data = await jupiter_order(input_mint, output_mint, amount)
+
+        # ❗避免 quote-only 被當成成功
         if data and data.get("transaction"):
             return data
+
         await asyncio.sleep(0.3)
+
     return None
 
 
@@ -1506,6 +1496,7 @@ async def safe_jupiter_execute(order):
             return await jupiter_execute(order)
         except Exception:
             await asyncio.sleep(0.5)
+
     raise RuntimeError("EXECUTE_FAIL_RETRY")
 
 
@@ -1544,7 +1535,6 @@ async def buy(m, a, combo, w, s):
             return
 
         tx_sig = None
-        tx_meta = None
         raw_token_amount = None
         trade_mode = "REAL" if real_trading_ready() else "PAPER"
 
@@ -1553,6 +1543,7 @@ async def buy(m, a, combo, w, s):
 
             order = await safe_jupiter_order(SOL, m, lamports_in)
             if not order:
+                log_once("buy_fail", f"BUY_FAIL {m[:6]}", 10)
                 return
 
             raw_token_amount = ensure_int(order.get("outAmount"), 0)
@@ -1560,18 +1551,18 @@ async def buy(m, a, combo, w, s):
             try:
                 exec_result = await safe_jupiter_execute(order)
                 tx_sig = exec_result.get("signature")
-                tx_meta = exec_result.get("result")
 
                 if USE_JITO and exec_result.get("signed_transaction"):
                     asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
 
-            except Exception:
+            except Exception as e:
+                log_once("buy_exec", f"BUY_EXEC_ERR {m[:6]} {e}", 10)
                 return
 
             if tx_sig:
                 await confirm_signature(tx_sig)
 
-        pos = {
+        engine.positions.append({
             "token": m,
             "entry_price": price,
             "last_price": price,
@@ -1587,17 +1578,16 @@ async def buy(m, a, combo, w, s):
             "combo": combo,
             "trade_mode": trade_mode,
             "entry_signature": tx_sig,
-            "entry_tx_meta": tx_meta,
-        }
-
-        engine.positions.append(pos)
+        })
 
         TOKEN_COOLDOWN[m] = now()
         engine.stats["buys"] += 1
-        engine.last_trade = f"BUY {m[:6]}"
+
+        log(f"BUY {m[:6]} size={size:.6f} sig={tx_sig}")
 
     finally:
         IN_FLIGHT_BUY.discard(m)
+
 
 
 # ================= PATCH SELL =================
@@ -1621,7 +1611,6 @@ async def sell(p):
         pnl = (price - p["entry_price"]) / p["entry_price"]
 
         tx_sig = None
-        tx_meta = None
 
         if real_trading_ready():
             raw_amount = ensure_int(p.get("raw_token_amount"), 0)
@@ -1637,7 +1626,6 @@ async def sell(p):
                 try:
                     exec_result = await safe_jupiter_execute(order)
                     tx_sig = exec_result.get("signature")
-                    tx_meta = exec_result.get("result")
 
                     if USE_JITO and exec_result.get("signed_transaction"):
                         asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
@@ -1660,6 +1648,8 @@ async def sell(p):
         })
 
         engine.stats["sells"] += 1
+
+        log(f"SELL {m[:6]} pnl={pnl:.4f} sig={tx_sig}")
 
     finally:
         IN_FLIGHT_SELL.discard(m)
