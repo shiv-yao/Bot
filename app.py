@@ -74,10 +74,8 @@ async def start_bot():
     try:
         from bot import bot_loop
         BOT_TASK = asyncio.create_task(bot_loop())
-
         engine.bot_ok = True
         engine.bot_error = ""
-
     except Exception as e:
         engine.bot_ok = False
         engine.bot_error = str(e)
@@ -130,7 +128,6 @@ def data():
             "last_trade": engine.last_trade,
             "logs": engine.logs[-100:]
         }
-
     except Exception as e:
         return JSONResponse({"error": str(e)})
 
@@ -148,7 +145,7 @@ def debug():
     }
 
 
-if name == "main":
+if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
