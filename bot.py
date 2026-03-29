@@ -1,24 +1,29 @@
-# ================= v950_FUSED_ENGINE =================
+# ================= v950_FUSED_FIXED =================
 
 import os, asyncio, random, time
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 import httpx
 
 from state import engine
-from wallet import load_keypair
-from jupiter import get_order, execute_order
 from mempool import mempool_stream
 
 # ================= CONFIG =================
 
 RPC = os.getenv("RPC", "")
 SOL = "So11111111111111111111111111111111111111112"
-MODE = os.getenv("MODE", "PAPER")
 
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
+
+# 👉 保證有 token（關鍵）
+SEED_TOKENS = [
+    SOL
+]
+
+# ================= INIT =================
+
+if not hasattr(engine, "positions"):
+    engine.positions = []
 
 # ================= ENGINE SYSTEM =================
 
@@ -47,22 +52,17 @@ ALPHA_MEMORY = {
 }
 
 MAX_POSITION_PER_ENGINE = 3
-KILL_SWITCH_LOSS_STREAK = 6
 
 # ================= STATE =================
 
-CANDIDATES = set()
-LAST_TRADE = defaultdict(float)
+CANDIDATES = set(SEED_TOKENS)
 
 # ================= UTILS =================
-
-def now():
-    return time.time()
 
 def clamp(v, lo, hi):
     return max(lo, min(v, hi))
 
-# ================= ALPHA =================
+# ================= PRICE =================
 
 async def get_price(mint):
     try:
@@ -76,8 +76,8 @@ async def get_price(mint):
                 }
             )
         j = r.json()
-        out = int(j["outAmount"]) / 1e9
-        return out / 1_000_000
+        out = int(j.get("outAmount", 0)) / 1e9
+        return out / 1_000_000 if out > 0 else None
     except:
         return None
 
@@ -104,15 +104,15 @@ def get_alpha_edge(engine_name, alpha):
     if not mem:
         return 1.0
 
-    sim = [p for a,p in mem if abs(a-alpha)<10]
+    sim = [p for a,p in mem if abs(a-alpha)<0.01]
     if not sim:
         return 1.0
 
     avg = sum(sim)/len(sim)
-    return max(0.5, min(2.0, 1 + avg*5))
+    return clamp(1 + avg*5, 0.5, 2.0)
 
 def pick_engine(alpha):
-    if alpha > 0.05:
+    if alpha > 0.02:
         return "sniper"
 
     return random.choices(
@@ -127,33 +127,24 @@ def pick_engine(alpha):
 def engine_size(name, alpha):
     base = ENGINE_BASE_SIZE[name]
     edge = get_alpha_edge(name, alpha)
-
     size = base * (1 + alpha*10) * edge
     return clamp(size, MIN_POSITION_SOL, MAX_POSITION_SOL)
 
-# ================= EXECUTION =================
-
-async def send_tx(tx):
-    async with httpx.AsyncClient() as client:
-        await client.post(RPC, json={
-            "jsonrpc":"2.0",
-            "method":"sendTransaction",
-            "params":[tx]
-        })
+# ================= EXEC =================
 
 async def buy(mint, alpha):
 
     eng = pick_engine(alpha)
 
-    if sum(1 for p in engine.positions if p["engine"]==eng) >= MAX_POSITION_PER_ENGINE:
+    # 限制單 engine 持倉
+    if sum(1 for p in engine.positions if p.get("engine")==eng) >= MAX_POSITION_PER_ENGINE:
         return False
-
-    size = engine_size(eng, alpha)
 
     price = await get_price(mint)
     if not price:
         return False
 
+    size = engine_size(eng, alpha)
     amount = size / price
 
     engine.positions.append({
@@ -165,7 +156,7 @@ async def buy(mint, alpha):
         "peak": price
     })
 
-    print("BUY", mint[:6], eng, size)
+    print(f"🟢 BUY {mint[:6]} {eng} α={round(alpha,4)}")
     return True
 
 async def sell(pos):
@@ -188,7 +179,7 @@ async def sell(pos):
 
     engine.positions.remove(pos)
 
-    print("SELL", mint[:6], pnl)
+    print(f"🔴 SELL {mint[:6]} pnl={round(pnl,6)}")
 
 # ================= MONITOR =================
 
@@ -206,20 +197,17 @@ async def monitor():
 
             pnl_pct = (price - p["entry"]) / p["entry"]
 
-            if pnl_pct > 0.15 or pnl_pct < -0.05:
+            if pnl_pct > 0.12 or pnl_pct < -0.05:
                 await sell(p)
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 # ================= MEMPOOL =================
 
 async def handle_mempool(e):
-
     mint = e.get("mint")
-    if not mint:
-        return
-
-    CANDIDATES.add(mint)
+    if mint:
+        CANDIDATES.add(mint)
 
 # ================= ALLOCATOR =================
 
@@ -244,18 +232,29 @@ def update_allocator():
 
 async def bot():
 
+    print("🚀 BOT START")
+
     asyncio.create_task(monitor())
-    asyncio.create_task(mempool_stream(handle_mempool))
+
+    try:
+        asyncio.create_task(mempool_stream(handle_mempool))
+    except:
+        pass
 
     while True:
 
         try:
 
+            # 👉 fallback 保證不空
+            if not CANDIDATES:
+                CANDIDATES.update(SEED_TOKENS)
+
             for mint in list(CANDIDATES):
 
                 alpha = await momentum(mint)
 
-                if alpha < 0.002:
+                # 👉 放寬條件（關鍵）
+                if alpha < 0.0005:
                     continue
 
                 await buy(mint, alpha)
@@ -267,7 +266,12 @@ async def bot():
 
         await asyncio.sleep(2)
 
-# ================= START =================
+# ================= FIX FOR RAILWAY =================
+
+async def bot_loop():
+    await bot()
+
+# ================= LOCAL =================
 
 if __name__ == "__main__":
     asyncio.run(bot())
