@@ -1,7 +1,7 @@
 import os
 import asyncio
-import random
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
@@ -30,7 +30,7 @@ def init_engine():
             "signals": 0,
             "buys": 0,
             "sells": 0,
-            "errors": 0
+            "errors": 0,
         }
 
     if not hasattr(engine, "last_trade"):
@@ -45,8 +45,11 @@ def init_engine():
     if not hasattr(engine, "sol_balance"):
         engine.sol_balance = 1.0
 
-    engine.bot_ok = True
-    engine.bot_error = ""
+    if not hasattr(engine, "bot_ok"):
+        engine.bot_ok = True
+
+    if not hasattr(engine, "bot_error"):
+        engine.bot_error = ""
 
 
 # ================= BOT =================
@@ -54,17 +57,19 @@ def init_engine():
 async def start_bot():
     global BOT_TASK
 
-    if BOT_TASK:
-        return  # ✅ 防止重複啟動
+    if BOT_TASK is not None and not BOT_TASK.done():
+        return
 
     try:
         from bot import bot_loop
+
         BOT_TASK = asyncio.create_task(bot_loop())
 
         engine.bot_ok = True
         engine.bot_error = ""
 
-        engine.logs.append("BOT_STARTED")
+        if not any("BOT_STARTED" in x for x in engine.logs[-5:]):
+            engine.logs.append("BOT_STARTED")
 
     except Exception as e:
         engine.bot_ok = False
@@ -84,6 +89,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# ================= HELPERS =================
+
+def normalize_position(p: dict):
+    entry = (
+        p.get("entry_price")
+        if p.get("entry_price") is not None
+        else p.get("entry", 0)
+    )
+    last = p.get("last_price", entry)
+    peak = (
+        p.get("peak_price")
+        if p.get("peak_price") is not None
+        else p.get("peak", entry)
+    )
+
+    pnl_pct = p.get("pnl_pct")
+    if pnl_pct is None:
+        pnl_pct = ((last - entry) / entry) if entry and entry > 0 else 0.0
+
+    return {
+        "token": p.get("token"),
+        "amount": p.get("amount", 0),
+        "entry_price": entry or 0,
+        "last_price": last or 0,
+        "peak_price": peak or 0,
+        "pnl_pct": pnl_pct or 0,
+        "engine": p.get("engine", ""),
+        "alpha": p.get("alpha", 0),
+    }
+
+
 # ================= API =================
 
 @app.get("/health")
@@ -97,26 +133,7 @@ def health():
 
 @app.get("/data")
 def data():
-
-    positions = []
-
-    for p in engine.positions:
-        entry = p.get("entry", 0)
-        peak = p.get("peak", entry)
-        last = p.get("last_price", peak)
-
-        pnl_pct = 0
-        if entry > 0:
-            pnl_pct = (last - entry) / entry
-
-        positions.append({
-            "token": p.get("token"),
-            "amount": p.get("amount"),
-            "entry_price": entry,
-            "last_price": last,
-            "peak_price": peak,
-            "pnl_pct": pnl_pct
-        })
+    positions = [normalize_position(p) for p in engine.positions]
 
     return {
         "running": engine.running,
@@ -143,56 +160,167 @@ def home():
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Quant Dashboard</title>
 <style>
-body { background:#0b1020;color:#fff;font-family:sans-serif;padding:20px;}
-.card {background:#121a2f;padding:12px;margin:6px;border-radius:10px;}
+body {
+  background: #0b1020;
+  color: #fff;
+  font-family: sans-serif;
+  padding: 16px;
+  margin: 0;
+}
+.wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.card {
+  background: #121a2f;
+  padding: 12px;
+  border-radius: 10px;
+  overflow: auto;
+}
+.full {
+  grid-column: 1 / -1;
+}
+.two {
+  grid-column: span 2;
+}
+h2 {
+  margin-top: 0;
+}
+.small {
+  font-size: 12px;
+  color: #9fb0d1;
+}
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr 1fr; }
+  .two { grid-column: span 2; }
+}
+@media (max-width: 520px) {
+  .grid { grid-template-columns: 1fr; }
+  .two, .full { grid-column: auto; }
+}
 </style>
 </head>
 <body>
-
-<h2>⚔️ Quant Dashboard</h2>
-
-<div id="main"></div>
+<div class="wrap">
+  <h2>Quant Dashboard</h2>
+  <div id="main"></div>
+</div>
 
 <script>
-async function load(){
-  const d = await fetch('/data').then(r=>r.json());
+async function load() {
+  const d = await fetch('/data').then(r => r.json());
+
+  const posHtml = (d.positions || []).length === 0
+    ? 'No positions'
+    : (d.positions || []).map(p => `
+      <div style="margin-bottom:10px;">
+        <b>${(p.token || '').slice(0, 12)}</b><br>
+        amount=${Number(p.amount || 0).toFixed(4)}<br>
+        entry=${Number(p.entry_price || 0).toExponential(4)}<br>
+        last=${Number(p.last_price || 0).toExponential(4)}<br>
+        peak=${Number(p.peak_price || 0).toExponential(4)}<br>
+        pnl=${((p.pnl_pct || 0) * 100).toFixed(2)}%<br>
+        engine=${p.engine || '-'} alpha=${Number(p.alpha || 0).toFixed(4)}
+      </div>
+    `).join('');
+
+  const logsHtml = (d.logs || []).slice().reverse().map(x => `<div>${x}</div>`).join('');
+
+  const histHtml = (d.trade_history || []).length === 0
+    ? 'No trade history'
+    : (d.trade_history || []).slice().reverse().map(x => `
+      <div style="margin-bottom:8px;">
+        <b>${x.side || 'TRADE'}</b> ${(x.mint || '').slice(0, 12)}
+        <pre>${JSON.stringify(x.result || x, null, 2)}</pre>
+      </div>
+    `).join('');
 
   document.getElementById('main').innerHTML = `
-  <div class="card">Mode: ${d.mode}</div>
-  <div class="card">Capital: ${d.capital.toFixed(6)}</div>
-  <div class="card">Last Trade: ${d.last_trade}</div>
+    <div class="grid">
+      <div class="card">
+        <div class="small">Mode</div>
+        <div>${d.mode || '-'}</div>
+      </div>
+      <div class="card">
+        <div class="small">Capital</div>
+        <div>${Number(d.capital || 0).toFixed(6)}</div>
+      </div>
+      <div class="card">
+        <div class="small">SOL Balance</div>
+        <div>${Number(d.sol_balance || 0).toFixed(6)}</div>
+      </div>
+      <div class="card">
+        <div class="small">Bot Status</div>
+        <div>${d.bot_ok ? 'OK' : 'ERROR'}</div>
+      </div>
 
-  <div class="card">
-    Signals: ${d.stats.signals} |
-    Buys: ${d.stats.buys} |
-    Sells: ${d.stats.sells} |
-    Errors: ${d.stats.errors}
-  </div>
+      <div class="card two">
+        <div class="small">Last Signal</div>
+        <div>${d.last_signal || '-'}</div>
+      </div>
+      <div class="card two">
+        <div class="small">Last Trade</div>
+        <div>${d.last_trade || '-'}</div>
+      </div>
 
-  <div class="card">
-    Positions:<br>
-    ${(d.positions||[]).map(p=>`
-      ${p.token?.slice(0,6)} 
-      pnl=${(p.pnl_pct*100).toFixed(2)}%
-    `).join("<br>")}
-  </div>
+      <div class="card">
+        <div class="small">Signals</div>
+        <div>${d.stats?.signals ?? 0}</div>
+      </div>
+      <div class="card">
+        <div class="small">Buys</div>
+        <div>${d.stats?.buys ?? 0}</div>
+      </div>
+      <div class="card">
+        <div class="small">Sells</div>
+        <div>${d.stats?.sells ?? 0}</div>
+      </div>
+      <div class="card">
+        <div class="small">Errors</div>
+        <div>${d.stats?.errors ?? 0}</div>
+      </div>
 
-  <div class="card">
-    Logs:<br>
-    ${(d.logs||[]).slice(-10).join("<br>")}
-  </div>
+      <div class="card two">
+        <div class="small">Positions</div>
+        <div>${posHtml}</div>
+      </div>
+
+      <div class="card two">
+        <div class="small">Logs</div>
+        <div>${logsHtml || 'No logs'}</div>
+      </div>
+
+      <div class="card full">
+        <div class="small">Trade History</div>
+        <div>${histHtml}</div>
+      </div>
+
+      <div class="card full">
+        <div class="small">Bot Error</div>
+        <div>${d.bot_error || '-'}</div>
+      </div>
+    </div>
   `;
 }
 
-setInterval(load,2000)
-load()
+load();
+setInterval(load, 2000);
 </script>
-
 </body>
 </html>
-"""
+    """
 
 
 # ================= RUN =================
