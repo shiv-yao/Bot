@@ -1009,10 +1009,15 @@ async def sniper_bonus(m):
 # ================= ALPHA =================
 async def alpha(m):
     p1 = await get_price(m)
-    await asyncio.sleep(1)
-    p2 = await get_price(m)
-    if not p1 or not p2 or p1 <= 0:
+    if not p1 or p1 <= 0:
         return 0.0
+
+    await asyncio.sleep(0.15)
+
+    p2 = await get_price(m)
+    if not p2 or p2 <= 0:
+        return 0.0
+
     return (p2 - p1) / p1
 
 # ================= STRATEGY =================
@@ -1035,8 +1040,29 @@ def position_size(combo):
 
 
 async def rank_candidates():
-    # 優先最近看到、來源較強的候選
     pool = list(CANDIDATES)
+
+    def sort_key(m):
+        meta = CANDIDATE_META.get(m, {})
+        return (meta.get("last_seen", 0.0), meta.get("hits", 0))
+
+    pool.sort(key=sort_key, reverse=True)
+    ranked = []
+
+    # 不要一次跑太多，避免整個主循環卡住
+    for m in pool[:15]:
+        try:
+            a = await alpha(m)
+            w = wallet_score(m)
+            s = await sniper_bonus(m)
+            combo = a + (w * 0.01) + s
+            ranked.append((m, combo, a, w, s))
+        except Exception as e:
+            log_once(f"rank_err_{m}", f"RANK_ERR {m[:6]} {e}", 20)
+            continue
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked[:10]
 
     def sort_key(m):
         meta = CANDIDATE_META.get(m, {})
@@ -1462,10 +1488,12 @@ async def main():
                 continue
 
             await build_wallet_graph()
-            ranked = await rank_candidates()
 
             engine.candidate_count = len(CANDIDATES)
+            log_once("cand_count", f"CANDIDATE_COUNT {engine.candidate_count}", 10)
 
+            ranked = await rank_candidates()
+            log_once("ranked_count", f"RANKED_COUNT {len(ranked)}", 10)
             for m, combo, a, w, s in ranked:
                 engine.stats["signals"] += 1
 
