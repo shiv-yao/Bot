@@ -948,9 +948,22 @@ async def main():
             for m, combo, a, w, s in ranked:
                 engine.stats["signals"] += 1
 
-                if not await liquidity_ok(m):
+                liq_ok = await liquidity_ok(m)
+                if not liq_ok:
+                    log_once(
+                        f"skip_liq_{m}",
+                        f"SKIP {m[:6]} NO_LIQ combo={combo:.4f}",
+                        30,
+                    )
                     continue
-                if not await anti_rug(m):
+
+                rug_ok = await anti_rug(m)
+                if not rug_ok:
+                    log_once(
+                        f"skip_rug_{m}",
+                        f"SKIP {m[:6]} RUG_FAIL combo={combo:.4f}",
+                        30,
+                    )
                     continue
 
                 engine.last_signal = (
@@ -959,7 +972,18 @@ async def main():
                 )
 
                 if combo > AI_PARAMS["entry_threshold"]:
+                    log_once(
+                        f"try_buy_{m}",
+                        f"TRY_BUY {m[:6]} combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
+                        15,
+                    )
                     await buy(m, a, combo, w, s)
+                else:
+                    log_once(
+                        f"skip_thr_{m}",
+                        f"SKIP {m[:6]} THRESHOLD combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
+                        30,
+                    )
 
             await asyncio.sleep(6)
 
