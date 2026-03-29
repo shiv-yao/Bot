@@ -1,8 +1,7 @@
-# ================= v1303_1_ANTI_BLOCK_BOT =================
+# ================= v1303_2_DEBUG_TRADABLE_BOT =================
 import asyncio
 import time
 import random
-import traceback
 from collections import defaultdict
 
 import httpx
@@ -34,9 +33,8 @@ CANDIDATES = set()
 TOKEN_COOLDOWN = defaultdict(float)
 
 PRICE_CACHE = {}
-ALPHA_CACHE = {}
-
 LAST_UNIVERSE_REFRESH = 0
+
 PUMP_FAILS = 0
 JUP_FAILS = 0
 MEMPOOL_FAILS = 0
@@ -56,31 +54,20 @@ def ensure_list(x):
 def ensure_dict(x):
     return x if isinstance(x, dict) else {}
 
-def ensure_float(x, d=0):
+def ensure_float(x, d=0.0):
     try:
         return float(x)
-    except:
+    except Exception:
         return d
 
 def ensure_int(x, d=0):
     try:
         return int(x)
-    except:
+    except Exception:
         return d
 
 def safe_slice(x, n):
     return list(x[:n]) if isinstance(x, (list, tuple)) else []
-
-def log(msg):
-    engine.logs.append(str(msg))
-    engine.logs = engine.logs[-300:]
-    print("[BOT]", msg)
-
-def log_once(key, msg, cooldown=60):
-    t = now()
-    if t - LAST_LOG_TS.get(key, 0) > cooldown:
-        LAST_LOG_TS[key] = t
-        log(msg)
 
 def repair():
     engine.positions = ensure_list(getattr(engine, "positions", []))
@@ -96,6 +83,47 @@ def repair():
         "adds": ensure_int(s.get("adds")),
     }
 
+    if not hasattr(engine, "engine_stats") or not isinstance(engine.engine_stats, dict):
+        engine.engine_stats = {
+            "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
+            "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
+        }
+
+    if not hasattr(engine, "engine_allocator") or not isinstance(engine.engine_allocator, dict):
+        engine.engine_allocator = {
+            "stable": 0.4,
+            "degen": 0.4,
+            "sniper": 0.2,
+        }
+
+    if not hasattr(engine, "candidate_count"):
+        engine.candidate_count = 0
+
+    if not hasattr(engine, "last_trade"):
+        engine.last_trade = ""
+
+    if not hasattr(engine, "last_signal"):
+        engine.last_signal = ""
+
+    if not hasattr(engine, "bot_ok"):
+        engine.bot_ok = True
+
+    if not hasattr(engine, "bot_error"):
+        engine.bot_error = ""
+
+def log(msg):
+    repair()
+    engine.logs.append(str(msg))
+    engine.logs = engine.logs[-300:]
+    print("[BOT]", msg)
+
+def log_once(key, msg, cooldown=60):
+    t = now()
+    if t - LAST_LOG_TS.get(key, 0) > cooldown:
+        LAST_LOG_TS[key] = t
+        log(msg)
+
 # ================= HTTP =================
 async def http_get_json(url, params=None):
     try:
@@ -103,7 +131,7 @@ async def http_get_json(url, params=None):
         if r.status_code != 200:
             return None, r.status_code
         return r.json(), 200
-    except:
+    except Exception:
         return None, None
 
 # ================= MARKET =================
@@ -111,9 +139,9 @@ async def get_price(mint):
     if not valid_mint(mint):
         return None
 
-    c = PRICE_CACHE.get(mint)
-    if c and now() - c[1] < 5:
-        return c[0]
+    cached = PRICE_CACHE.get(mint)
+    if cached and now() - cached[1] < 4:
+        return cached[0]
 
     data, status = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
@@ -123,8 +151,8 @@ async def get_price(mint):
     if status != 200 or not isinstance(data, dict):
         return None
 
-    out = ensure_int(data.get("outAmount"))
-    price = (out / 1e9) / 1_000_000 if out > 0 else None
+    out_amount = ensure_int(data.get("outAmount"))
+    price = (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
 
     PRICE_CACHE[mint] = (price, now())
     return price
@@ -137,7 +165,10 @@ async def liquidity_ok(mint):
     if not isinstance(data, dict):
         return False
 
-    return ensure_int(data.get("outAmount")) > 5000
+    out_amount = ensure_int(data.get("outAmount"))
+    impact = ensure_float(data.get("priceImpactPct"), 1.0)
+
+    return out_amount > 5000 and impact < 0.60
 
 async def anti_rug(mint):
     data, _ = await http_get_json(
@@ -146,14 +177,28 @@ async def anti_rug(mint):
     )
     return isinstance(data, dict) and ensure_int(data.get("outAmount")) > 0
 
-# ================= TOKEN =================
+# ================= TOKEN SOURCES =================
 async def add_candidate(mint):
-    if valid_mint(mint):
-        CANDIDATES.add(mint)
+    repair()
 
-async def inject_fallback():
+    if not valid_mint(mint):
+        return False
+
+    if mint in CANDIDATES:
+        return False
+
+    CANDIDATES.add(mint)
+    engine.stats["adds"] += 1
+    return True
+
+async def inject_fallback(reason="fallback"):
+    added = 0
     for m in FALLBACK_TOKENS:
-        await add_candidate(m)
+        ok = await add_candidate(m)
+        if ok:
+            added += 1
+    if added > 0:
+        log(f"FALLBACK_OK +{added} reason={reason}")
 
 async def pump_scanner():
     global PUMP_FAILS
@@ -163,16 +208,21 @@ async def pump_scanner():
 
         if status != 200 or not isinstance(data, list):
             PUMP_FAILS += 1
-            log_once("pump", f"PUMP_HTTP_{status}")
-            await inject_fallback()
+            log_once("pump", f"PUMP_HTTP_{status}", cooldown=60)
+            await inject_fallback(reason=f"pump_{status}")
             await asyncio.sleep(min(10 * PUMP_FAILS, 120))
             continue
 
         PUMP_FAILS = 0
 
+        added = 0
         for c in safe_slice(data, 20):
             if isinstance(c, dict):
-                await add_candidate(c.get("mint"))
+                if await add_candidate(c.get("mint")):
+                    added += 1
+
+        if added > 0:
+            log(f"PUMP_OK +{added}")
 
         await asyncio.sleep(10)
 
@@ -184,97 +234,203 @@ async def jup_scanner():
 
         if status != 200 or not isinstance(data, list):
             JUP_FAILS += 1
-            log_once("jup", f"JUP_ERR {status}")
+            log_once("jup", f"JUP_ERR {status}", cooldown=90)
             await asyncio.sleep(min(30 * JUP_FAILS, 300))
             continue
 
         JUP_FAILS = 0
-
         random.shuffle(data)
 
+        added = 0
         for t in safe_slice(data, 50):
-            await add_candidate(t.get("address"))
+            if isinstance(t, dict):
+                mint = t.get("address") or t.get("mint")
+                if await add_candidate(mint):
+                    added += 1
+
+        if added > 0:
+            log(f"JUP_OK +{added}")
 
         await asyncio.sleep(180)
+
+async def handle_mempool_event(event):
+    if not isinstance(event, dict):
+        return
+    mint = event.get("mint")
+    await add_candidate(mint)
 
 async def mempool_runner():
     global MEMPOOL_FAILS
 
     while True:
         try:
-            await mempool_stream(lambda e: add_candidate(e.get("mint")))
+            await mempool_stream(handle_mempool_event)
             MEMPOOL_FAILS = 0
         except Exception as e:
             MEMPOOL_FAILS += 1
             msg = str(e)
 
             if "429" in msg:
-                log_once("mp429", "MEMPOOL 429 BLOCK")
+                log_once("mp429", "MEMPOOL_429_BLOCK", cooldown=120)
                 await asyncio.sleep(min(60 * MEMPOOL_FAILS, 600))
             else:
-                log_once("mp", msg)
+                log_once("mp", f"MEMPOOL_ERR {msg[:100]}", cooldown=60)
                 await asyncio.sleep(min(5 * MEMPOOL_FAILS, 120))
+
+async def refresh_universe():
+    global LAST_UNIVERSE_REFRESH
+
+    if now() - LAST_UNIVERSE_REFRESH < 60:
+        return
+
+    LAST_UNIVERSE_REFRESH = now()
+
+    if len(CANDIDATES) < 5:
+        await inject_fallback(reason="low_universe")
+
+    engine.candidate_count = len(CANDIDATES)
+    log_once("universe", f"UNIVERSE_REFRESH total={len(CANDIDATES)}", cooldown=45)
 
 # ================= STRATEGY =================
 async def alpha(mint):
     p1 = await get_price(mint)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(1.2)
     p2 = await get_price(mint)
 
-    if not p1 or not p2:
-        return 0
+    if not p1 or not p2 or p1 <= 0:
+        return 0.0
 
-    return max(0, min((p2 - p1) / p1 * 0.6, 0.08))
+    return max(0.0, min(((p2 - p1) / p1) * 1.2, 0.08))
 
 def can_buy(mint):
+    repair()
+
     if mint in {SOL, USDC, USDT}:
         return False
+
     if len(engine.positions) >= MAX_POSITIONS:
         return False
+
+    if any(isinstance(p, dict) and p.get("token") == mint for p in engine.positions):
+        return False
+
+    if now() - TOKEN_COOLDOWN[mint] < 30:
+        return False
+
     return True
 
 async def buy(mint, a):
+    repair()
+
     if not can_buy(mint):
-        return
+        return False
 
     price = await get_price(mint)
-    if not price:
-        return
+    if not price or price <= 0:
+        return False
 
     size = MAX_POSITION_SOL * max(0.2, a * 8)
+    size = max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
+    amount = size / price if price > 0 else 0.0
 
     engine.positions.append({
         "token": mint,
         "entry_price": price,
-        "amount": size / price,
+        "last_price": price,
+        "peak_price": price,
+        "pnl_pct": 0.0,
+        "amount": amount,
         "engine": "degen",
-        "alpha": a
+        "alpha": a,
     })
 
+    TOKEN_COOLDOWN[mint] = now()
     engine.stats["buys"] += 1
-    log(f"BUY {mint[:6]} alpha={a:.3f}")
+    engine.last_trade = f"BUY {mint[:6]}"
+    engine.last_signal = f"BUY_ALPHA {a:.4f}"
+
+    log(f"BUY {mint[:6]} alpha={a:.4f} size={size:.6f}")
+    return True
+
+async def sell(p):
+    repair()
+
+    token = p.get("token")
+    if not valid_mint(token):
+        return False
+
+    price = await get_price(token)
+    if not price:
+        return False
+
+    entry = ensure_float(p.get("entry_price"), 0.0)
+    if entry <= 0:
+        return False
+
+    pnl = (price - entry) / entry
+
+    try:
+        engine.positions.remove(p)
+    except ValueError:
+        engine.positions = [
+            x for x in engine.positions
+            if not (isinstance(x, dict) and x.get("token") == token)
+        ]
+
+    engine.trade_history.append({
+        "side": "SELL",
+        "token": token,
+        "entry_price": entry,
+        "exit_price": price,
+        "pnl_pct": pnl,
+        "alpha": ensure_float(p.get("alpha"), 0.0),
+        "engine": p.get("engine", "degen"),
+        "ts": now(),
+    })
+    engine.trade_history = engine.trade_history[-300:]
+
+    engine.stats["sells"] += 1
+    engine.last_trade = f"SELL {token[:6]}"
+
+    log(f"SELL {token[:6]} pnl={pnl:.4f}")
+    return True
 
 async def monitor():
     while True:
-        for p in list(engine.positions):
-            price = await get_price(p["token"])
-            if not price:
-                continue
+        try:
+            repair()
 
-            pnl = (price - p["entry_price"]) / p["entry_price"]
+            for p in list(engine.positions):
+                if not isinstance(p, dict):
+                    continue
 
-            if pnl > 0.18 or pnl < -0.1:
-                engine.positions.remove(p)
-                engine.stats["sells"] += 1
-                log(f"SELL {p['token'][:6]} pnl={pnl:.2f}")
+                price = await get_price(p.get("token"))
+                if not price:
+                    continue
+
+                entry = ensure_float(p.get("entry_price"), 0.0)
+                if entry <= 0:
+                    continue
+
+                pnl = (price - entry) / entry
+
+                p["last_price"] = price
+                p["peak_price"] = max(ensure_float(p.get("peak_price"), price), price)
+                p["pnl_pct"] = pnl
+
+                if pnl > 0.18 or pnl < -0.10:
+                    await sell(p)
+
+        except Exception as e:
+            engine.stats["errors"] += 1
+            log_once("monitor_err", f"MONITOR_ERR {str(e)[:100]}", cooldown=60)
 
         await asyncio.sleep(6)
 
 # ================= MAIN =================
 async def main():
-    log("🚀 v1303.1 BOT START")
-
-    await inject_fallback()
+    log("🚀 v1303.2 BOT START")
+    await inject_fallback(reason="boot")
 
     asyncio.create_task(pump_scanner())
     asyncio.create_task(jup_scanner())
@@ -284,36 +440,64 @@ async def main():
     while True:
         try:
             repair()
+            await refresh_universe()
 
-            if len(CANDIDATES) < 5:
-                await inject_fallback()
+            candidates = list(CANDIDATES)
+            random.shuffle(candidates)
 
-            engine.candidate_count = len(CANDIDATES)
-
-            for mint in safe_slice(list(CANDIDATES), 15):
+            for mint in safe_slice(candidates, 15):
                 engine.stats["signals"] += 1
 
-                if not await liquidity_ok(mint):
+                liq_ok = await liquidity_ok(mint)
+                if not liq_ok:
+                    log_once(f"liq_{mint}", f"SKIP_LIQ {mint[:6]}", cooldown=120)
                     continue
 
-                if not await anti_rug(mint):
+                rug_ok = await anti_rug(mint)
+                if not rug_ok:
+                    log_once(f"rug_{mint}", f"SKIP_RUG {mint[:6]}", cooldown=120)
                     continue
 
                 a = await alpha(mint)
+                engine.last_signal = f"{mint[:6]} alpha={a:.4f}"
+                log_once(f"alpha_{mint}", f"ALPHA {mint[:6]} {a:.4f}", cooldown=90)
 
-                if a > 0.01:
+                if a > 0.002:
                     await buy(mint, a)
+
+            engine.engine_stats = {
+                "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
+                "degen": {"pnl": 0.0, "trades": len(engine.trade_history), "wins": 0},
+                "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
+            }
+            engine.engine_allocator = {
+                "stable": 0.4,
+                "degen": 0.4,
+                "sniper": 0.2,
+            }
 
             await asyncio.sleep(6)
 
         except Exception as e:
+            repair()
             engine.stats["errors"] += 1
+            engine.bot_ok = False
+            engine.bot_error = str(e)
             log(f"MAIN_ERR {str(e)[:80]}")
             await asyncio.sleep(5)
 
 # ================= ENTRY =================
 async def bot_loop():
     try:
+        engine.bot_ok = True
+        engine.bot_error = ""
         await main()
+    except asyncio.CancelledError:
+        log("BOT_STOPPED")
+        raise
     except Exception as e:
+        repair()
+        engine.bot_ok = False
+        engine.bot_error = str(e)
         log(f"FATAL {e}")
+        raise
