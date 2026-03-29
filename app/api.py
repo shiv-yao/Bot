@@ -1,7 +1,22 @@
 from fastapi import FastAPI
 from state import engine
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+import asyncio
+from fastapi import FastAPI
+
+from bot import bot_loop   # 🔥 關鍵
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    print("🚀 BOT STARTING...")
+
+    asyncio.create_task(bot_loop())   # 🔥 核心
+
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/data")
 def data():
