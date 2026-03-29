@@ -1,4 +1,4 @@
-# ================= v1301_REAL_MARKET_BOT (完整補齊版 - 2026.03) =================
+# ================= v1301_REAL_MARKET_BOT (最終穩定版) =================
 import asyncio
 import time
 import random
@@ -115,7 +115,7 @@ async def get_liquidity_and_impact(mint: str):
 # ================= FILTER =================
 async def liquidity_ok(mint: str) -> bool:
     out, impact = await get_liquidity_and_impact(mint)
-    return out > 5000 and impact < 0.40   # 提高流動性門檻
+    return out > 5000 and impact < 0.40
 
 async def anti_rug(mint: str) -> bool:
     try:
@@ -184,14 +184,15 @@ async def alpha_engine(mint: str) -> float:
         return 0.01
 
 def pick_engine(alpha: float) -> str:
+    """安全版 pick_engine - 徹底避免 slice 錯誤"""
     if alpha > 0.07:
         return "sniper"
     if alpha > 0.03:
         return random.choices(["stable", "degen", "sniper"], weights=[0.2, 0.5, 0.3])[0]
     
-    # 強制轉 list，避免 slice 錯誤
-    weights_list = [ENGINE_ALLOCATOR["stable"], ENGINE_ALLOCATOR["degen"], ENGINE_ALLOCATOR["sniper"]]
-    return random.choices(["stable", "degen", "sniper"], weights=weights_list)[0]
+    # 最安全寫法：明確轉成 list
+    weights = [0.4, 0.4, 0.2]
+    return random.choices(["stable", "degen", "sniper"], weights=weights)[0]
 
 def update_allocator():
     engine.engine_stats = ENGINE_STATS.copy()
@@ -295,9 +296,9 @@ async def main():
             log(f"MAIN LOOP ERROR: {e}")
             await asyncio.sleep(10)
 
-# ================= 給 FastAPI 使用的入口 =================
+# ================= FastAPI 入口 =================
 async def bot_loop():
-    """解決 import bot_loop 的關鍵函數"""
+    """給 app.py 使用的入口"""
     try:
         await main()
     except Exception as e:
