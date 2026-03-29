@@ -17,18 +17,14 @@ LAST_SEEN_SIG = {}
 WALLET_TOKEN_SCORE = defaultdict(float)
 TOKEN_LAST_SEEN = defaultdict(float)
 
-
 def now():
     return time.time()
-
 
 def valid_pubkey(x):
     return isinstance(x, str) and 32 <= len(x) <= 44
 
-
 def valid_mint(x):
     return valid_pubkey(x) and x not in IGNORE_MINTS
-
 
 async def rpc_post(rpc_url: str, method: str, params: list):
     try:
@@ -52,7 +48,6 @@ async def rpc_post(rpc_url: str, method: str, params: list):
     except Exception:
         return None
 
-
 async def get_signatures(rpc_url: str, address: str, limit: int = 10):
     result = await rpc_post(
         rpc_url,
@@ -60,7 +55,6 @@ async def get_signatures(rpc_url: str, address: str, limit: int = 10):
         [address, {"limit": limit}],
     )
     return result if isinstance(result, list) else []
-
 
 async def get_tx(rpc_url: str, sig: str):
     result = await rpc_post(
@@ -75,7 +69,6 @@ async def get_tx(rpc_url: str, sig: str):
         ],
     )
     return result if isinstance(result, dict) else None
-
 
 def extract_candidate_mints(tx: dict):
     out = set()
@@ -116,12 +109,10 @@ def extract_candidate_mints(tx: dict):
             post_amt = 0.0
 
         pre_amt = pre_by_mint.get(mint, 0.0)
-
         if post_amt > pre_amt:
             out.add(mint)
 
     return list(out)
-
 
 async def poll_wallet_once(rpc_url: str, wallet: str):
     sigs = await get_signatures(rpc_url, wallet, limit=8)
@@ -161,7 +152,6 @@ async def poll_wallet_once(rpc_url: str, wallet: str):
 
     return found
 
-
 async def wallet_tracker_loop(rpc_url: str, wallets: list[str], on_token):
     while True:
         try:
@@ -173,24 +163,25 @@ async def wallet_tracker_loop(rpc_url: str, wallets: list[str], on_token):
                 for mint in found:
                     await on_token(mint, source="wallet")
 
-                await __sleep(0.25)
-
+                await _sleep(0.25)
         except Exception:
-            await __sleep(3)
+            await _sleep(3)
 
-        await __sleep(4)
-
+        await _sleep(4)
 
 def wallet_score(mint: str) -> float:
     base = WALLET_TOKEN_SCORE.get(mint, 0.0)
     age = now() - TOKEN_LAST_SEEN.get(mint, 0.0)
+
+    # v1306: 沒有 wallet 分數時給一點 bootstrap，避免永遠 0
+    if base <= 0:
+        return 1.0
 
     if age <= 0:
         return base
 
     decay = max(0.2, 1.0 - min(age / 3600.0, 0.8))
     return base * decay
-
 
 async def extract_wallets_from_mints(rpc_url: str, mints):
     wallets = set()
@@ -226,10 +217,9 @@ async def extract_wallets_from_mints(rpc_url: str, mints):
             except Exception:
                 continue
 
-        await __sleep(0.15)
+        await _sleep(0.15)
 
     return list(wallets)
-
 
 async def track_wallet_behavior(rpc_url: str, wallets):
     results = []
@@ -272,10 +262,9 @@ async def track_wallet_behavior(rpc_url: str, wallets):
                 "ts": now(),
             }
 
-        await __sleep(0.15)
+        await _sleep(0.15)
 
     return results
-
 
 async def discover_active_wallets_from_candidates(rpc_url: str, candidate_mints):
     wallets = await extract_wallets_from_mints(rpc_url, candidate_mints)
@@ -299,7 +288,6 @@ async def discover_active_wallets_from_candidates(rpc_url: str, candidate_mints)
     scored_wallets.sort(key=lambda x: x["score"], reverse=True)
     return scored_wallets
 
-
-async def __sleep(seconds: float):
+async def _sleep(seconds: float):
     import asyncio
     await asyncio.sleep(seconds)
