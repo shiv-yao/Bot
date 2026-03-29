@@ -26,6 +26,7 @@ IN_FLIGHT_SELL = set()
 LAST_LOG = {}
 
 # ================= CONFIG =================
+
 MAX_POSITIONS = 2
 BASE_SIZE = 0.0015
 
@@ -36,10 +37,25 @@ MAX_THRESHOLD = 0.08
 TAKE_PROFIT = 0.12
 STOP_LOSS = -0.05
 
+RPC_WS = [
+    "wss://api.mainnet-beta.solana.com"
+]
+RPC_POOL = [
+    "https://api.mainnet-beta.solana.com",
+    "https://rpc.ankr.com/solana"
+]
+
+def pick_rpc():
+    return random.choice(RPC_POOL)
+
 REAL = os.getenv("REAL_TRADING", "false").lower() == "true"
 PRIVATE_KEY = os.getenv("PRIVATE_KEY_B58", "")
 
 HTTP = httpx.AsyncClient(timeout=10)
+WATCH_PROGRAMS = [
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14MZg6UoF6P",  # pump.fun
+    "RVKd61ztZW9zQ3hJ9jS7XGJqvXrT4W7kwh28ykV59y",   # Raydium
+]
 
 # ================= WALLET =================
 KEYPAIR = None
@@ -163,6 +179,10 @@ def wallet_score(m):
     return 1.0
 
 async def sniper_bonus(m):
+    # 🔥 新幣加權
+    if m not in {"BONK", "JUP", "WIF"}:
+        return random.uniform(0.02, 0.05)
+
     return random.uniform(0.005, 0.02)
 
 # ================= RANK =================
@@ -284,6 +304,54 @@ async def sell(p):
         IN_FLIGHT_SELL.discard(m)
 
 # ================= MONITOR =================
+async def mempool_sniper():
+    import websockets
+    import json
+
+    while True:
+        try:
+            ws_url = random.choice(RPC_WS)
+
+            async with websockets.connect(ws_url) as ws:
+
+                for program in WATCH_PROGRAMS:
+                    sub = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [program]},
+                            {"commitment": "processed"}
+                        ]
+                    }
+                    await ws.send(json.dumps(sub))
+                    await ws.recv()
+
+                log("SNIPER CONNECTED")
+
+                while True:
+                    msg = json.loads(await ws.recv())
+
+                    logs = (
+                        msg.get("params", {})
+                        .get("result", {})
+                        .get("value", {})
+                        .get("logs", [])
+                    )
+
+                    for line in logs:
+                        parts = line.split()
+
+                        for p in parts:
+                            if len(p) >= 32 and len(p) <= 44:
+                                if p not in CANDIDATES:
+                                    CANDIDATES.add(p)
+                                    log(f"🔥 SNIPER ADD {p[:6]}")
+
+        except Exception as e:
+            log(f"SNIPER_ERR {e}")
+            await asyncio.sleep(3)
+            
 async def monitor():
     while True:
         try:
