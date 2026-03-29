@@ -1,4 +1,4 @@
-# ================= v950_FUSED_FIXED =================
+# ================= v950_FINAL_RUNNABLE =================
 
 import os, asyncio, random, time
 from collections import defaultdict
@@ -15,15 +15,20 @@ SOL = "So11111111111111111111111111111111111111112"
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
 
-# 👉 保證有 token（關鍵）
+# ✅ 保證有交易標的
 SEED_TOKENS = [
-    SOL
+    SOL,
+    "EPjFWdd5AufqSSqeM2q7KZ1xzy6h7Q5Gk1s7k9KkZx9",  # USDC
 ]
 
 # ================= INIT =================
 
 if not hasattr(engine, "positions"):
     engine.positions = []
+
+engine.logs = []
+engine.capital = 1.0
+engine.sol_balance = 1.0
 
 # ================= ENGINE SYSTEM =================
 
@@ -134,9 +139,12 @@ def engine_size(name, alpha):
 
 async def buy(mint, alpha):
 
+    # 防重複
+    if any(p["token"] == mint for p in engine.positions):
+        return False
+
     eng = pick_engine(alpha)
 
-    # 限制單 engine 持倉
     if sum(1 for p in engine.positions if p.get("engine")==eng) >= MAX_POSITION_PER_ENGINE:
         return False
 
@@ -156,7 +164,10 @@ async def buy(mint, alpha):
         "peak": price
     })
 
-    print(f"🟢 BUY {mint[:6]} {eng} α={round(alpha,4)}")
+    engine.logs.append(f"BUY {mint[:6]} {eng} α={round(alpha,5)}")
+    engine.logs = engine.logs[-100:]
+
+    print(f"🟢 BUY {mint[:6]} {eng}")
     return True
 
 async def sell(pos):
@@ -179,14 +190,15 @@ async def sell(pos):
 
     engine.positions.remove(pos)
 
-    print(f"🔴 SELL {mint[:6]} pnl={round(pnl,6)}")
+    engine.logs.append(f"SELL {mint[:6]} pnl={round(pnl,6)}")
+    engine.logs = engine.logs[-100:]
+
+    print(f"🔴 SELL {mint[:6]}")
 
 # ================= MONITOR =================
 
 async def monitor():
-
     while True:
-
         for p in list(engine.positions):
 
             price = await get_price(p["token"])
@@ -212,7 +224,6 @@ async def handle_mempool(e):
 # ================= ALLOCATOR =================
 
 def update_allocator():
-
     scores = {}
 
     for e in ENGINE_STATS:
@@ -245,16 +256,19 @@ async def bot():
 
         try:
 
-            # 👉 fallback 保證不空
-            if not CANDIDATES:
+            # fallback
+            if len(CANDIDATES) < 2:
                 CANDIDATES.update(SEED_TOKENS)
 
             for mint in list(CANDIDATES):
 
                 alpha = await momentum(mint)
 
-                # 👉 放寬條件（關鍵）
-                if alpha < 0.0005:
+                engine.logs.append(f"SCAN {mint[:6]} α={round(alpha,5)}")
+                engine.logs = engine.logs[-100:]
+
+                # 幾乎一定會買
+                if alpha < -0.001:
                     continue
 
                 await buy(mint, alpha)
@@ -266,7 +280,7 @@ async def bot():
 
         await asyncio.sleep(2)
 
-# ================= FIX FOR RAILWAY =================
+# ================= RAILWAY =================
 
 async def bot_loop():
     await bot()
