@@ -1,4 +1,4 @@
-# ================= v1000_GOD_MODE_ENGINE =================
+# ================= v1000_GOD_MODE_PRO =================
 
 import os, asyncio, random, time
 from collections import defaultdict
@@ -23,6 +23,8 @@ SEED_TOKENS = [
     "EPjFWdd5AufqSSqeM2q7KZ1xzy6h7Q5Gk1s7k9KkZx9"
 ]
 
+PUMP_API = "https://frontend-api.pump.fun/coins/latest"
+
 # ================= INIT =================
 
 if not hasattr(engine, "positions"):
@@ -34,6 +36,10 @@ engine.sol_balance = 1.0
 
 engine.loss_streak = 0
 engine.peak_capital = 1.0
+
+# ================= HTTP（關鍵修復）=================
+
+HTTP = httpx.AsyncClient(timeout=10)
 
 # ================= ENGINE =================
 
@@ -75,19 +81,52 @@ def clamp(v, lo, hi):
 def now():
     return time.time()
 
+# ================= LIVE TOKEN =================
+
+async def fetch_new_tokens():
+    try:
+        r = await HTTP.get(PUMP_API)
+        data = r.json()
+
+        tokens = []
+        for c in data:
+            mint = c.get("mint")
+            if mint:
+                tokens.append(mint)
+
+        return tokens[:20]
+
+    except:
+        return []
+
+async def pump_scanner():
+    while True:
+        try:
+            tokens = await fetch_new_tokens()
+
+            for mint in tokens:
+                if mint not in CANDIDATES:
+                    CANDIDATES.add(mint)
+                    LAST_SEEN[mint] = now()
+                    print(f"🆕 NEW {mint[:6]}")
+
+        except Exception as e:
+            print("PUMP ERR", e)
+
+        await asyncio.sleep(5)
+
 # ================= PRICE =================
 
 async def get_price(mint):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": mint,
-                    "outputMint": SOL,
-                    "amount": "1000000"
-                }
-            )
+        r = await HTTP.get(
+            "https://lite-api.jup.ag/swap/v1/quote",
+            params={
+                "inputMint": mint,
+                "outputMint": SOL,
+                "amount": "1000000"
+            }
+        )
         j = r.json()
         out = int(j.get("outAmount", 0)) / 1e9
         return out / 1_000_000 if out > 0 else None
@@ -103,18 +142,15 @@ async def multi_momentum(mint):
         if not p:
             return 0
         prices.append(p)
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.06)
 
     return (prices[-1] - prices[0]) / prices[0]
 
-
 async def flow_acceleration(mint):
     v1 = await multi_momentum(mint)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.08)
     v2 = await multi_momentum(mint)
-
     return max(0, v2 - v1)
-
 
 async def volume_surge(mint):
     p = await get_price(mint)
@@ -126,12 +162,6 @@ async def volume_surge(mint):
 
     return abs(p - prev) / prev if prev > 0 else 0
 
-
-async def alpha_confidence(alpha):
-    """👉 防假訊號"""
-    return 1 if alpha > 0.01 else 0
-
-
 async def alpha_fusion(mint):
 
     if mint in ALPHA_CACHE and now() - ALPHA_CACHE[mint][1] < 2:
@@ -141,11 +171,7 @@ async def alpha_fusion(mint):
     f = await flow_acceleration(mint)
     v = await volume_surge(mint)
 
-    score = (
-        m * 0.4 +
-        f * 0.3 +
-        v * 0.3
-    )
+    score = (m * 0.4 + f * 0.3 + v * 0.3)
 
     ALPHA_CACHE[mint] = (score, now())
 
@@ -155,32 +181,29 @@ async def alpha_fusion(mint):
 
 async def liquidity_ok(mint):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": SOL,
-                    "outputMint": mint,
-                    "amount": "10000000"
-                }
-            )
+        r = await HTTP.get(
+            "https://lite-api.jup.ag/swap/v1/quote",
+            params={
+                "inputMint": SOL,
+                "outputMint": mint,
+                "amount": "10000000"
+            }
+        )
         impact = float(r.json().get("priceImpactPct", 1))
         return impact < 0.35
     except:
         return False
 
-
 async def anti_rug(mint):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://lite-api.jup.ag/swap/v1/quote",
-                params={
-                    "inputMint": mint,
-                    "outputMint": SOL,
-                    "amount": "1000000"
-                }
-            )
+        r = await HTTP.get(
+            "https://lite-api.jup.ag/swap/v1/quote",
+            params={
+                "inputMint": mint,
+                "outputMint": SOL,
+                "amount": "1000000"
+            }
+        )
         return int(r.json().get("outAmount", 0)) > 0
     except:
         return False
@@ -195,11 +218,9 @@ def pick_engine(alpha):
         weights=list(ENGINE_ALLOCATOR.values())
     )[0]
 
-
 def engine_size(name, alpha):
     base = ENGINE_BASE_SIZE[name]
 
-    # 👉 連敗降低風險
     if engine.loss_streak >= 3:
         base *= 0.5
 
@@ -223,10 +244,6 @@ async def buy(mint, alpha):
     if sum(1 for p in engine.positions if p.get("engine")==eng) >= MAX_POSITION_PER_ENGINE:
         return False
 
-    confidence = await alpha_confidence(alpha)
-    if confidence == 0:
-        return False
-
     price = await get_price(mint)
     if not price:
         FAILED_TOKENS.add(mint)
@@ -248,7 +265,6 @@ async def buy(mint, alpha):
 
     print(f"🟢 BUY {mint[:6]} {eng}")
     return True
-
 
 async def sell(pos):
 
@@ -284,7 +300,6 @@ async def monitor():
                 continue
 
             p["peak"] = max(p["peak"], price)
-
             pnl_pct = (price - p["entry"]) / p["entry"]
 
             if pnl_pct > 0.30 or pnl_pct < -0.10:
@@ -295,47 +310,30 @@ async def monitor():
 # ================= RISK =================
 
 def risk_check():
-
     engine.peak_capital = max(engine.peak_capital, engine.capital)
-
     dd = (engine.peak_capital - engine.capital) / engine.peak_capital
 
     if dd > MAX_DRAWDOWN:
-        print("🛑 KILL SWITCH (drawdown)")
+        print("🛑 DRAWDOWN STOP")
         return False
 
     if engine.loss_streak >= LOSS_STREAK_LIMIT:
-        print("🛑 KILL SWITCH (loss streak)")
+        print("🛑 LOSS STREAK STOP")
         return False
 
     return True
-
-# ================= MEMPOOL =================
-
-async def handle_mempool(e):
-    mint = e.get("mint")
-    if mint:
-        CANDIDATES.add(mint)
-        LAST_SEEN[mint] = now()
-
-# ================= CLEANUP =================
-
-def cleanup():
-    cutoff = now() - 600
-    for m in list(CANDIDATES):
-        if LAST_SEEN.get(m, now()) < cutoff:
-            CANDIDATES.discard(m)
 
 # ================= MAIN =================
 
 async def bot():
 
-    print("🚀 V1000 GOD MODE LIVE")
+    print("🚀 V1000 GOD MODE PRO")
 
     asyncio.create_task(monitor())
+    asyncio.create_task(pump_scanner())
 
     try:
-        asyncio.create_task(mempool_stream(handle_mempool))
+        asyncio.create_task(mempool_stream(lambda e: CANDIDATES.add(e.get("mint"))))
     except:
         pass
 
@@ -347,8 +345,6 @@ async def bot():
                 await asyncio.sleep(5)
                 continue
 
-            cleanup()
-
             if len(CANDIDATES) < 3:
                 CANDIDATES.update(SEED_TOKENS)
 
@@ -356,9 +352,7 @@ async def bot():
 
                 alpha = await alpha_fusion(mint)
 
-                threshold = 0.01 + random.uniform(0, 0.004)
-
-                if alpha < threshold:
+                if alpha < 0.01:
                     continue
 
                 if not await liquidity_ok(mint):
