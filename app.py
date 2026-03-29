@@ -1,17 +1,14 @@
 import os
 import asyncio
-from init_engine import init_engine
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from init_engine import init_engine
 from state import engine
 
 BOT_TASK = None
-
-
-
 
 
 async def start_bot():
@@ -84,11 +81,14 @@ def data():
 @app.get("/debug")
 def debug():
     return {
+        "requested_real": os.environ.get("REAL_TRADING"),
         "mode": engine.mode,
-        "REAL_TRADING": os.environ.get("REAL_TRADING"),
-        "RPC": os.environ.get("SOLANA_RPC_HTTP"),
-        "has_private_key": bool(os.environ.get("PRIVATE_KEY_JSON")),
+        "wallet_ok": getattr(engine, "wallet_ok", False),
+        "jup_ok": getattr(engine, "jup_ok", False),
+        "has_private_key_json": bool(os.environ.get("PRIVATE_KEY_JSON")),
+        "has_private_key_b58": bool(os.environ.get("PRIVATE_KEY_B58")),
         "has_jup_key": bool(os.environ.get("JUP_API_KEY")),
+        "rpc_url": os.environ.get("SOLANA_RPC_HTTP") or os.environ.get("RPC_URL"),
         "bot_ok": engine.bot_ok,
         "bot_error": engine.bot_error,
     }
