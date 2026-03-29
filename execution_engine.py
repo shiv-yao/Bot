@@ -1,11 +1,28 @@
-class ExecutionEngine:
-    def __init__(self, engine):
-        self.engine = engine
+import base64
+import httpx
+import asyncio
+from solders.transaction import VersionedTransaction
+from solders.keypair import Keypair
+from solana.rpc.async_api import AsyncClient
 
-    async def buy(self, mint, size):
-        from bot import buy  # 直接用你原本
-        return await buy(mint, size_override=size)
+RPC_URL = "https://api.mainnet-beta.solana.com"
 
-    async def sell(self, position):
-        from bot import sell
-        return await sell(position)
+
+async def execute_swap(wallet: Keypair, tx_base64: str):
+    try:
+        tx_bytes = base64.b64decode(tx_base64)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+
+        tx.sign([wallet])
+
+        client = AsyncClient(RPC_URL)
+
+        resp = await client.send_raw_transaction(bytes(tx))
+        sig = resp.value
+
+        await client.confirm_transaction(sig)
+
+        return sig
+
+    except Exception as e:
+        raise RuntimeError(f"EXECUTE ERROR: {e}")
