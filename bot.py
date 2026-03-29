@@ -1,4 +1,4 @@
-# ================= v1314 REAL TRADING (JUP V2 ORDER + SIGN + SEND) =================
+# ================= v1314 REAL TRADING (JUP V2 ORDER + EXECUTE) =================
 import os
 import json
 import time
@@ -8,6 +8,7 @@ import asyncio
 from collections import defaultdict
 
 import httpx
+import base58
 
 from state import engine
 from mempool import mempool_stream
@@ -33,7 +34,9 @@ MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 
 PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 JUP_TOKENS_API = "https://token.jup.ag/all"
-JUP_ORDER_API = "https://api.jup.ag/swap/v2/order"
+JUP_BASE_API = "https://api.jup.ag/swap/v2"
+JUP_ORDER_API = f"{JUP_BASE_API}/order"
+JUP_EXECUTE_API = f"{JUP_BASE_API}/execute"
 
 RPC_HTTP = os.environ.get("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")
 RPC_WS = os.environ.get("SOLANA_RPC_WS", "wss://api.mainnet-beta.solana.com")
@@ -44,14 +47,36 @@ REAL_TRADING = os.environ.get("REAL_TRADING", "false").lower() == "true"
 JUP_API_KEY = os.environ.get("JUP_API_KEY", "").strip()
 
 PRIVATE_KEY_JSON = os.environ.get("PRIVATE_KEY_JSON", "").strip()
-KEYPAIR = None
-if PRIVATE_KEY_JSON:
-    try:
-        KEYPAIR = Keypair.from_bytes(bytes(json.loads(PRIVATE_KEY_JSON)))
-    except Exception:
-        KEYPAIR = None
+PRIVATE_KEY_B58 = os.environ.get("PRIVATE_KEY_B58", "").strip()
 
-HTTP = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+HTTP = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+
+# ================= WALLET =================
+def load_keypair():
+    last_err = None
+
+    if PRIVATE_KEY_JSON:
+        try:
+            return Keypair.from_bytes(bytes(json.loads(PRIVATE_KEY_JSON)))
+        except Exception as e:
+            last_err = f"PRIVATE_KEY_JSON invalid: {e}"
+
+    if PRIVATE_KEY_B58:
+        try:
+            return Keypair.from_bytes(base58.b58decode(PRIVATE_KEY_B58))
+        except Exception as e:
+            last_err = f"PRIVATE_KEY_B58 invalid: {e}"
+
+    if last_err:
+        raise RuntimeError(last_err)
+
+    raise RuntimeError("No private key provided")
+
+
+try:
+    KEYPAIR = load_keypair()
+except Exception:
+    KEYPAIR = None
 
 # ================= AI =================
 AI_PARAMS = {
@@ -93,8 +118,10 @@ STRATEGY_LOCAL_STATS = {
 def now() -> float:
     return time.time()
 
+
 def valid_mint(m) -> bool:
     return isinstance(m, str) and 32 <= len(m) <= 44
+
 
 def ensure_float(x, d=0.0):
     try:
@@ -102,17 +129,21 @@ def ensure_float(x, d=0.0):
     except Exception:
         return d
 
+
 def ensure_int(x, d=0):
     try:
         return int(x)
     except Exception:
         return d
 
+
 def real_trading_ready() -> bool:
     return REAL_TRADING and KEYPAIR is not None and bool(JUP_API_KEY)
 
+
 def wallet_pubkey_str() -> str:
     return str(KEYPAIR.pubkey()) if KEYPAIR else ""
+
 
 def log(msg: str):
     repair()
@@ -120,11 +151,13 @@ def log(msg: str):
     engine.logs = engine.logs[-500:]
     print("[BOT]", msg)
 
+
 def log_once(key: str, msg: str, cooldown: int = 60):
     ts = now()
     if ts - LAST_LOG_TS.get(key, 0) > cooldown:
         LAST_LOG_TS[key] = ts
         log(msg)
+
 
 def repair():
     if not hasattr(engine, "positions") or not isinstance(engine.positions, list):
@@ -174,6 +207,7 @@ def jup_headers():
         headers["x-api-key"] = JUP_API_KEY
     return headers
 
+
 async def http_get_json(url, params=None, headers=None):
     try:
         r = await HTTP.get(url, params=params, headers=headers)
@@ -183,6 +217,7 @@ async def http_get_json(url, params=None, headers=None):
     except Exception:
         return None
 
+
 async def http_post_json(url, payload=None, headers=None):
     try:
         r = await HTTP.post(url, json=payload, headers=headers)
@@ -191,6 +226,7 @@ async def http_post_json(url, payload=None, headers=None):
         return r.json()
     except Exception:
         return None
+
 
 async def rpc_post(method: str, params):
     try:
@@ -216,15 +252,12 @@ async def preload_token_decimals():
             if valid_mint(mint):
                 TOKEN_DECIMALS[mint] = ensure_int(t.get("decimals"), 6)
 
+
 def token_decimals(mint: str) -> int:
     return TOKEN_DECIMALS.get(mint, 6)
 
-# ================= JUPITER ORDER =================
+# ================= JUPITER ORDER / EXECUTE =================
 async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int):
-    """
-    Latest Jupiter v2 /order:
-    returns quote + assembled base64 tx when taker is provided.
-    """
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -234,31 +267,82 @@ async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int)
         "slippageBps": AI_PARAMS["slippage_bps"],
         "priorityFeeLamports": AI_PARAMS["priority_fee_lamports"],
     }
+
     if USE_JITO and AI_PARAMS["jito_tip_lamports"] > 0:
         params["jitoTipLamports"] = AI_PARAMS["jito_tip_lamports"]
 
     params = {k: v for k, v in params.items() if v is not None}
     return await http_get_json(JUP_ORDER_API, params=params, headers=jup_headers())
 
+
 def sign_transaction_base64(tx_b64: str) -> str:
+    """
+    Keep any placeholder / existing signatures and only replace the taker signature.
+    This is safer for JupiterZ / RFQ style routes than rebuilding from scratch.
+    """
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
-    signature = KEYPAIR.sign_message(solders_message.to_bytes_versioned(raw_tx.message))
-    signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+    msg_bytes = solders_message.to_bytes_versioned(raw_tx.message)
+    taker_sig = KEYPAIR.sign_message(msg_bytes)
+
+    existing_sigs = list(raw_tx.signatures)
+    if existing_sigs:
+        existing_sigs[0] = taker_sig
+        signed_tx = VersionedTransaction.populate(raw_tx.message, existing_sigs)
+    else:
+        signed_tx = VersionedTransaction.populate(raw_tx.message, [taker_sig])
+
     return base64.b64encode(bytes(signed_tx)).decode("utf-8")
 
-async def send_signed_transaction_b64(tx_b64: str):
-    return await rpc_post(
-        "sendTransaction",
-        [
-            tx_b64,
-            {
-                "encoding": "base64",
-                "skipPreflight": False,
-                "preflightCommitment": "processed",
-                "maxRetries": 5,
-            },
-        ],
+
+async def jupiter_execute(order: dict):
+    """
+    Official Jupiter flow:
+    1) GET /order
+    2) sign returned transaction locally
+    3) POST /execute with signedTransaction + requestId
+    """
+    tx_b64 = order.get("transaction")
+    request_id = order.get("requestId")
+    last_valid_block_height = order.get("lastValidBlockHeight")
+
+    if not tx_b64 or not request_id:
+        raise RuntimeError(f"INVALID_ORDER tx={bool(tx_b64)} requestId={bool(request_id)}")
+
+    signed_b64 = sign_transaction_base64(tx_b64)
+
+    payload = {
+        "signedTransaction": signed_b64,
+        "requestId": request_id,
+    }
+    if last_valid_block_height is not None:
+        try:
+            payload["lastValidBlockHeight"] = int(last_valid_block_height)
+        except Exception:
+            pass
+
+    result = await http_post_json(
+        JUP_EXECUTE_API,
+        payload,
+        headers={**jup_headers(), "Content-Type": "application/json"},
     )
+
+    if not result:
+        raise RuntimeError("EXECUTE_HTTP_FAIL")
+
+    status = result.get("status")
+    signature = result.get("signature")
+    code = result.get("code", None)
+    error = result.get("error", "")
+
+    if status != "Success":
+        raise RuntimeError(f"EXECUTE_FAIL code={code} error={error} sig={signature}")
+
+    return {
+        "signature": signature,
+        "result": result,
+        "signed_transaction": signed_b64,
+    }
+
 
 async def confirm_signature(signature: str, timeout_sec: int = 35):
     deadline = now() + timeout_sec
@@ -307,9 +391,11 @@ async def get_price(m):
     PRICE_CACHE[m] = (price, now())
     return price
 
+
 async def liquidity_ok(m):
     data = await jupiter_order(SOL, m, 10_000_000)
     return bool(data and ensure_int(data.get("outAmount"), 0) > 5000)
+
 
 async def anti_rug(m):
     data = await jupiter_order(m, SOL, 1_000_000)
@@ -336,6 +422,7 @@ async def build_wallet_graph():
     except Exception as e:
         log_once("wallet_graph", f"WALLET_GRAPH_ERR {e}", 60)
 
+
 def wallet_score(m):
     score = 1.0
     for wallet, tokens in WALLET_GRAPH.items():
@@ -351,6 +438,7 @@ WATCH_PROGRAMS = set(filter(None, [
     os.environ.get("WATCH_PROGRAM_2", ""),
 ]))
 
+
 async def mempool_decode_loop():
     while True:
         try:
@@ -358,6 +446,7 @@ async def mempool_decode_loop():
         except Exception as e:
             log_once("mempool_stream", f"MEMPOOL_STREAM_ERR {e}", 30)
             await asyncio.sleep(5)
+
 
 async def mempool_logs_subscribe_loop():
     if not WATCH_PROGRAMS:
@@ -407,6 +496,7 @@ async def mempool_logs_subscribe_loop():
             log_once("mempool_logs", f"LOGS_SUB_ERR {e}", 30)
             await asyncio.sleep(5)
 
+
 async def sniper_bonus(m):
     if m in SNIPER_CACHE:
         return 0.0
@@ -440,6 +530,7 @@ def pick_engine(combo):
         return "degen"
     return "stable"
 
+
 def position_size(combo):
     if combo > 0.03:
         return MAX_POSITION_SOL
@@ -448,6 +539,7 @@ def position_size(combo):
     elif combo > 0.008:
         return MAX_POSITION_SOL * 0.5
     return MIN_POSITION_SOL
+
 
 async def rank_candidates():
     ranked = []
@@ -483,6 +575,7 @@ def strategy_stats_from_history():
             stats[eng]["wins"] += 1
 
     return stats
+
 
 def review_strategies():
     global LAST_STRATEGY_REVIEW_TS
@@ -531,6 +624,7 @@ def capital_stage():
         return "mid", 0.70
     return "large", 1.00
 
+
 def capital_scale(size):
     _, mult = capital_stage()
     return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, size * mult))
@@ -559,6 +653,7 @@ def can_buy(m):
     if now() - TOKEN_COOLDOWN[m] < 30:
         return False
     return True
+
 
 async def buy(m, a, combo, w, s):
     repair()
@@ -596,34 +691,34 @@ async def buy(m, a, combo, w, s):
         lamports_in = int(size * 1e9)
         order = await jupiter_order(SOL, m, lamports_in)
 
-        if not order or not order.get("transaction"):
-            log_once("buy_order", f"BUY_ORDER_ERR {m[:6]}", 15)
+        if not order:
+            log_once("buy_order", f"BUY_ORDER_ERR {m[:6]} no_response", 15)
             return
 
         if order.get("errorCode") or order.get("error"):
-            log_once("buy_order", f"BUY_ORDER_FAIL {m[:6]} {order.get('errorMessage') or order.get('error')}", 15)
+            log_once(
+                "buy_order",
+                f"BUY_ORDER_FAIL {m[:6]} {order.get('errorMessage') or order.get('error') or order.get('errorCode')}",
+                15,
+            )
+            return
+
+        if not order.get("transaction") or not order.get("requestId"):
+            log_once("buy_order", f"BUY_ORDER_NO_TX {m[:6]}", 15)
             return
 
         raw_token_amount = ensure_int(order.get("outAmount"), 0)
 
         try:
-            signed_b64 = sign_transaction_base64(order["transaction"])
+            exec_result = await jupiter_execute(order)
+            tx_sig = exec_result.get("signature")
+            tx_meta = exec_result.get("result")
         except Exception as e:
-            log_once("buy_sign", f"BUY_SIGN_ERR {m[:6]} {e}", 15)
+            log_once("buy_exec", f"BUY_EXEC_ERR {m[:6]} {e}", 15)
             return
 
-        if USE_JITO and JITO_BUNDLE_URL:
-            tx_meta = await jito_send_bundle([signed_b64])
-
-        # retry send
-        for _ in range(2):
-            tx_sig = await send_signed_transaction_b64(signed_b64)
-            if tx_sig:
-                break
-            await asyncio.sleep(0.5)
-
         if not tx_sig:
-            log_once("buy_send", f"BUY_SEND_ERR {m[:6]}", 15)
+            log_once("buy_exec", f"BUY_EXEC_FAIL {m[:6]}", 15)
             return
 
         await confirm_signature(tx_sig)
@@ -655,7 +750,8 @@ async def buy(m, a, combo, w, s):
         f"{m[:6]} a={a:.4f} w={w:.2f} s={s:.4f} c={combo:.4f} eng={engine_type}"
     )
 
-    log(f"BUY {m[:6]} {engine_type} combo={combo:.4f} size={size:.6f} mode={trade_mode}")
+    log(f"BUY {m[:6]} {engine_type} combo={combo:.4f} size={size:.6f} mode={trade_mode} sig={tx_sig}")
+
 
 async def sell(p):
     repair()
@@ -672,27 +768,21 @@ async def sell(p):
     if real_trading_ready():
         raw_amount = ensure_int(p.get("raw_token_amount"), 0)
 
-        # fallback
         if raw_amount <= 0:
-            raw_amount = int(max(0, ensure_float(p.get("amount"), 0.0)) * (10 ** token_decimals(p["token"])))
+            raw_amount = int(
+                max(0, ensure_float(p.get("amount"), 0.0)) * (10 ** token_decimals(p["token"]))
+            )
 
         order = await jupiter_order(p["token"], SOL, raw_amount)
-        if order and order.get("transaction") and not order.get("errorCode") and not order.get("error"):
+        if order and order.get("transaction") and order.get("requestId") and not order.get("errorCode") and not order.get("error"):
             try:
-                signed_b64 = sign_transaction_base64(order["transaction"])
-                if USE_JITO and JITO_BUNDLE_URL:
-                    tx_meta = await jito_send_bundle([signed_b64])
-
-                for _ in range(2):
-                    tx_sig = await send_signed_transaction_b64(signed_b64)
-                    if tx_sig:
-                        break
-                    await asyncio.sleep(0.5)
-
+                exec_result = await jupiter_execute(order)
+                tx_sig = exec_result.get("signature")
+                tx_meta = exec_result.get("result")
                 if tx_sig:
                     await confirm_signature(tx_sig)
             except Exception as e:
-                log_once("sell_real", f"SELL_REAL_ERR {p['token'][:6]} {e}", 15)
+                log_once("sell_exec", f"SELL_EXEC_ERR {p['token'][:6]} {e}", 15)
         else:
             log_once("sell_order", f"SELL_ORDER_ERR {p['token'][:6]}", 15)
 
@@ -731,7 +821,7 @@ async def sell(p):
     engine.capital = max(1.0, ensure_float(engine.capital, 30.0) * (1.0 + pnl * 0.1))
     engine.stats["sells"] += 1
     engine.last_trade = f"SELL {p['token'][:6]}"
-    log(f"SELL {p['token'][:6]} pnl={pnl:.4f} eng={eng} mode={p.get('trade_mode', 'PAPER')}")
+    log(f"SELL {p['token'][:6]} pnl={pnl:.4f} eng={eng} mode={p.get('trade_mode', 'PAPER')} sig={tx_sig}")
 
 # ================= MONITOR =================
 async def monitor():
@@ -797,6 +887,7 @@ async def add_candidate(m, source="unknown"):
         engine.stats["adds"] += 1
         log_once(f"cand_{m}", f"ADD {m[:6]} src={source}", 120)
 
+
 async def pump():
     while True:
         data = await http_get_json(PUMP_API)
@@ -806,6 +897,7 @@ async def pump():
                 if valid_mint(m):
                     await add_candidate(m, source="pump")
         await asyncio.sleep(10)
+
 
 async def jup():
     while True:
@@ -827,7 +919,7 @@ async def main():
     log(f"🚀 v1314 START mode={mode}")
 
     if REAL_TRADING and not real_trading_ready():
-        log("REAL_TRADING requested but PRIVATE_KEY_JSON or JUP_API_KEY invalid; falling back to PAPER")
+        log("REAL_TRADING requested but PRIVATE_KEY_B58/PRIVATE_KEY_JSON or JUP_API_KEY invalid; falling back to PAPER")
 
     for m in FALLBACK_TOKENS:
         await add_candidate(m, source="fallback")
