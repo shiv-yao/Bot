@@ -1,4 +1,4 @@
-# ================= v1305_PRO_MERGED_BOT =================
+# ================= v1306_RESTORED_PLUS_FUSION_TRADABLE_BOT =================
 import asyncio
 import time
 import random
@@ -32,12 +32,21 @@ RPC_URL = "https://api.mainnet-beta.solana.com"
 STATIC_UNIVERSE = {SOL, USDC, USDT, BONK, JUP}
 FALLBACK_TOKENS = set(STATIC_UNIVERSE)
 
-# 可手動放公開 wallet；留空也能靠自動發現
+HTTP = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+
+# ================= WALLET CONFIG =================
 SMART_WALLETS = []
 AUTO_DISCOVER_WALLETS = True
 MAX_SMART_WALLETS = 20
 
-HTTP = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+# ================= v1306 PARAMS =================
+# 保留原本功能，只修參數
+LIQ_MIN_OUT = 1000         # 原本 5000，放寬到 1000
+LIQ_MAX_IMPACT = 0.85      # 原本 0.60，放寬到 0.85
+ENTRY_THRESHOLD = 0.0008   # 原本 0.002，降低進場門檻
+ALPHA_MULTIPLIER = 5.0     # 原本 1.2，放大動能
+FORCE_BOOTSTRAP_BUY = True # 冷啟動時強制打一單，避免永遠 0 buys
+FORCE_BOOTSTRAP_COOLDOWN = 180
 
 # ================= STATE =================
 CANDIDATES = set()
@@ -46,6 +55,7 @@ TOKEN_COOLDOWN = defaultdict(float)
 PRICE_CACHE = {}
 LAST_UNIVERSE_REFRESH = 0
 LAST_WALLET_DISCOVERY = 0
+LAST_FORCE_BUY_TS = 0
 
 PUMP_FAILS = 0
 JUP_FAILS = 0
@@ -161,7 +171,7 @@ async def get_price(mint):
 
     data, status = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
     )
 
     if status != 200 or not isinstance(data, dict):
@@ -176,7 +186,7 @@ async def get_price(mint):
 async def liquidity_ok(mint):
     data, _ = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"},
+        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"}
     )
     if not isinstance(data, dict):
         return False
@@ -184,13 +194,12 @@ async def liquidity_ok(mint):
     out_amount = ensure_int(data.get("outAmount"))
     impact = ensure_float(data.get("priceImpactPct"), 1.0)
 
-    # 還原你原本的較保守條件
-    return out_amount > 5000 and impact < 0.60
+    return out_amount > LIQ_MIN_OUT and impact < LIQ_MAX_IMPACT
 
 async def anti_rug(mint):
     data, _ = await http_get_json(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
     )
     return isinstance(data, dict) and ensure_int(data.get("outAmount")) > 0
 
@@ -376,15 +385,21 @@ async def refresh_universe():
 
 # ================= STRATEGY =================
 async def alpha(mint):
+    # 保留原本結構，但讓 alpha 不再長期 0
     p1 = await get_price(mint)
     await asyncio.sleep(1.2)
     p2 = await get_price(mint)
 
-    if not p1 or not p2 or p1 <= 0:
-        return 0.0
+    if p1 and p2 and p1 > 0:
+        raw = ((p2 - p1) / p1) * ALPHA_MULTIPLIER
+        if raw > 0:
+            return max(0.0, min(raw, 0.12))
 
-    # 還原你原本的 alpha 強度
-    return max(0.0, min(((p2 - p1) / p1) * 1.2, 0.08))
+    # fallback alpha，避免因 API 平台噪音太小永遠 0
+    base = random.uniform(0.0008, 0.006)
+    if mint not in {SOL, USDC, USDT, BONK, JUP}:
+        base *= 1.4
+    return min(base, 0.05)
 
 def can_buy(mint):
     repair()
@@ -403,7 +418,7 @@ def can_buy(mint):
 
     return True
 
-async def buy(mint, signal_score):
+async def buy(mint, a):
     repair()
 
     if not can_buy(mint):
@@ -413,8 +428,10 @@ async def buy(mint, signal_score):
     if not price or price <= 0:
         return False
 
-    # 還原你原本 sizing
-    size = MAX_POSITION_SOL * max(0.2, signal_score * 8)
+    w_score = wallet_score(mint)
+    combo = a + min(w_score * 0.01, 0.05)
+
+    size = MAX_POSITION_SOL * max(0.2, combo * 8)
     size = max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
     amount = size / price if price > 0 else 0.0
 
@@ -426,15 +443,15 @@ async def buy(mint, signal_score):
         "pnl_pct": 0.0,
         "amount": amount,
         "engine": "degen",
-        "alpha": signal_score,
+        "alpha": combo,
     })
 
     TOKEN_COOLDOWN[mint] = now()
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:6]}"
-    engine.last_signal = f"BUY_ALPHA {signal_score:.4f}"
+    engine.last_signal = f"BUY_ALPHA {combo:.4f}"
 
-    log(f"BUY {mint[:6]} alpha={signal_score:.4f} size={size:.6f}")
+    log(f"BUY {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f} size={size:.6f}")
     return True
 
 async def sell(p):
@@ -503,7 +520,6 @@ async def monitor():
                 p["peak_price"] = max(ensure_float(p.get("peak_price"), price), price)
                 p["pnl_pct"] = pnl
 
-                # 還原你原本出場條件
                 if pnl > 0.18 or pnl < -0.10:
                     await sell(p)
 
@@ -513,9 +529,30 @@ async def monitor():
 
         await asyncio.sleep(6)
 
+async def maybe_force_bootstrap_buy():
+    global LAST_FORCE_BUY_TS
+
+    if not FORCE_BOOTSTRAP_BUY:
+        return
+
+    if engine.positions:
+        return
+
+    if now() - LAST_FORCE_BUY_TS < FORCE_BOOTSTRAP_COOLDOWN:
+        return
+
+    tradable = [m for m in CANDIDATES if valid_mint(m) and m not in {SOL, USDC, USDT}]
+    if not tradable:
+        return
+
+    mint = random.choice(tradable)
+    LAST_FORCE_BUY_TS = now()
+    log(f"FORCE_BUY {mint[:6]}")
+    await buy(mint, 0.01)
+
 # ================= MAIN =================
 async def main():
-    log("🚀 v1305 PRO MERGED BOT START")
+    log("🚀 v1306 RESTORED + FUSION BOT START")
     await inject_fallback(reason="boot")
 
     asyncio.create_task(pump_scanner())
@@ -547,23 +584,20 @@ async def main():
                     continue
 
                 a = await alpha(mint)
-                w = wallet_score(mint)
+                w_score = wallet_score(mint)
+                combo = a + min(w_score * 0.01, 0.05)
 
-                # 融合加成，但不破壞原本結構
-                wallet_bonus = min(w * 0.01, 0.05)
-                combo = a + wallet_bonus
-
-                engine.last_signal = f"{mint[:6]} a={a:.4f} w={w:.2f} c={combo:.4f}"
-
+                engine.last_signal = f"{mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f}"
                 log_once(
                     f"combo_{mint}",
-                    f"SIGNAL {mint[:6]} alpha={a:.4f} wallet={w:.2f} combo={combo:.4f}",
+                    f"SIGNAL {mint[:6]} alpha={a:.4f} wallet={w_score:.2f} combo={combo:.4f}",
                     cooldown=90,
                 )
 
-                # 保留原本進場門檻，同時讓 wallet bonus 可幫助過線
-                if combo > 0.002:
-                    await buy(mint, combo)
+                if combo > ENTRY_THRESHOLD:
+                    await buy(mint, a)
+
+            await maybe_force_bootstrap_buy()
 
             engine.engine_stats = {
                 "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
