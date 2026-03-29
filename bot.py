@@ -1,10 +1,7 @@
-# ================= FINAL_MERGED_BOT_STABLE =================
+# ================= FINAL_MERGED_BOT_V2 =================
 
-import asyncio
-import time
-import random
+import asyncio, time, random
 from collections import defaultdict
-
 import httpx
 
 from state import engine
@@ -37,27 +34,27 @@ engine.stats = {
     "signals": 0,
     "buys": 0,
     "sells": 0,
-    "errors": 0,
+    "errors": 0
 }
 
 # ================= ENGINE =================
 
 ENGINE_STATS = {
-    "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
-    "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
-    "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
+    "stable": {"pnl":0,"trades":0,"wins":0},
+    "degen": {"pnl":0,"trades":0,"wins":0},
+    "sniper": {"pnl":0,"trades":0,"wins":0},
 }
 
 ENGINE_ALLOCATOR = {
-    "stable": 0.4,
-    "degen": 0.4,
-    "sniper": 0.2,
+    "stable":0.4,
+    "degen":0.4,
+    "sniper":0.2,
 }
 
 ALPHA_MEMORY = {
-    "stable": [],
-    "degen": [],
-    "sniper": [],
+    "stable":[],
+    "degen":[],
+    "sniper":[]
 }
 
 # ================= STATE =================
@@ -72,14 +69,14 @@ PRICE_CACHE = {}
 
 # ================= LOG =================
 
-def log(msg: str) -> None:
+def log(msg):
     engine.logs.append(msg)
     engine.logs = engine.logs[-200:]
     print(msg)
 
 # ================= PRICE =================
 
-async def get_price(mint: str):
+async def get_price(mint):
     cached = PRICE_CACHE.get(mint)
     if cached and time.time() - cached[1] < 3:
         return cached[0]
@@ -90,21 +87,22 @@ async def get_price(mint: str):
             params={
                 "inputMint": mint,
                 "outputMint": SOL,
-                "amount": "1000000",
-            },
+                "amount": "1000000"
+            }
         )
 
         if r.status_code != 200:
             return None
 
         data = r.json()
-        out_amount = int(data.get("outAmount", 0) or 0)
-        price = (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
+        out = int(data.get("outAmount", 0))
 
+        price = (out / 1e9) / 1_000_000 if out > 0 else None
         PRICE_CACHE[mint] = (price, time.time())
+
         return price
 
-    except Exception:
+    except:
         engine.stats["errors"] += 1
         return None
 
@@ -120,21 +118,15 @@ async def pump_scanner():
                 await asyncio.sleep(8)
                 continue
 
-            text = r.text.strip()
-            if not text:
-                log("PUMP_EMPTY")
-                await asyncio.sleep(8)
-                continue
-
             try:
                 data = r.json()
-            except Exception:
-                log(f"PUMP_BAD_JSON {text[:120]}")
+            except:
+                log("PUMP_BAD_JSON")
                 await asyncio.sleep(8)
                 continue
 
             if not isinstance(data, list):
-                log(f"PUMP_BAD_SHAPE {type(data).__name__}")
+                log("PUMP_BAD_SHAPE")
                 await asyncio.sleep(8)
                 continue
 
@@ -146,44 +138,44 @@ async def pump_scanner():
                         added += 1
                     CANDIDATES.add(mint)
 
-            log(f"PUMP_OK added={added} total={len(CANDIDATES)}")
+            log(f"PUMP_OK +{added}")
 
         except Exception as e:
-            engine.stats["errors"] += 1
             log(f"PUMP_ERR {e}")
 
         await asyncio.sleep(8)
 
-async def handle_mempool(e: dict):
+async def handle_mempool(e):
     mint = e.get("mint")
     if mint:
         CANDIDATES.add(mint)
 
 # ================= ALPHA =================
 
-async def momentum(mint: str) -> float:
+async def momentum(mint):
     p1 = await get_price(mint)
     await asyncio.sleep(0.1)
     p2 = await get_price(mint)
 
-    if not p1 or not p2 or p1 <= 0:
-        return 0.0
+    if not p1 or not p2:
+        return 0
 
     return (p2 - p1) / p1
 
-async def volume_surge(mint: str) -> float:
+async def volume_surge(mint):
     p = await get_price(mint)
     if not p:
-        return 0.0
+        return 0
 
     prev = LAST_PRICE.get(mint, p)
     LAST_PRICE[mint] = p
 
-    return abs(p - prev) / prev if prev > 0 else 0.0
+    return abs(p - prev) / prev if prev > 0 else 0
 
-async def alpha_engine(mint: str) -> float:
+async def alpha_engine(mint):
+
     cached = ALPHA_CACHE.get(mint)
-    if cached and time.time() - cached[1] < 4:
+    if cached and time.time() - cached[1] < 3:
         return cached[0]
 
     m = await momentum(mint)
@@ -192,51 +184,52 @@ async def alpha_engine(mint: str) -> float:
     score = m * 0.6 + v * 0.4
 
     ALPHA_CACHE[mint] = (score, time.time())
+
     return score
 
-# ================= ENGINE LOGIC =================
+# ================= ENGINE =================
 
-def update_allocator() -> None:
+def update_allocator():
     weights = {}
 
-    for k, v in ENGINE_STATS.items():
+    for k,v in ENGINE_STATS.items():
         if v["trades"] == 0:
-            weights[k] = 1.0
+            weights[k] = 1
         else:
-            winrate = v["wins"] / max(v["trades"], 1)
-            weights[k] = max(0.0, v["pnl"] + 0.001) * winrate
+            winrate = v["wins"]/max(v["trades"],1)
+            weights[k] = (v["pnl"]+0.001)*winrate
 
     total = sum(abs(v) for v in weights.values()) + 1e-9
-
     for k in weights:
-        weights[k] = abs(weights[k]) / total
+        weights[k] = abs(weights[k])/total
 
     ENGINE_ALLOCATOR.update(weights)
 
-def get_alpha_edge(engine_name: str, alpha: float) -> float:
+def get_alpha_edge(engine_name, alpha):
     mem = ALPHA_MEMORY[engine_name]
     if not mem:
         return 1.0
 
-    similar = [pnl for a, pnl in mem if abs(a - alpha) < 0.02]
-    if not similar:
+    sim = [p for a,p in mem if abs(a-alpha)<0.02]
+    if not sim:
         return 1.0
 
-    avg = sum(similar) / len(similar)
-    return max(0.5, min(2.0, 1 + avg * 5))
+    avg = sum(sim)/len(sim)
+    return max(0.5, min(2.0, 1 + avg*5))
 
-def pick_engine(alpha: float) -> str:
+def pick_engine(alpha):
     if alpha > 0.05:
         return "sniper"
 
     return random.choices(
-        ["stable", "degen", "sniper"],
-        weights=list(ENGINE_ALLOCATOR.values()),
-        k=1,
+        ["stable","degen","sniper"],
+        weights=list(ENGINE_ALLOCATOR.values())
     )[0]
 
-def size(alpha: float, eng: str) -> float:
-    base = MAX_POSITION_SOL * min(1.0, alpha * 6)
+def size(alpha, eng):
+
+    base = MAX_POSITION_SOL * min(1, alpha*6)
+
     edge = get_alpha_edge(eng, alpha)
     alloc = ENGINE_ALLOCATOR[eng]
 
@@ -249,7 +242,7 @@ def size(alpha: float, eng: str) -> float:
 
 # ================= EXEC =================
 
-def can_buy(mint: str) -> bool:
+def can_buy(mint):
     if len(engine.positions) >= MAX_POSITIONS:
         return False
 
@@ -261,40 +254,41 @@ def can_buy(mint: str) -> bool:
 
     return True
 
-async def buy(mint: str, alpha: float) -> bool:
+async def buy(mint, alpha):
+
     eng = pick_engine(alpha)
 
     if not can_buy(mint):
         return False
 
     price = await get_price(mint)
-    if not price or price <= 0:
+    if not price:
         return False
 
     s = size(alpha, eng)
     amount = s / price
 
-    engine.positions.append(
-        {
-            "token": mint,
-            "amount": amount,
-            "entry": price,
-            "alpha": alpha,
-            "engine": eng,
-            "peak": price,
-            "last_price": price,
-        }
-    )
+    engine.positions.append({
+        "token": mint,
+        "amount": amount,
+        "entry": price,
+        "last_price": price,
+        "peak": price,
+        "alpha": alpha,
+        "engine": eng
+    })
 
     TOKEN_COOLDOWN[mint] = time.time()
 
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:8]}"
 
-    log(f"BUY {mint[:8]} eng={eng} alpha={round(alpha, 4)} size={round(s, 6)}")
+    log(f"BUY {mint[:8]} eng={eng} alpha={round(alpha,4)}")
+
     return True
 
-async def sell(p: dict) -> None:
+async def sell(p):
+
     price = await get_price(p["token"])
     if not price:
         return
@@ -318,22 +312,18 @@ async def sell(p: dict) -> None:
 
     engine.capital += pnl
 
-    engine.trade_history.append(
-        {
-            "mint": p["token"],
-            "pnl": pnl,
-            "engine": eng,
-        }
-    )
-    engine.trade_history = engine.trade_history[-200:]
+    engine.trade_history.append({
+        "mint": p["token"],
+        "pnl": pnl,
+        "engine": eng
+    })
 
-    if p in engine.positions:
-        engine.positions.remove(p)
+    engine.positions.remove(p)
 
     engine.stats["sells"] += 1
     engine.last_trade = f"SELL {p['token'][:8]}"
 
-    log(f"SELL {p['token'][:8]} pnl={round(pnl, 6)} eng={eng}")
+    log(f"SELL {p['token'][:8]} pnl={round(pnl,6)} eng={eng}")
 
 # ================= MONITOR =================
 
@@ -341,6 +331,7 @@ async def monitor():
     while True:
         try:
             for p in list(engine.positions):
+
                 price = await get_price(p["token"])
                 if not price:
                     continue
@@ -348,22 +339,20 @@ async def monitor():
                 p["last_price"] = price
                 p["peak"] = max(p["peak"], price)
 
-                pnl_ratio = (price - p["entry"]) / p["entry"]
+                pnl = (price - p["entry"]) / p["entry"]
 
-                # fixed TP/SL
-                if pnl_ratio > 0.25 or pnl_ratio < -0.08:
+                # TP / SL
+                if pnl > 0.25 or pnl < -0.08:
                     await sell(p)
                     continue
 
                 # trailing stop
                 if p["peak"] > p["entry"]:
-                    dd_from_peak = (p["peak"] - price) / p["peak"]
-                    if dd_from_peak > 0.10:
+                    dd = (p["peak"] - price) / p["peak"]
+                    if dd > 0.10:
                         await sell(p)
-                        continue
 
         except Exception as e:
-            engine.stats["errors"] += 1
             log(f"MONITOR_ERR {e}")
 
         await asyncio.sleep(2)
@@ -371,33 +360,36 @@ async def monitor():
 # ================= MAIN =================
 
 async def bot():
-    log("FINAL_BOT_LIVE")
+
+    log("BOT_STARTED")
 
     asyncio.create_task(monitor())
     asyncio.create_task(pump_scanner())
 
     try:
         asyncio.create_task(mempool_stream(handle_mempool))
-    except Exception as e:
-        log(f"MEMPOOL_DISABLED {e}")
+    except:
+        log("MEMPOOL_DISABLED")
 
     while True:
+
         try:
+
             if len(CANDIDATES) == 0:
                 CANDIDATES.update(SEED_TOKENS)
                 log("SEED_BOOTSTRAP")
 
             if len(CANDIDATES) < 3:
                 CANDIDATES.update(SEED_TOKENS)
-                log("FALLBACK_ADD_SEEDS")
                 await asyncio.sleep(2)
                 continue
 
             for mint in list(CANDIDATES):
+
                 alpha = await alpha_engine(mint)
 
                 engine.stats["signals"] += 1
-                engine.last_signal = f"{mint[:8]} {round(alpha, 4)}"
+                engine.last_signal = f"{mint[:6]} {round(alpha,4)}"
 
                 if alpha < 0.01:
                     continue
@@ -416,4 +408,4 @@ async def bot_loop():
     await bot()
 
 if __name__ == "__main__":
-    asyncio.run(bot_loop())
+    asyncio.run(bot())
