@@ -1,4 +1,4 @@
-# ================= v1314 REAL TRADING UPGRADE FROM YOUR v1313 =================
+# ================= v1314 REAL TRADING (JUP V2 ORDER + SIGN + SEND) =================
 import os
 import json
 import time
@@ -13,7 +13,6 @@ from state import engine
 from mempool import mempool_stream
 from wallet_tracker import extract_wallets_from_mints, track_wallet_behavior
 
-# solders for signing / serializing versioned tx
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
@@ -28,19 +27,19 @@ JUP = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
 STATIC_UNIVERSE = {SOL, USDC, USDT, BONK, JUP}
 FALLBACK_TOKENS = set(STATIC_UNIVERSE)
 
-MAX_POSITION_SOL = 0.0025
-MIN_POSITION_SOL = 0.001
-MAX_POSITIONS = 5
+MAX_POSITION_SOL = float(os.environ.get("MAX_POSITION_SOL", "0.0025"))
+MIN_POSITION_SOL = float(os.environ.get("MIN_POSITION_SOL", "0.001"))
+MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 
 PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 JUP_TOKENS_API = "https://token.jup.ag/all"
-JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
-JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
+JUP_ORDER_API = "https://api.jup.ag/swap/v2/order"
 
 RPC_HTTP = os.environ.get("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")
 RPC_WS = os.environ.get("SOLANA_RPC_WS", "wss://api.mainnet-beta.solana.com")
 JITO_BUNDLE_URL = os.environ.get("JITO_BUNDLE_URL", "")
 USE_JITO = os.environ.get("USE_JITO", "false").lower() == "true"
+
 REAL_TRADING = os.environ.get("REAL_TRADING", "false").lower() == "true"
 JUP_API_KEY = os.environ.get("JUP_API_KEY", "").strip()
 
@@ -61,6 +60,7 @@ AI_PARAMS = {
     "trailing_stop": 0.08,
     "slippage_bps": 80,
     "priority_fee_lamports": 5000,
+    "jito_tip_lamports": 0,
 }
 
 # ================= STATE =================
@@ -70,6 +70,7 @@ PRICE_CACHE = {}
 LAST_LOG_TS = {}
 LAST_WALLET_GRAPH_TS = 0.0
 LAST_STRATEGY_REVIEW_TS = 0.0
+TOKEN_DECIMALS = {}
 
 # ================= WALLET GRAPH =================
 WALLET_GRAPH = {}
@@ -107,10 +108,16 @@ def ensure_int(x, d=0):
     except Exception:
         return d
 
+def real_trading_ready() -> bool:
+    return REAL_TRADING and KEYPAIR is not None and bool(JUP_API_KEY)
+
+def wallet_pubkey_str() -> str:
+    return str(KEYPAIR.pubkey()) if KEYPAIR else ""
+
 def log(msg: str):
     repair()
     engine.logs.append(str(msg))
-    engine.logs = engine.logs[-300:]
+    engine.logs = engine.logs[-500:]
     print("[BOT]", msg)
 
 def log_once(key: str, msg: str, cooldown: int = 60):
@@ -124,8 +131,13 @@ def repair():
         engine.positions = []
     if not hasattr(engine, "trade_history") or not isinstance(engine.trade_history, list):
         engine.trade_history = []
-    if not hasattr(engine, "logs") or not isinstance(engine.logs, list):
+    if not hasattr(engine, "logs"):
         engine.logs = []
+    if not isinstance(engine.logs, list):
+        try:
+            engine.logs = list(engine.logs)
+        except Exception:
+            engine.logs = []
     if not hasattr(engine, "stats") or not isinstance(engine.stats, dict):
         engine.stats = {"signals": 0, "buys": 0, "sells": 0, "errors": 0, "adds": 0}
     if not hasattr(engine, "engine_stats") or not isinstance(engine.engine_stats, dict):
@@ -157,7 +169,7 @@ def repair():
 
 # ================= HTTP =================
 def jup_headers():
-    headers = {"Content-Type": "application/json"}
+    headers = {"Accept": "application/json"}
     if JUP_API_KEY:
         headers["x-api-key"] = JUP_API_KEY
     return headers
@@ -193,21 +205,100 @@ async def rpc_post(method: str, params):
     except Exception:
         return None
 
+# ================= TOKEN META =================
+async def preload_token_decimals():
+    if TOKEN_DECIMALS:
+        return
+    data = await http_get_json(JUP_TOKENS_API)
+    if isinstance(data, list):
+        for t in data:
+            mint = t.get("address")
+            if valid_mint(mint):
+                TOKEN_DECIMALS[mint] = ensure_int(t.get("decimals"), 6)
+
+def token_decimals(mint: str) -> int:
+    return TOKEN_DECIMALS.get(mint, 6)
+
+# ================= JUPITER ORDER =================
+async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int):
+    """
+    Latest Jupiter v2 /order:
+    returns quote + assembled base64 tx when taker is provided.
+    """
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(int(amount_smallest)),
+        "taker": wallet_pubkey_str() if real_trading_ready() else None,
+        "swapMode": "ExactIn",
+        "slippageBps": AI_PARAMS["slippage_bps"],
+        "priorityFeeLamports": AI_PARAMS["priority_fee_lamports"],
+    }
+    if USE_JITO and AI_PARAMS["jito_tip_lamports"] > 0:
+        params["jitoTipLamports"] = AI_PARAMS["jito_tip_lamports"]
+
+    params = {k: v for k, v in params.items() if v is not None}
+    return await http_get_json(JUP_ORDER_API, params=params, headers=jup_headers())
+
+def sign_transaction_base64(tx_b64: str) -> str:
+    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    signature = KEYPAIR.sign_message(solders_message.to_bytes_versioned(raw_tx.message))
+    signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
+    return base64.b64encode(bytes(signed_tx)).decode("utf-8")
+
+async def send_signed_transaction_b64(tx_b64: str):
+    return await rpc_post(
+        "sendTransaction",
+        [
+            tx_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "preflightCommitment": "processed",
+                "maxRetries": 5,
+            },
+        ],
+    )
+
+async def confirm_signature(signature: str, timeout_sec: int = 35):
+    deadline = now() + timeout_sec
+    while now() < deadline:
+        result = await rpc_post(
+            "getSignatureStatuses",
+            [[signature], {"searchTransactionHistory": True}],
+        )
+        if result and result.get("value"):
+            item = result["value"][0]
+            if item and item.get("confirmationStatus") in ("confirmed", "finalized"):
+                return True
+        await asyncio.sleep(1.5)
+    return False
+
+# optional hook, kept
+async def jito_send_bundle(serialized_txs):
+    if not USE_JITO or not JITO_BUNDLE_URL:
+        return {"ok": False, "reason": "JITO_DISABLED"}
+
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [serialized_txs],
+        }
+        r = await HTTP.post(JITO_BUNDLE_URL, json=payload)
+        if r.status_code != 200:
+            return {"ok": False, "reason": f"http_{r.status_code}"}
+        return {"ok": True, "result": r.json()}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
 # ================= MARKET =================
 async def get_price(m):
     if m in PRICE_CACHE and now() - PRICE_CACHE[m][1] < 4:
         return PRICE_CACHE[m][0]
 
-    data = await http_get_json(
-        JUP_QUOTE_API,
-        {
-            "inputMint": m,
-            "outputMint": SOL,
-            "amount": "1000000",
-            "slippageBps": AI_PARAMS["slippage_bps"],
-        },
-        headers=jup_headers(),
-    )
+    data = await jupiter_order(m, SOL, 1_000_000)
     if not data:
         return None
 
@@ -217,29 +308,11 @@ async def get_price(m):
     return price
 
 async def liquidity_ok(m):
-    data = await http_get_json(
-        JUP_QUOTE_API,
-        {
-            "inputMint": SOL,
-            "outputMint": m,
-            "amount": "10000000",
-            "slippageBps": AI_PARAMS["slippage_bps"],
-        },
-        headers=jup_headers(),
-    )
+    data = await jupiter_order(SOL, m, 10_000_000)
     return bool(data and ensure_int(data.get("outAmount"), 0) > 5000)
 
 async def anti_rug(m):
-    data = await http_get_json(
-        JUP_QUOTE_API,
-        {
-            "inputMint": m,
-            "outputMint": SOL,
-            "amount": "1000000",
-            "slippageBps": AI_PARAMS["slippage_bps"],
-        },
-        headers=jup_headers(),
-    )
+    data = await jupiter_order(m, SOL, 1_000_000)
     return bool(data and ensure_int(data.get("outAmount"), 0) > 0)
 
 # ================= WALLET GRAPH =================
@@ -317,7 +390,6 @@ async def mempool_logs_subscribe_loop():
                 while True:
                     raw = await ws.recv()
                     msg = json.loads(raw)
-
                     params = msg.get("params", {})
                     result = params.get("result", {})
                     value = result.get("value", {})
@@ -379,7 +451,6 @@ def position_size(combo):
 
 async def rank_candidates():
     ranked = []
-
     for m in list(CANDIDATES):
         try:
             a = await alpha(m)
@@ -471,100 +542,11 @@ def risk_check():
         return False
 
     losses = [t for t in trades if ensure_float(t.get("pnl_pct"), 0.0) < 0]
-
     if len(losses) >= 5:
         return True
 
     avg = sum(ensure_float(t.get("pnl_pct"), 0.0) for t in trades) / len(trades)
     return avg < -0.05
-
-# ================= REAL TRADING (JUPITER + SIGN + SEND) =================
-def real_trading_ready() -> bool:
-    return REAL_TRADING and KEYPAIR is not None
-
-def wallet_pubkey_str() -> str:
-    return str(KEYPAIR.pubkey()) if KEYPAIR else ""
-
-async def jupiter_quote(input_mint: str, output_mint: str, amount: int):
-    return await http_get_json(
-        JUP_QUOTE_API,
-        {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-            "slippageBps": AI_PARAMS["slippage_bps"],
-        },
-        headers=jup_headers(),
-    )
-
-async def jupiter_build_swap_tx(quote_response: dict):
-    if not KEYPAIR:
-        return None
-
-    payload = {
-        "quoteResponse": quote_response,
-        "userPublicKey": wallet_pubkey_str(),
-        "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": {
-            "priorityLevelWithMaxLamports": {
-                "maxLamports": int(max(10000, AI_PARAMS["priority_fee_lamports"] * 10)),
-                "priorityLevel": "veryHigh",
-            }
-        },
-    }
-    return await http_post_json(JUP_SWAP_API, payload, headers=jup_headers())
-
-def sign_swap_transaction_base64(swap_tx_b64: str) -> str:
-    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx_b64))
-    signature = KEYPAIR.sign_message(solders_message.to_bytes_versioned(raw_tx.message))
-    signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-    return base64.b64encode(bytes(signed_tx)).decode("utf-8")
-
-async def send_signed_transaction_b64(tx_b64: str):
-    result = await rpc_post(
-        "sendTransaction",
-        [
-            tx_b64,
-            {
-                "encoding": "base64",
-                "skipPreflight": False,
-                "preflightCommitment": "processed",
-                "maxRetries": 3,
-            },
-        ],
-    )
-    return result
-
-async def confirm_signature(signature: str, timeout_sec: int = 35):
-    deadline = now() + timeout_sec
-
-    while now() < deadline:
-        result = await rpc_post("getSignatureStatuses", [[signature], {"searchTransactionHistory": True}])
-        if result and result.get("value"):
-            item = result["value"][0]
-            if item and item.get("confirmationStatus") in ("confirmed", "finalized"):
-                return True
-        await asyncio.sleep(1.5)
-
-    return False
-
-async def jito_send_bundle(serialized_txs):
-    if not USE_JITO or not JITO_BUNDLE_URL:
-        return {"ok": False, "reason": "JITO_DISABLED"}
-
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [serialized_txs],
-        }
-        r = await HTTP.post(JITO_BUNDLE_URL, json=payload)
-        if r.status_code != 200:
-            return {"ok": False, "reason": f"http_{r.status_code}"}
-        return {"ok": True, "result": r.json()}
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
 
 # ================= EXEC =================
 def can_buy(m):
@@ -606,29 +588,39 @@ async def buy(m, a, combo, w, s):
         return
 
     tx_sig = None
-    raw_token_amount = None
     tx_meta = None
+    raw_token_amount = None
+    trade_mode = "REAL" if real_trading_ready() else "PAPER"
 
     if real_trading_ready():
         lamports_in = int(size * 1e9)
-        quote = await jupiter_quote(SOL, m, lamports_in)
-        if not quote:
-            log_once("buy_quote", f"BUY_QUOTE_ERR {m[:6]}", 15)
+        order = await jupiter_order(SOL, m, lamports_in)
+
+        if not order or not order.get("transaction"):
+            log_once("buy_order", f"BUY_ORDER_ERR {m[:6]}", 15)
             return
 
-        raw_token_amount = ensure_int(quote.get("outAmount"), 0)
-
-        swap_resp = await jupiter_build_swap_tx(quote)
-        if not swap_resp or "swapTransaction" not in swap_resp:
-            log_once("buy_swap_build", f"BUY_SWAP_BUILD_ERR {m[:6]}", 15)
+        if order.get("errorCode") or order.get("error"):
+            log_once("buy_order", f"BUY_ORDER_FAIL {m[:6]} {order.get('errorMessage') or order.get('error')}", 15)
             return
 
-        signed_b64 = sign_swap_transaction_base64(swap_resp["swapTransaction"])
+        raw_token_amount = ensure_int(order.get("outAmount"), 0)
+
+        try:
+            signed_b64 = sign_transaction_base64(order["transaction"])
+        except Exception as e:
+            log_once("buy_sign", f"BUY_SIGN_ERR {m[:6]} {e}", 15)
+            return
 
         if USE_JITO and JITO_BUNDLE_URL:
             tx_meta = await jito_send_bundle([signed_b64])
-            # Jito bundle response shape varies by endpoint; still submit by RPC for deterministic signature path if needed
-        tx_sig = await send_signed_transaction_b64(signed_b64)
+
+        # retry send
+        for _ in range(2):
+            tx_sig = await send_signed_transaction_b64(signed_b64)
+            if tx_sig:
+                break
+            await asyncio.sleep(0.5)
 
         if not tx_sig:
             log_once("buy_send", f"BUY_SEND_ERR {m[:6]}", 15)
@@ -650,7 +642,7 @@ async def buy(m, a, combo, w, s):
         "wallet_score": w,
         "sniper_score": s,
         "combo": combo,
-        "trade_mode": "REAL" if real_trading_ready() else "PAPER",
+        "trade_mode": trade_mode,
         "entry_signature": tx_sig,
         "entry_tx_meta": tx_meta,
     }
@@ -663,7 +655,7 @@ async def buy(m, a, combo, w, s):
         f"{m[:6]} a={a:.4f} w={w:.2f} s={s:.4f} c={combo:.4f} eng={engine_type}"
     )
 
-    log(f"BUY {m[:6]} {engine_type} combo={combo:.4f} size={size:.6f} mode={pos['trade_mode']}")
+    log(f"BUY {m[:6]} {engine_type} combo={combo:.4f} size={size:.6f} mode={trade_mode}")
 
 async def sell(p):
     repair()
@@ -679,26 +671,30 @@ async def sell(p):
 
     if real_trading_ready():
         raw_amount = ensure_int(p.get("raw_token_amount"), 0)
+
+        # fallback
         if raw_amount <= 0:
-            # 沒有原始 token amount 時，用 paper fallback，不嘗試真賣
-            log_once("sell_raw_amount", f"SELL_RAW_AMOUNT_MISSING {p['token'][:6]}", 30)
-        else:
-            quote = await jupiter_quote(p["token"], SOL, raw_amount)
-            if quote and ensure_int(quote.get("outAmount"), 0) > 0:
-                swap_resp = await jupiter_build_swap_tx(quote)
-                if swap_resp and "swapTransaction" in swap_resp:
-                    signed_b64 = sign_swap_transaction_base64(swap_resp["swapTransaction"])
+            raw_amount = int(max(0, ensure_float(p.get("amount"), 0.0)) * (10 ** token_decimals(p["token"])))
 
-                    if USE_JITO and JITO_BUNDLE_URL:
-                        tx_meta = await jito_send_bundle([signed_b64])
+        order = await jupiter_order(p["token"], SOL, raw_amount)
+        if order and order.get("transaction") and not order.get("errorCode") and not order.get("error"):
+            try:
+                signed_b64 = sign_transaction_base64(order["transaction"])
+                if USE_JITO and JITO_BUNDLE_URL:
+                    tx_meta = await jito_send_bundle([signed_b64])
 
+                for _ in range(2):
                     tx_sig = await send_signed_transaction_b64(signed_b64)
                     if tx_sig:
-                        await confirm_signature(tx_sig)
-                else:
-                    log_once("sell_swap_build", f"SELL_SWAP_BUILD_ERR {p['token'][:6]}", 15)
-            else:
-                log_once("sell_quote", f"SELL_QUOTE_ERR {p['token'][:6]}", 15)
+                        break
+                    await asyncio.sleep(0.5)
+
+                if tx_sig:
+                    await confirm_signature(tx_sig)
+            except Exception as e:
+                log_once("sell_real", f"SELL_REAL_ERR {p['token'][:6]} {e}", 15)
+        else:
+            log_once("sell_order", f"SELL_ORDER_ERR {p['token'][:6]}", 15)
 
     try:
         engine.positions.remove(p)
@@ -733,7 +729,6 @@ async def sell(p):
         engine.engine_stats[eng]["wins"] += 1
 
     engine.capital = max(1.0, ensure_float(engine.capital, 30.0) * (1.0 + pnl * 0.1))
-
     engine.stats["sells"] += 1
     engine.last_trade = f"SELL {p['token'][:6]}"
     log(f"SELL {p['token'][:6]} pnl={pnl:.4f} eng={eng} mode={p.get('trade_mode', 'PAPER')}")
@@ -819,16 +814,20 @@ async def jup():
             for t in data[:50]:
                 m = t.get("address")
                 if valid_mint(m):
+                    TOKEN_DECIMALS[m] = ensure_int(t.get("decimals"), TOKEN_DECIMALS.get(m, 6))
                     await add_candidate(m, source="jup")
         await asyncio.sleep(120)
 
 # ================= MAIN =================
 async def main():
     repair()
-    log("🚀 v1314 REAL TRADING START")
+    await preload_token_decimals()
 
-    if REAL_TRADING and KEYPAIR is None:
-        log("REAL_TRADING requested but PRIVATE_KEY_JSON invalid or missing; falling back to PAPER")
+    mode = "REAL" if real_trading_ready() else "PAPER"
+    log(f"🚀 v1314 START mode={mode}")
+
+    if REAL_TRADING and not real_trading_ready():
+        log("REAL_TRADING requested but PRIVATE_KEY_JSON or JUP_API_KEY invalid; falling back to PAPER")
 
     for m in FALLBACK_TOKENS:
         await add_candidate(m, source="fallback")
