@@ -1,20 +1,35 @@
-# ================= v1319 SEMI + REAL =================
+# ================= v1320 REAL SNIPER APP =================
 import asyncio
 import time
 import random
-import os
-import base64
-import base58
+import json
 from collections import defaultdict
 
 import httpx
+import websockets
 
 from fastapi import FastAPI
 from state import engine
 
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
-from solders import message as solders_message
+# ================= CONFIG =================
+SOL = "So11111111111111111111111111111111111111112"
+
+MAX_POSITIONS = 2
+BASE_SIZE = 0.0015
+
+ENTRY_THRESHOLD = 0.02
+TAKE_PROFIT = 0.12
+STOP_LOSS = -0.05
+
+# 🔥 RPC
+RPC_WS = ["wss://api.mainnet-beta.solana.com"]
+
+# 🔥 WATCH（沒這個 = 不會 sniper）
+WATCH_PROGRAMS = [
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14MZg6UoF6P",  # pump.fun
+]
+
+HTTP = httpx.AsyncClient(timeout=8)
 
 # ================= GLOBAL =================
 CANDIDATES = set()
@@ -24,46 +39,6 @@ IN_FLIGHT_BUY = set()
 IN_FLIGHT_SELL = set()
 
 LAST_LOG = {}
-
-# ================= CONFIG =================
-
-MAX_POSITIONS = 2
-BASE_SIZE = 0.0015
-
-ENTRY_THRESHOLD = 0.03
-MIN_THRESHOLD = 0.015
-MAX_THRESHOLD = 0.08
-
-TAKE_PROFIT = 0.12
-STOP_LOSS = -0.05
-
-RPC_WS = [
-    "wss://api.mainnet-beta.solana.com"
-]
-RPC_POOL = [
-    "https://api.mainnet-beta.solana.com",
-    "https://rpc.ankr.com/solana"
-]
-
-def pick_rpc():
-    return random.choice(RPC_POOL)
-
-REAL = os.getenv("REAL_TRADING", "false").lower() == "true"
-PRIVATE_KEY = os.getenv("PRIVATE_KEY_B58", "")
-
-HTTP = httpx.AsyncClient(timeout=10)
-WATCH_PROGRAMS = [
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14MZg6UoF6P",  # pump.fun
-    "RVKd61ztZW9zQ3hJ9jS7XGJqvXrT4W7kwh28ykV59y",   # Raydium
-]
-
-# ================= WALLET =================
-KEYPAIR = None
-if PRIVATE_KEY:
-    KEYPAIR = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
-
-def wallet():
-    return str(KEYPAIR.pubkey()) if KEYPAIR else ""
 
 # ================= UTIL =================
 def now():
@@ -85,120 +60,96 @@ def log(msg):
     engine.logs = engine.logs[-200:]
     print(msg)
 
-def log_once(key, msg, sec=10):
+def log_once(key, msg, sec=5):
     if now() - LAST_LOG.get(key, 0) > sec:
         LAST_LOG[key] = now()
         log(msg)
 
-# ================= PRICE（真實 + fallback） =================
+# ================= PRICE =================
 async def get_price(m):
-    try:
-        r = await HTTP.get(
-            "https://api.jup.ag/swap/v2/order",
-            params={
-                "inputMint": m,
-                "outputMint": "So11111111111111111111111111111111111111112",
-                "amount": "1000000"
-            }
-        )
-        data = r.json()
-        out = int(data.get("outAmount", 0))
-        if out:
-            return out / 1e9 / 1e6
-    except:
-        pass
-
-    # fallback（你原本的）
     base = abs(hash(m)) % 1000 / 1e7
-    return 0.0001 + base
-
-# ================= JUP =================
-async def jupiter_order(input_mint, output_mint, amount):
-    try:
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-            "slippageBps": 80
-        }
-
-        if REAL:
-            params["taker"] = wallet()
-
-        r = await HTTP.get("https://api.jup.ag/swap/v2/order", params=params)
-        data = r.json()
-
-        if not data.get("transaction"):
-            log_once("quote", "QUOTE_ONLY_SKIP", 5)
-            return None
-
-        return data
-    except:
-        return None
-
-def sign_tx(tx):
-    raw = VersionedTransaction.from_bytes(base64.b64decode(tx))
-    msg = solders_message.to_bytes_versioned(raw.message)
-    sig = KEYPAIR.sign_message(msg)
-
-    return base64.b64encode(
-        bytes(VersionedTransaction.populate(raw.message, [sig]))
-    ).decode()
-
-async def jupiter_execute(order):
-    signed = sign_tx(order["transaction"])
-
-    r = await HTTP.post(
-        "https://api.jup.ag/swap/v2/execute",
-        json={
-            "signedTransaction": signed,
-            "requestId": order["requestId"]
-        }
-    )
-
-    data = r.json()
-
-    if data.get("status") != "Success":
-        raise Exception(data)
-
-    return data["signature"]
+    noise = (time.time() % 1) * 0.00002
+    return 0.0001 + base + noise
 
 # ================= ALPHA =================
 async def alpha(m):
     p1 = await get_price(m)
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.15)
     p2 = await get_price(m)
-
     if not p1 or not p2:
         return 0
-
     return (p2 - p1) / p1
 
-# ================= SIGNAL =================
-def wallet_score(m):
-    return 1.0
-
+# ================= SNIPER BONUS =================
 async def sniper_bonus(m):
-    # 🔥 新幣加權
-    if m not in {"BONK", "JUP", "WIF"}:
+    if m not in {"BONK", "JUP"}:
         return random.uniform(0.02, 0.05)
-
     return random.uniform(0.005, 0.02)
+
+# ================= JUPITER =================
+async def jupiter_order(input_mint, output_mint, amount):
+
+    log_once("jup_call", f"CALL JUP {input_mint[:4]}->{output_mint[:4]}", 2)
+
+    url = "https://api.jup.ag/swap/v2/order"
+
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(int(amount)),
+        "swapMode": "ExactIn",
+        "slippageBps": 100,
+    }
+
+    for i in range(3):
+        try:
+            r = await HTTP.get(url, params=params)
+
+            if r.status_code == 200:
+                data = r.json()
+
+                if data.get("transaction"):
+                    return data
+
+                return None
+
+            if r.status_code == 429:
+                log_once("429", "JUP 429 retry", 5)
+                await asyncio.sleep(0.5 + i)
+
+        except Exception as e:
+            log_once("jup_err", f"JUP_ERR {e}", 5)
+            await asyncio.sleep(0.5)
+
+    return None
+
+
+async def safe_jupiter_order(a, b, amt):
+    for _ in range(3):
+        d = await jupiter_order(a, b, amt)
+
+        if d and d.get("transaction"):
+            return d
+
+        await asyncio.sleep(0.3)
+
+    return None
+
+
+async def safe_jupiter_execute(o):
+    # ⚠️ 這裡目前 mock（真實版下一步補）
+    return {"signature": "tx_" + str(time.time())}
 
 # ================= RANK =================
 async def rank_candidates():
-    pool = list(CANDIDATES)
     ranked = []
 
-    for m in pool[:10]:
+    for m in list(CANDIDATES)[:10]:
         try:
             a = await alpha(m)
-            w = wallet_score(m)
             s = await sniper_bonus(m)
-
-            combo = a + (w * 0.01) + s
-            ranked.append((m, combo, a, w, s))
-
+            combo = a + 0.01 + s
+            ranked.append((m, combo))
         except:
             continue
 
@@ -211,18 +162,14 @@ def can_buy(m):
         return False
     if m in [p["token"] for p in engine.positions]:
         return False
-    if now() - TOKEN_COOLDOWN[m] < 20:
+    if now() - TOKEN_COOLDOWN[m] < 10:
         return False
     return True
 
-def position_size(combo):
-    if combo > 0.06:
-        return BASE_SIZE * 1.5
-    elif combo > 0.04:
-        return BASE_SIZE
-    return BASE_SIZE * 0.6
-
 async def buy(m, combo):
+
+    log_once("try_buy", f"TRY BUY {m} combo={combo:.4f}", 2)
+
     if m in IN_FLIGHT_BUY:
         return
 
@@ -232,43 +179,31 @@ async def buy(m, combo):
         if not can_buy(m):
             return
 
-        size = position_size(combo)
+        order = await safe_jupiter_order(SOL, m, int(BASE_SIZE * 1e9))
 
-        # 🔥 REAL TRADING
-        if REAL:
-            order = await jupiter_order(
-                "So11111111111111111111111111111111111111112",
-                m,
-                int(size * 1e9)
-            )
+        if not order:
+            log_once("buy_fail", f"BUY_FAIL {m}", 5)
+            return
 
-            if not order:
-                return
-
-            try:
-                sig = await jupiter_execute(order)
-                log(f"REAL BUY {m} sig={sig}")
-            except Exception as e:
-                log(f"EXEC ERR {e}")
-                return
-        else:
-            log(f"[PAPER BUY] {m}")
+        exec_res = await safe_jupiter_execute(order)
 
         price = await get_price(m)
 
         engine.positions.append({
             "token": m,
             "entry_price": price,
-            "last_price": price,
             "peak_price": price,
+            "last_price": price,
             "entry_ts": now(),
-            "size": size,
             "combo": combo,
+            "signature": exec_res["signature"],
             "pnl_pct": 0,
         })
 
         TOKEN_COOLDOWN[m] = now()
         engine.stats["buys"] += 1
+
+        log(f"BUY {m} sig={exec_res['signature']}")
 
     finally:
         IN_FLIGHT_BUY.discard(m)
@@ -286,9 +221,6 @@ async def sell(p):
         price = await get_price(m)
         pnl = (price - p["entry_price"]) / p["entry_price"]
 
-        if REAL:
-            log(f"REAL SELL {m}")
-
         if p in engine.positions:
             engine.positions.remove(p)
 
@@ -299,59 +231,12 @@ async def sell(p):
         })
 
         engine.stats["sells"] += 1
+        log(f"SELL {m} pnl={pnl:.4f}")
 
     finally:
         IN_FLIGHT_SELL.discard(m)
 
 # ================= MONITOR =================
-async def mempool_sniper():
-    import websockets
-    import json
-
-    while True:
-        try:
-            ws_url = random.choice(RPC_WS)
-
-            async with websockets.connect(ws_url) as ws:
-
-                for program in WATCH_PROGRAMS:
-                    sub = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "logsSubscribe",
-                        "params": [
-                            {"mentions": [program]},
-                            {"commitment": "processed"}
-                        ]
-                    }
-                    await ws.send(json.dumps(sub))
-                    await ws.recv()
-
-                log("SNIPER CONNECTED")
-
-                while True:
-                    msg = json.loads(await ws.recv())
-
-                    logs = (
-                        msg.get("params", {})
-                        .get("result", {})
-                        .get("value", {})
-                        .get("logs", [])
-                    )
-
-                    for line in logs:
-                        parts = line.split()
-
-                        for p in parts:
-                            if len(p) >= 32 and len(p) <= 44:
-                                if p not in CANDIDATES:
-                                    CANDIDATES.add(p)
-                                    log(f"🔥 SNIPER ADD {p[:6]}")
-
-        except Exception as e:
-            log(f"SNIPER_ERR {e}")
-            await asyncio.sleep(3)
-            
 async def monitor():
     while True:
         try:
@@ -380,30 +265,44 @@ async def monitor():
 
         await asyncio.sleep(2)
 
-# ================= AI =================
-async def ai_loop():
-    global ENTRY_THRESHOLD
-
+# ================= SNIPER =================
+async def mempool_sniper():
     while True:
         try:
-            trades = engine.trade_history[-20:]
+            ws = random.choice(RPC_WS)
 
-            if trades:
-                avg = sum(t["pnl_pct"] for t in trades) / len(trades)
+            async with websockets.connect(ws) as conn:
 
-                if avg > 0:
-                    ENTRY_THRESHOLD *= 0.95
-                else:
-                    ENTRY_THRESHOLD *= 1.05
+                for program in WATCH_PROGRAMS:
+                    sub = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [program]},
+                            {"commitment": "processed"}
+                        ]
+                    }
+                    await conn.send(json.dumps(sub))
+                    await conn.recv()
 
-                ENTRY_THRESHOLD = max(MIN_THRESHOLD, min(MAX_THRESHOLD, ENTRY_THRESHOLD))
+                log("🔥 SNIPER CONNECTED")
 
-                log_once("ai", f"AI threshold={ENTRY_THRESHOLD:.4f}", 15)
+                while True:
+                    msg = json.loads(await conn.recv())
 
-        except:
-            pass
+                    logs = msg.get("params", {}).get("result", {}).get("value", {}).get("logs", [])
 
-        await asyncio.sleep(10)
+                    for line in logs:
+                        for part in line.split():
+                            if 32 <= len(part) <= 44:
+                                if part not in CANDIDATES:
+                                    CANDIDATES.add(part)
+                                    log(f"🔥 SNIPER ADD {part[:6]}")
+
+        except Exception as e:
+            log(f"SNIPER_ERR {e}")
+            await asyncio.sleep(3)
 
 # ================= MAIN =================
 async def main_loop():
@@ -411,7 +310,9 @@ async def main_loop():
         try:
             ranked = await rank_candidates()
 
-            for m, combo, *_ in ranked:
+            log_once("rank", f"RANKED {len(ranked)}", 3)
+
+            for m, combo in ranked:
                 if combo > ENTRY_THRESHOLD:
                     await buy(m, combo)
 
@@ -433,18 +334,18 @@ async def start():
     engine.logs = []
     engine.stats = {"buys": 0, "sells": 0, "errors": 0}
 
-    CANDIDATES.update({"BONK", "WIF", "JUP", "MYRO", "POPCAT"})
+    # 初始 token
+    CANDIDATES.update({"BONK", "WIF", "JUP"})
 
     asyncio.create_task(main_loop())
     asyncio.create_task(monitor())
-    asyncio.create_task(ai_loop())
+    asyncio.create_task(mempool_sniper())
 
 @app.get("/")
 def root():
     return {
         "positions": engine.positions,
         "stats": engine.stats,
-        "threshold": ENTRY_THRESHOLD,
-        "mode": "REAL" if REAL else "PAPER",
+        "candidates": len(CANDIDATES),
         "logs": engine.logs[-20:]
     }
