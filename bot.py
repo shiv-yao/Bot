@@ -1,5 +1,4 @@
-# ================= v1301_REAL_MARKET_BOT =================
-
+# ================= v1301_REAL_MARKET_BOT (完整修正版) =================
 import asyncio
 import time
 import random
@@ -11,7 +10,6 @@ from state import engine
 from mempool import mempool_stream
 
 # ================= CONFIG =================
-
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT = "Es9vMFrzaCERmJfrF4H2FYD6hF4n7hH3UX77PGD5Y8v"
@@ -23,17 +21,11 @@ MAX_POSITIONS = 5
 
 PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 
-SEED_TOKENS = {
-    SOL,
-    USDC,
-    USDT,
-    JUP,
-}
+SEED_TOKENS = {SOL, USDC, USDT, JUP}
 
 HTTP = httpx.AsyncClient(timeout=10)
 
 # ================= INIT =================
-
 if not hasattr(engine, "positions"):
     engine.positions = []
 
@@ -57,7 +49,6 @@ engine.stats = {
 }
 
 # ================= ENGINE =================
-
 ENGINE_STATS = {
     "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
     "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
@@ -77,7 +68,6 @@ ALPHA_MEMORY = {
 }
 
 # ================= STATE =================
-
 CANDIDATES = set()
 TOKEN_COOLDOWN = defaultdict(float)
 ALPHA_CACHE = {}
@@ -87,7 +77,6 @@ LAST_PUMP_ERROR = {"code": None, "ts": 0.0}
 LAST_UNIVERSE_REFRESH = 0.0
 
 # ================= UTIL =================
-
 def log(msg: str) -> None:
     engine.logs.append(msg)
     engine.logs = engine.logs[-200:]
@@ -100,7 +89,6 @@ def valid_mint(m: str) -> bool:
     return isinstance(m, str) and 32 <= len(m) <= 44
 
 # ================= MARKET DATA =================
-
 async def get_price(mint: str):
     cached = PRICE_CACHE.get(mint)
     if cached and now() - cached[1] < 3:
@@ -150,7 +138,6 @@ async def get_liquidity_and_impact(mint: str):
         return 0, 1.0
 
 # ================= TOKEN SOURCES =================
-
 async def pump_scanner():
     while True:
         try:
@@ -207,59 +194,45 @@ async def handle_mempool(e: dict):
 
 async def refresh_token_universe():
     global LAST_UNIVERSE_REFRESH
-
     if now() - LAST_UNIVERSE_REFRESH < 120:
         return
-
     LAST_UNIVERSE_REFRESH = now()
-
     CANDIDATES.update(SEED_TOKENS)
-
     for p in engine.positions:
         mint = p.get("token")
         if valid_mint(mint):
             CANDIDATES.add(mint)
-
     log(f"UNIVERSE_REFRESH total={len(CANDIDATES)}")
 
 # ================= ALPHA =================
-
 async def momentum(mint: str) -> float:
     p1 = await get_price(mint)
     await asyncio.sleep(0.10)
     p2 = await get_price(mint)
-
     if not p1 or not p2 or p1 <= 0:
         return 0.0
-
     return (p2 - p1) / p1
 
 async def micro(mint: str) -> float:
     p1 = await get_price(mint)
     await asyncio.sleep(0.05)
     p2 = await get_price(mint)
-
     if not p1 or not p2 or p1 <= 0:
         return 0.0
-
     return (p2 - p1) / p1
 
 async def volume_surge(mint: str) -> float:
     p = await get_price(mint)
     if not p:
         return 0.0
-
     prev = LAST_PRICE.get(mint, p)
     LAST_PRICE[mint] = p
-
     return abs(p - prev) / prev if prev > 0 else 0.0
 
 async def liquidity_score(mint: str) -> float:
     out, impact = await get_liquidity_and_impact(mint)
-
     if out <= 0:
         return 0.0
-
     liq_term = min(out / 100000, 2.0)
     impact_penalty = max(0.0, impact - 0.10) * 2.0
     return max(0.0, liq_term - impact_penalty)
@@ -274,21 +247,13 @@ async def alpha_engine(mint: str) -> float:
     vol = await volume_surge(mint)
     liq = await liquidity_score(mint)
 
-    raw_score = (
-        m * 0.45 +
-        mic * 0.20 +
-        vol * 0.20 +
-        liq * 0.15
-    )
-
-    # 關鍵修正：避免 alpha 永遠衝到超高，讓三引擎有分流空間
-    score = max(0.0, min(raw_score, 0.08))
+    raw_score = m * 0.45 + mic * 0.20 + vol * 0.20 + liq * 0.15
+    score = max(0.0, min(raw_score, 0.08))   # 避免 alpha 過高
 
     ALPHA_CACHE[mint] = (score, now())
     return score
 
 # ================= FILTER =================
-
 async def liquidity_ok(mint: str) -> bool:
     out, impact = await get_liquidity_and_impact(mint)
     if out <= 0:
@@ -299,11 +264,7 @@ async def anti_rug(mint: str) -> bool:
     try:
         r = await HTTP.get(
             "https://lite-api.jup.ag/swap/v1/quote",
-            params={
-                "inputMint": mint,
-                "outputMint": SOL,
-                "amount": "1000000",
-            },
+            params={"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
         )
         if r.status_code != 200:
             return False
@@ -312,68 +273,46 @@ async def anti_rug(mint: str) -> bool:
         return False
 
 # ================= ENGINE LOGIC =================
-
 def update_allocator() -> None:
     weights = {}
-
     for k, v in ENGINE_STATS.items():
         if v["trades"] == 0:
             weights[k] = 1.0
         else:
             win = v["wins"] / max(v["trades"], 1)
             weights[k] = (v["pnl"] + 0.001) * win
-
     total = sum(abs(v) for v in weights.values()) + 1e-9
     for k in weights:
         weights[k] = abs(weights[k]) / total
-
     ENGINE_ALLOCATOR.update(weights)
 
 def get_alpha_edge(engine_name: str, alpha: float) -> float:
     mem = ALPHA_MEMORY[engine_name]
-
     if not mem:
         return 1.0
-
     sim = [p for a, p in mem if abs(a - alpha) < 0.02]
     if not sim:
         return 1.0
-
     avg = sum(sim) / len(sim)
     return max(0.5, min(2.0, 1 + avg * 5))
 
 def pick_engine(alpha: float) -> str:
-    # 真正分流版本
     if alpha > 0.07:
         return "sniper"
-
     if alpha > 0.03:
-        return random.choices(
-            ["stable", "degen", "sniper"],
-            weights=[0.2, 0.5, 0.3],
-            k=1,
-        )[0]
-
-    return random.choices(
-        ["stable", "degen", "sniper"],
-        weights=list(ENGINE_ALLOCATOR.values()),
-        k=1,
-    )[0]
+        return random.choices(["stable", "degen", "sniper"], weights=[0.2, 0.5, 0.3], k=1)[0]
+    return random.choices(["stable", "degen", "sniper"], weights=list(ENGINE_ALLOCATOR.values()), k=1)[0]
 
 def size(alpha: float, eng: str) -> float:
     base = MAX_POSITION_SOL * min(1.0, alpha * 6)
     alloc = ENGINE_ALLOCATOR[eng]
     edge = get_alpha_edge(eng, alpha)
-
     s = base * alloc * edge
-
     if engine.loss_streak >= 3:
         s *= 0.5
-
     return max(MIN_POSITION_SOL, min(MAX_POSITION_SOL, s))
 
 # ================= EXEC =================
-
 def can_buy(mint: str) -> bool:
     if len(engine.positions) >= MAX_POSITIONS:
         return False
@@ -385,7 +324,6 @@ def can_buy(mint: str) -> bool:
 
 async def buy(mint: str, alpha: float) -> bool:
     eng = pick_engine(alpha)
-
     if not can_buy(mint):
         return False
 
@@ -396,27 +334,100 @@ async def buy(mint: str, alpha: float) -> bool:
     s = size(alpha, eng)
     amount = s / price
 
-    engine.positions.append(
-        {
-            "token": mint,
-            "amount": amount,
-            "entry_price": price,
-            "last_price": price,
-            "peak_price": price,
-            "pnl_pct": 0.0,
-            "engine": eng,
-            "alpha": alpha,
-        }
-    )
+    engine.positions.append({
+        "token": mint,
+        "amount": amount,
+        "entry_price": price,
+        "last_price": price,
+        "peak_price": price,
+        "pnl_pct": 0.0,
+        "engine": eng,
+        "alpha": alpha,
+    })
 
     TOKEN_COOLDOWN[mint] = now()
-
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:8]}"
-
     log(f"BUY {mint[:8]} eng={eng} alpha={round(alpha,4)} size={round(s,6)}")
     return True
 
 async def sell(p: dict) -> None:
+    """完整賣出邏輯（已修正）"""
     price = await get_price(p["token"])
-    if
+    if not price or price <= 0:
+        log(f"SELL FAILED: invalid price for {p['token'][:8]}")
+        return
+
+    entry = p.get("entry_price", 0.0) or price
+    pnl_pct = (price - entry) / entry if entry > 0 else 0.0
+    realized_pnl = (price - entry) * float(p.get("amount", 0.0))
+
+    eng = p.get("engine", "sniper")
+    ENGINE_STATS[eng]["trades"] += 1
+    ENGINE_STATS[eng]["pnl"] += realized_pnl
+    if realized_pnl > 0:
+        ENGINE_STATS[eng]["wins"] += 1
+
+    if realized_pnl < 0:
+        engine.loss_streak += 1
+    else:
+        engine.loss_streak = 0
+
+    # 移除持倉
+    engine.positions = [pos for pos in engine.positions if pos["token"] != p["token"]]
+
+    engine.stats["sells"] += 1
+    engine.last_trade = f"SELL {p['token'][:8]}"
+    log(f"SELL {p['token'][:8]} eng={eng} pnl={realized_pnl:.6f} ({pnl_pct*100:+.2f}%)")
+
+# ================= MONITOR =================
+async def monitor_positions():
+    """自動監控持倉 + 止盈止損"""
+    while True:
+        try:
+            for p in list(engine.positions):
+                price = await get_price(p["token"])
+                if not price:
+                    continue
+
+                entry = p.get("entry_price", 0.0)
+                pnl_pct = (price - entry) / entry if entry > 0 else 0.0
+                p["last_price"] = price
+                p["pnl_pct"] = pnl_pct
+
+                # 止盈 15% 或 止損 -8%
+                if pnl_pct >= 0.15 or pnl_pct <= -0.08:
+                    await sell(p)
+        except Exception as e:
+            log(f"MONITOR ERROR: {e}")
+        await asyncio.sleep(5)
+
+# ================= MAIN LOOP =================
+async def main():
+    log("🚀 v1301_REAL_MARKET_BOT 已啟動 (PAPER MODE)")
+    asyncio.create_task(pump_scanner())
+    asyncio.create_task(mempool_stream(handle_mempool))
+    asyncio.create_task(monitor_positions())
+
+    while True:
+        try:
+            await refresh_token_universe()
+
+            # 取前 10 個 candidate 嘗試進場
+            candidates_list = list(CANDIDATES)[:10]
+            for mint in candidates_list:
+                if await liquidity_ok(mint) and await anti_rug(mint):
+                    alpha = await alpha_engine(mint)
+                    if alpha > 0.015:   # alpha 門檻
+                        await buy(mint, alpha)
+                        engine.stats["signals"] += 1
+
+            update_allocator()
+            await asyncio.sleep(8)
+        except Exception as e:
+            engine.stats["errors"] += 1
+            log(f"MAIN LOOP ERROR: {e}")
+            await asyncio.sleep(8)
+
+if __name__ == "__main__":
+    asyncio.run(main())
