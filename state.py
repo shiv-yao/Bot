@@ -36,17 +36,15 @@ class EngineState:
         }
 
         self.engine_allocator = {
-            "stable": 0.33,
-            "degen": 0.33,
-            "sniper": 0.34,
+            "stable": 0.4,
+            "degen": 0.4,
+            "sniper": 0.2,
         }
 
         self.candidate_count = 0
 
         self.bot_ok = True
         self.bot_error = ""
-
-    # ================= SAFE OPS =================
 
     def log(self, message: str):
         with self._lock:
