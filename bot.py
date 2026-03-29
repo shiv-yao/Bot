@@ -1,11 +1,16 @@
-# ================= FINAL_MERGED_BOT_V2 =================
+# ================= FINAL_BOT_PRODUCTION =================
 
-import asyncio, time, random
+import asyncio
+import time
+import random
 from collections import defaultdict
+
 import httpx
 
 from state import engine
 from mempool import mempool_stream
+
+# ================= CONFIG =================
 
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -77,6 +82,7 @@ def log(msg):
 # ================= PRICE =================
 
 async def get_price(mint):
+
     cached = PRICE_CACHE.get(mint)
     if cached and time.time() - cached[1] < 3:
         return cached[0]
@@ -94,10 +100,11 @@ async def get_price(mint):
         if r.status_code != 200:
             return None
 
-        data = r.json()
-        out = int(data.get("outAmount", 0))
+        j = r.json()
+        out = int(j.get("outAmount", 0))
 
         price = (out / 1e9) / 1_000_000 if out > 0 else None
+
         PRICE_CACHE[mint] = (price, time.time())
 
         return price
@@ -131,6 +138,7 @@ async def pump_scanner():
                 continue
 
             added = 0
+
             for c in data[:20]:
                 mint = c.get("mint") if isinstance(c, dict) else None
                 if mint:
@@ -190,34 +198,41 @@ async def alpha_engine(mint):
 # ================= ENGINE =================
 
 def update_allocator():
+
     weights = {}
 
     for k,v in ENGINE_STATS.items():
         if v["trades"] == 0:
             weights[k] = 1
         else:
-            winrate = v["wins"]/max(v["trades"],1)
-            weights[k] = (v["pnl"]+0.001)*winrate
+            win = v["wins"]/max(v["trades"],1)
+            weights[k] = (v["pnl"]+0.001)*win
 
     total = sum(abs(v) for v in weights.values()) + 1e-9
+
     for k in weights:
-        weights[k] = abs(weights[k])/total
+        weights[k] = abs(weights[k]) / total
 
     ENGINE_ALLOCATOR.update(weights)
 
 def get_alpha_edge(engine_name, alpha):
+
     mem = ALPHA_MEMORY[engine_name]
+
     if not mem:
         return 1.0
 
-    sim = [p for a,p in mem if abs(a-alpha)<0.02]
+    sim = [p for a,p in mem if abs(a-alpha) < 0.02]
+
     if not sim:
         return 1.0
 
     avg = sum(sim)/len(sim)
+
     return max(0.5, min(2.0, 1 + avg*5))
 
 def pick_engine(alpha):
+
     if alpha > 0.05:
         return "sniper"
 
@@ -243,6 +258,7 @@ def size(alpha, eng):
 # ================= EXEC =================
 
 def can_buy(mint):
+
     if len(engine.positions) >= MAX_POSITIONS:
         return False
 
@@ -262,6 +278,7 @@ async def buy(mint, alpha):
         return False
 
     price = await get_price(mint)
+
     if not price:
         return False
 
@@ -290,6 +307,7 @@ async def buy(mint, alpha):
 async def sell(p):
 
     price = await get_price(p["token"])
+
     if not price:
         return
 
@@ -341,7 +359,6 @@ async def monitor():
 
                 pnl = (price - p["entry"]) / p["entry"]
 
-                # TP / SL
                 if pnl > 0.25 or pnl < -0.08:
                     await sell(p)
                     continue
