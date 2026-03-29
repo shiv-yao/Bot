@@ -8,7 +8,6 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from state import engine
-from bot import bot_loop
 
 BOT_TASK = None
 
@@ -75,7 +74,6 @@ def init_engine():
         engine.mode = "PAPER"
 
 
-# ================= ENV / STATUS =================
 def get_mode():
     real_trading = os.environ.get("REAL_TRADING", "false").lower() == "true"
     jup_api_key = bool(os.environ.get("JUP_API_KEY", "").strip())
@@ -194,14 +192,31 @@ async def collect_runtime_status():
     }
 
 
-# ================= APP LIFECYCLE =================
+async def safe_bot_runner():
+    try:
+        from bot import bot_loop
+        engine.bot_ok = True
+        engine.bot_error = ""
+        await bot_loop()
+    except Exception as e:
+        init_engine()
+        engine.bot_ok = False
+        engine.bot_error = f"BOT_START_ERR: {e}"
+        engine.logs.append(f"BOT_START_ERR: {e}")
+        engine.logs = engine.logs[-500:]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_TASK
     init_engine()
 
-    if BOT_TASK is None or BOT_TASK.done():
-        BOT_TASK = asyncio.create_task(bot_loop())
+    try:
+        if BOT_TASK is None or BOT_TASK.done():
+            BOT_TASK = asyncio.create_task(safe_bot_runner())
+    except Exception as e:
+        engine.bot_ok = False
+        engine.bot_error = f"LIFESPAN_ERR: {e}"
 
     yield
 
@@ -209,14 +224,13 @@ async def lifespan(app: FastAPI):
         BOT_TASK.cancel()
         try:
             await BOT_TASK
-        except Exception:
+        except BaseException:
             pass
 
 
 app = FastAPI(title="Trading Bot Dashboard", lifespan=lifespan)
 
 
-# ================= ROUTES =================
 @app.get("/health")
 async def health():
     init_engine()
@@ -243,286 +257,22 @@ async def api_status():
 @app.get("/", response_class=HTMLResponse)
 async def home():
     data = await collect_runtime_status()
-
-    def badge(ok: bool, text_ok="OK", text_bad="BAD"):
-        bg = "#16a34a" if ok else "#dc2626"
-        text = text_ok if ok else text_bad
-        return f'<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{bg};color:white;font-weight:700;">{text}</span>'
-
-    def mode_badge(mode: str):
-        bg = "#dc2626" if mode == "REAL" else "#2563eb"
-        return f'<span style="display:inline-block;padding:6px 12px;border-radius:999px;background:{bg};color:white;font-weight:800;">{mode}</span>'
-
-    def render_rpc_rows(rows):
-        html = ""
-        for row in rows:
-            ok = row.get("ok", False)
-            detail = row.get("detail", "")
-            url = row.get("url", "")
-            html += f"""
-            <tr>
-                <td style="padding:8px;border-bottom:1px solid #222;">{url}</td>
-                <td style="padding:8px;border-bottom:1px solid #222;">{badge(ok)}</td>
-                <td style="padding:8px;border-bottom:1px solid #222;color:#aaa;">{detail}</td>
-            </tr>
-            """
-        return html or """
-        <tr><td colspan="3" style="padding:8px;color:#aaa;">No RPC configured</td></tr>
+    return HTMLResponse(
+        f"""
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Bot Dashboard</title>
+        </head>
+        <body style="font-family: sans-serif; background:#0b0f19; color:white; padding:24px;">
+            <h1>Trading Bot Dashboard</h1>
+            <p>Mode: <b>{data["mode"]}</b></p>
+            <p>Bot OK: <b>{data["bot_ok"]}</b></p>
+            <p>Bot Error: <b>{data["bot_error"] or "-"}</b></p>
+            <p><a href="/debug" style="color:#7dd3fc;">/debug</a></p>
+            <p><a href="/api/status" style="color:#7dd3fc;">/api/status</a></p>
+        </body>
+        </html>
         """
-
-    positions_html = ""
-    for p in data["positions"][-20:]:
-        positions_html += f"""
-        <tr>
-            <td style="padding:8px;border-bottom:1px solid #222;">{p.get("token","")[:10]}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{p.get("engine","")}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{round(float(p.get("entry_price", 0) or 0), 10)}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{round(float(p.get("last_price", 0) or 0), 10)}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{round(float(p.get("pnl_pct", 0) or 0) * 100, 2)}%</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{p.get("trade_mode","")}</td>
-        </tr>
-        """
-    if not positions_html:
-        positions_html = '<tr><td colspan="6" style="padding:8px;color:#aaa;">No open positions</td></tr>'
-
-    trades_html = ""
-    for t in data["trade_history"][-20:][::-1]:
-        trades_html += f"""
-        <tr>
-            <td style="padding:8px;border-bottom:1px solid #222;">{t.get("token","")[:10]}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{t.get("engine","")}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{round(float(t.get("pnl_pct", 0) or 0) * 100, 2)}%</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{t.get("trade_mode","")}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{t.get("entry_signature","") or ""}</td>
-            <td style="padding:8px;border-bottom:1px solid #222;">{t.get("exit_signature","") or ""}</td>
-        </tr>
-        """
-    if not trades_html:
-        trades_html = '<tr><td colspan="6" style="padding:8px;color:#aaa;">No trade history</td></tr>'
-
-    logs_html = "<br>".join(
-        str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        for x in data["logs"][-80:]
     )
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <meta http-equiv="refresh" content="8"/>
-        <title>Trading Bot Dashboard</title>
-        <style>
-            body {{
-                margin: 0;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #0b0f19;
-                color: #f3f4f6;
-            }}
-            .wrap {{
-                max-width: 1400px;
-                margin: 0 auto;
-                padding: 24px;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-                gap: 16px;
-            }}
-            .card {{
-                background: #111827;
-                border: 1px solid #1f2937;
-                border-radius: 16px;
-                padding: 18px;
-                box-shadow: 0 4px 18px rgba(0,0,0,0.25);
-            }}
-            .title {{
-                font-size: 13px;
-                color: #9ca3af;
-                margin-bottom: 8px;
-                text-transform: uppercase;
-                letter-spacing: 0.06em;
-            }}
-            .value {{
-                font-size: 28px;
-                font-weight: 800;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 14px;
-            }}
-            .section-title {{
-                font-size: 20px;
-                font-weight: 800;
-                margin: 24px 0 12px;
-            }}
-            .mono {{
-                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-                word-break: break-all;
-            }}
-            .small {{
-                font-size: 12px;
-                color: #9ca3af;
-            }}
-            .logs {{
-                background: #050814;
-                border: 1px solid #1f2937;
-                border-radius: 16px;
-                padding: 16px;
-                min-height: 240px;
-                max-height: 420px;
-                overflow: auto;
-                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-                font-size: 12px;
-                line-height: 1.5;
-                white-space: pre-wrap;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="wrap">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;">
-                <div>
-                    <div style="font-size:32px;font-weight:900;">Trading Bot Dashboard</div>
-                    <div class="small">Auto refresh every 8s</div>
-                </div>
-                <div>{mode_badge(data["mode"])}</div>
-            </div>
-
-            <div class="grid" style="margin-top:18px;">
-                <div class="card">
-                    <div class="title">Bot Status</div>
-                    <div class="value">{badge(data["bot_ok"], "RUNNING", "ERROR")}</div>
-                    <div class="small" style="margin-top:10px;">{data["bot_error"] or "No error"}</div>
-                </div>
-                <div class="card">
-                    <div class="title">Capital</div>
-                    <div class="value">{round(float(data["capital"]), 4)}</div>
-                </div>
-                <div class="card">
-                    <div class="title">SOL Balance</div>
-                    <div class="value">{round(float(data["sol_balance"]), 4)}</div>
-                </div>
-                <div class="card">
-                    <div class="title">Candidates</div>
-                    <div class="value">{int(data["candidate_count"])}</div>
-                </div>
-            </div>
-
-            <div class="grid" style="margin-top:16px;">
-                <div class="card"><div class="title">Signals</div><div class="value">{int(data["stats"].get("signals", 0))}</div></div>
-                <div class="card"><div class="title">Buys</div><div class="value">{int(data["stats"].get("buys", 0))}</div></div>
-                <div class="card"><div class="title">Sells</div><div class="value">{int(data["stats"].get("sells", 0))}</div></div>
-                <div class="card"><div class="title">Errors</div><div class="value">{int(data["stats"].get("errors", 0))}</div></div>
-                <div class="card"><div class="title">Adds</div><div class="value">{int(data["stats"].get("adds", 0))}</div></div>
-            </div>
-
-            <div class="grid" style="margin-top:16px;">
-                <div class="card">
-                    <div class="title">Jupiter API Key</div>
-                    <div class="value">{badge(data["jup_api_key_present"], "PRESENT", "MISSING")}</div>
-                </div>
-                <div class="card">
-                    <div class="title">Jito Enabled</div>
-                    <div class="value">{badge(data["use_jito"], "ON", "OFF")}</div>
-                    <div class="small" style="margin-top:10px;">Bundle URL: {"present" if data["jito_url_present"] else "missing"}</div>
-                </div>
-                <div class="card">
-                    <div class="title">Last Trade</div>
-                    <div class="small mono">{data["last_trade"] or "-"}</div>
-                </div>
-                <div class="card">
-                    <div class="title">Last Signal</div>
-                    <div class="small mono">{data["last_signal"] or "-"}</div>
-                </div>
-            </div>
-
-            <div class="section-title">RPC HTTP Status</div>
-            <div class="card">
-                <table>
-                    <thead>
-                        <tr>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">URL</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Status</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Detail</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {render_rpc_rows(data["rpc_http"])}
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="section-title">RPC WS Status</div>
-            <div class="card">
-                <table>
-                    <thead>
-                        <tr>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">URL</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Status</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Detail</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {render_rpc_rows(data["rpc_ws"])}
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="section-title">Engine Allocator</div>
-            <div class="card">
-                <div class="mono">{json.dumps(data["engine_allocator"], ensure_ascii=False, indent=2)}</div>
-            </div>
-
-            <div class="section-title">Engine Stats</div>
-            <div class="card">
-                <div class="mono">{json.dumps(data["engine_stats"], ensure_ascii=False, indent=2)}</div>
-            </div>
-
-            <div class="section-title">Open Positions</div>
-            <div class="card">
-                <table>
-                    <thead>
-                        <tr>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Token</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Engine</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Entry</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Last</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">PnL</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Mode</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {positions_html}
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="section-title">Trade History</div>
-            <div class="card">
-                <table>
-                    <thead>
-                        <tr>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Token</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Engine</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">PnL</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Mode</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Entry Sig</th>
-                            <th style="text-align:left;padding:8px;border-bottom:1px solid #222;">Exit Sig</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {trades_html}
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="section-title">Recent Logs</div>
-            <div class="logs">{logs_html or "No logs yet"}</div>
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html)
