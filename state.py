@@ -9,7 +9,13 @@ class EngineState:
 
         self.running = True
         self.mode = "PAPER"
-
+        # ===== 狀態 =====
+        self.wallet_ok = False
+        
+        self.jup_ok = False
+        self.bot_ok = False
+        self.bot_error = ""
+        
         self.sol_balance = 30.0
         self.capital = 30.0
 
