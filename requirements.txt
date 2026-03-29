@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-aiohttp
-solders
-streamlit
-pandas
-plotly
-requests
-
