@@ -1,4 +1,4 @@
-# ================= v1300_REAL_MARKET_BOT =================
+# ================= v1300_REAL_MARKET_BOT_FINAL =================
 
 import asyncio
 import time
@@ -40,9 +40,14 @@ if not hasattr(engine, "positions"):
 engine.logs = []
 engine.trade_history = []
 engine.capital = 1.0
+engine.sol_balance = getattr(engine, "sol_balance", 1.0)
 engine.loss_streak = 0
 engine.last_trade = ""
 engine.last_signal = ""
+engine.running = True
+engine.mode = getattr(engine, "mode", "PAPER")
+engine.bot_ok = True
+engine.bot_error = ""
 
 engine.stats = {
     "signals": 0,
@@ -208,10 +213,8 @@ async def refresh_token_universe():
 
     LAST_UNIVERSE_REFRESH = now()
 
-    # 這裡保留輕量版 universe。未來可接真 Jupiter token list / wallet signals
     CANDIDATES.update(SEED_TOKENS)
 
-    # 從現有持倉維持關注
     for p in engine.positions:
         mint = p.get("token")
         if valid_mint(mint):
@@ -460,12 +463,10 @@ async def monitor():
                 pnl = (price - p["entry_price"]) / p["entry_price"]
                 p["pnl_pct"] = pnl
 
-                # take profit / stop loss
                 if pnl > 0.25 or pnl < -0.08:
                     await sell(p)
                     continue
 
-                # trailing stop
                 if p["peak_price"] > p["entry_price"]:
                     dd = (p["peak_price"] - price) / p["peak_price"]
                     if dd > 0.10:
@@ -493,6 +494,10 @@ async def bot():
     while True:
         try:
             await refresh_token_universe()
+
+            engine.engine_stats = ENGINE_STATS
+            engine.engine_allocator = ENGINE_ALLOCATOR
+            engine.candidate_count = len(CANDIDATES)
 
             if len(CANDIDATES) == 0:
                 CANDIDATES.update(SEED_TOKENS)
