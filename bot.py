@@ -1,4 +1,4 @@
-# ================= v1200_FULL_IMPLEMENTATION =================
+# ================= v1200_STABLE =================
 
 import os, asyncio, time, random
 from collections import defaultdict
@@ -9,7 +9,6 @@ from mempool import mempool_stream
 
 RPC = os.getenv("RPC", "")
 SOL = "So11111111111111111111111111111111111111112"
-HELIUS_API = os.getenv("HELIUS_API", "")
 
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
@@ -36,14 +35,15 @@ engine.stats = {
     "errors": 0
 }
 
+# 🔥 單一 HTTP（關鍵）
 HTTP = httpx.AsyncClient(timeout=10)
 
 # ================= STATE =================
 
-CANDIDATES = set()
-SMART_WALLETS = {}
+CANDIDATES = set([SOL])
 TOKEN_COOLDOWN = defaultdict(float)
 ALPHA_CACHE = {}
+PRICE_CACHE = {}
 LAST_PRICE = {}
 
 # ================= LOG =================
@@ -56,6 +56,11 @@ def log(msg):
 # ================= PRICE =================
 
 async def get_price(mint):
+
+    # 🔥 cache（減少 API）
+    if mint in PRICE_CACHE and time.time() - PRICE_CACHE[mint][1] < 3:
+        return PRICE_CACHE[mint][0]
+
     try:
         r = await HTTP.get(
             "https://lite-api.jup.ag/swap/v1/quote",
@@ -65,13 +70,19 @@ async def get_price(mint):
                 "amount": "1000000"
             }
         )
+
         out = int(r.json().get("outAmount", 0)) / 1e9
-        return out / 1_000_000 if out > 0 else None
+        price = out / 1_000_000 if out > 0 else None
+
+        PRICE_CACHE[mint] = (price, time.time())
+
+        return price
+
     except:
         engine.stats["errors"] += 1
         return None
 
-# ================= TOKEN SOURCES =================
+# ================= TOKEN =================
 
 async def pump_scanner():
     while True:
@@ -79,52 +90,26 @@ async def pump_scanner():
             r = await HTTP.get(PUMP_API)
             data = r.json()
 
-            for c in data[:20]:
+            for c in data[:15]:
                 mint = c.get("mint")
                 if mint:
                     CANDIDATES.add(mint)
 
-        except Exception as e:
-            log(f"PUMP_ERR {e}")
+        except:
+            pass
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)  # 🔥 降頻
 
 async def handle_mempool(e):
     mint = e.get("mint")
     if mint:
         CANDIDATES.add(mint)
 
-# ================= SMART WALLET =================
-
-async def fetch_wallet_tx(wallet):
-    try:
-        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API}"
-        r = await HTTP.get(url)
-        return r.json()
-    except:
-        return []
-
-async def detect_smart_wallets():
-    while True:
-        try:
-            # 👉 這裡之後換真 whale scan
-            for i in range(5):
-                SMART_WALLETS[f"wallet_{i}"] = random.uniform(0.8, 1.5)
-
-        except Exception as e:
-            log(f"SMART_ERR {e}")
-
-        await asyncio.sleep(10)
-
-async def smart_money_score(mint):
-    base = sum(SMART_WALLETS.values()) / (len(SMART_WALLETS) + 1)
-    return base * random.uniform(0.8, 1.2)
-
 # ================= ALPHA =================
 
 async def momentum(mint):
     p1 = await get_price(mint)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.08)
     p2 = await get_price(mint)
 
     if not p1 or not p2:
@@ -154,19 +139,18 @@ async def volume_surge(mint):
 
 async def alpha_engine(mint):
 
-    if mint in ALPHA_CACHE and time.time() - ALPHA_CACHE[mint][1] < 2:
+    # 🔥 cache（關鍵）
+    if mint in ALPHA_CACHE and time.time() - ALPHA_CACHE[mint][1] < 4:
         return ALPHA_CACHE[mint][0]
 
     m = await momentum(mint)
     mic = await micro(mint)
     vol = await volume_surge(mint)
-    smart = await smart_money_score(mint)
 
     score = (
-        m * 0.4 +
+        m * 0.5 +
         mic * 0.2 +
-        vol * 0.2 +
-        smart * 0.2
+        vol * 0.3
     )
 
     ALPHA_CACHE[mint] = (score, time.time())
@@ -185,7 +169,7 @@ async def liquidity_ok(mint):
                 "amount": "10000000"
             }
         )
-        return float(r.json().get("priceImpactPct", 1)) < 0.35
+        return float(r.json().get("priceImpactPct", 1)) < 0.4
     except:
         return False
 
@@ -212,13 +196,13 @@ def can_buy(mint):
     if any(p["token"] == mint for p in engine.positions):
         return False
 
-    if time.time() - TOKEN_COOLDOWN[mint] < 15:
+    if time.time() - TOKEN_COOLDOWN[mint] < 20:
         return False
 
     return True
 
 def size(alpha):
-    return max(MIN_POSITION_SOL, MAX_POSITION_SOL * min(1, alpha * 8))
+    return max(MIN_POSITION_SOL, MAX_POSITION_SOL * min(1, alpha * 6))
 
 # ================= EXEC =================
 
@@ -247,7 +231,7 @@ async def buy(mint, alpha):
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint}"
 
-    log(f"BUY {mint[:6]} alpha={round(alpha,4)} size={round(s,6)}")
+    log(f"BUY {mint[:6]} alpha={round(alpha,4)}")
 
     return True
 
@@ -276,7 +260,6 @@ async def sell(p):
 # ================= MONITOR =================
 
 async def monitor():
-
     while True:
 
         for p in list(engine.positions):
@@ -289,23 +272,18 @@ async def monitor():
 
             pnl = (price - p["entry"]) / p["entry"]
 
-            if pnl > 0.25:
-                await sell(p)
-            elif pnl < -0.08:
-                await sell(p)
-            elif p["peak"] > p["entry"] and (p["peak"] - price)/p["peak"] > 0.1:
+            if pnl > 0.25 or pnl < -0.08:
                 await sell(p)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)  # 🔥 降頻
 
 # ================= MAIN =================
 
 async def bot():
 
-    log("🚀 FULL IMPLEMENTATION LIVE")
+    log("🚀 FULL IMPLEMENTATION STABLE")
 
     asyncio.create_task(monitor())
-    asyncio.create_task(detect_smart_wallets())
     asyncio.create_task(pump_scanner())
 
     try:
@@ -317,7 +295,10 @@ async def bot():
 
         try:
 
-            if len(CANDIDATES) < 5:
+            # 🔥 fallback
+            if len(CANDIDATES) < 3:
+                CANDIDATES.add(SOL)
+                await asyncio.sleep(1)
                 continue
 
             for mint in list(CANDIDATES):
@@ -342,7 +323,8 @@ async def bot():
             engine.stats["errors"] += 1
             log(f"ERR {e}")
 
-        await asyncio.sleep(2)
+        # 🔥 關鍵：避免 Railway kill
+        await asyncio.sleep(3 + random.random()*2)
 
 # ================= ENTRY =================
 
