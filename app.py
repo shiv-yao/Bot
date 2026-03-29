@@ -137,7 +137,7 @@ async def check_ws_rpc(url: str):
             req = {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "getHealth",
+                "method": "Ping",
                 "params": [],
             }
             await ws.send(json.dumps(req))
