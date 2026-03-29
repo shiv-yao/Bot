@@ -1,4 +1,4 @@
-# ================= v1308 FULL MERGED BOT =================
+# ================= v1309 FULL MERGED BOT =================
 import asyncio
 import time
 import random
@@ -8,6 +8,7 @@ import httpx
 
 from state import engine
 from mempool import mempool_stream
+from wallet_tracker import extract_wallets_from_mints, track_wallet_behavior
 
 # ================= CONFIG =================
 SOL = "So11111111111111111111111111111111111111112"
@@ -16,6 +17,9 @@ USDT = "Es9vMFrzaCERm7w7z7y7v4JgJ6pG6fQ5gYdExgkt1Py"
 BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB263kzwc"
 JUP = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
 
+STATIC_UNIVERSE = {SOL, USDC, USDT, BONK, JUP}
+FALLBACK_TOKENS = set(STATIC_UNIVERSE)
+
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
 MAX_POSITIONS = 5
@@ -23,12 +27,9 @@ MAX_POSITIONS = 5
 PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 JUP_TOKENS_API = "https://token.jup.ag/all"
 
-STATIC_UNIVERSE = {SOL, USDC, USDT, BONK, JUP}
-FALLBACK_TOKENS = set(STATIC_UNIVERSE)
-
 HTTP = httpx.AsyncClient(timeout=10.0)
 
-# ================= AI PARAMS =================
+# ================= AI =================
 AI_PARAMS = {
     "entry_threshold": 0.002,
     "size_multiplier": 1.0,
@@ -39,21 +40,16 @@ AI_PARAMS = {
 CANDIDATES = set()
 TOKEN_COOLDOWN = defaultdict(float)
 PRICE_CACHE = {}
-LAST_UNIVERSE_REFRESH = 0
 LAST_LOG_TS = {}
 
+# ================= WALLET GRAPH =================
+WALLET_GRAPH = {}
+WALLET_SCORE = {}
+
 # ================= UTIL =================
-def now():
-    return time.time()
+def now(): return time.time()
 
-def valid_mint(m):
-    return isinstance(m, str) and 32 <= len(m) <= 44
-
-def ensure_float(x, d=0):
-    try:
-        return float(x)
-    except:
-        return d
+def valid_mint(m): return isinstance(m, str) and 32 <= len(m) <= 44
 
 def log(msg):
     engine.logs.append(str(msg))
@@ -61,9 +57,8 @@ def log(msg):
     print("[BOT]", msg)
 
 def log_once(k, msg, cd=60):
-    t = now()
-    if t - LAST_LOG_TS.get(k, 0) > cd:
-        LAST_LOG_TS[k] = t
+    if now() - LAST_LOG_TS.get(k, 0) > cd:
+        LAST_LOG_TS[k] = now()
         log(msg)
 
 # ================= HTTP =================
@@ -77,13 +72,13 @@ async def http_get(url, params=None):
         return None
 
 # ================= MARKET =================
-async def get_price(mint):
-    if mint in PRICE_CACHE and now() - PRICE_CACHE[mint][1] < 4:
-        return PRICE_CACHE[mint][0]
+async def get_price(m):
+    if m in PRICE_CACHE and now() - PRICE_CACHE[m][1] < 4:
+        return PRICE_CACHE[m][0]
 
     data = await http_get(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+        {"inputMint": m, "outputMint": SOL, "amount": "1000000"}
     )
 
     if not data:
@@ -91,66 +86,58 @@ async def get_price(mint):
 
     out = int(data.get("outAmount", 0))
     price = (out / 1e9) / 1_000_000 if out > 0 else None
-
-    PRICE_CACHE[mint] = (price, now())
+    PRICE_CACHE[m] = (price, now())
     return price
 
-async def liquidity_ok(mint):
+async def liquidity_ok(m):
     data = await http_get(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"}
+        {"inputMint": SOL, "outputMint": m, "amount": "10000000"}
     )
-    if not data:
-        return False
+    return data and int(data.get("outAmount", 0)) > 5000
 
-    return int(data.get("outAmount", 0)) > 5000
-
-async def anti_rug(mint):
+async def anti_rug(m):
     data = await http_get(
         "https://lite-api.jup.ag/swap/v1/quote",
-        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+        {"inputMint": m, "outputMint": SOL, "amount": "1000000"}
     )
     return data and int(data.get("outAmount", 0)) > 0
 
-# ================= SOURCES =================
-async def add_candidate(m):
-    if valid_mint(m) and m not in CANDIDATES:
-        CANDIDATES.add(m)
-        engine.stats["adds"] += 1
-
-async def inject_fallback():
-    for m in FALLBACK_TOKENS:
-        await add_candidate(m)
-
-async def pump():
-    while True:
-        data = await http_get(PUMP_API)
-        if isinstance(data, list):
-            for c in data[:20]:
-                await add_candidate(c.get("mint"))
-        else:
-            await inject_fallback()
-        await asyncio.sleep(10)
-
-async def jup():
-    while True:
-        data = await http_get(JUP_TOKENS_API)
-        if isinstance(data, list):
-            random.shuffle(data)
-            for t in data[:50]:
-                await add_candidate(t.get("address"))
-        await asyncio.sleep(120)
-
-async def mempool_loop():
-    while True:
-        try:
-            await mempool_stream(lambda e: add_candidate(e.get("mint")))
-        except:
-            await asyncio.sleep(5)
-
 # ================= WALLET =================
-def wallet_score(mint):
-    return 1.0  # 保留你原本 + 可擴展
+async def build_wallet_graph():
+    RPC = "https://api.mainnet-beta.solana.com"
+    try:
+        wallets = await extract_wallets_from_mints(RPC, list(CANDIDATES)[-20:])
+        behaviors = await track_wallet_behavior(RPC, wallets)
+
+        for b in behaviors:
+            w = b["wallet"]
+            tokens = b["tokens"]
+
+            WALLET_GRAPH[w] = tokens
+            WALLET_SCORE[w] = min(len(tokens) / 10, 1.5)
+
+    except Exception as e:
+        log_once("wallet_graph", str(e))
+
+def wallet_score(m):
+    score = 1.0
+    for w, tokens in WALLET_GRAPH.items():
+        if m in tokens:
+            score += WALLET_SCORE.get(w, 0)
+    return min(score, 3.0)
+
+# ================= SNIPER =================
+SNIPER_CACHE = set()
+
+async def sniper(m):
+    if m in SNIPER_CACHE:
+        return 0
+    SNIPER_CACHE.add(m)
+
+    if m not in STATIC_UNIVERSE:
+        return 0.01 + random.random() * 0.01
+    return 0
 
 # ================= ALPHA =================
 async def alpha(m):
@@ -160,8 +147,26 @@ async def alpha(m):
 
     if not p1 or not p2:
         return 0
-
     return (p2 - p1) / p1
+
+# ================= RANK =================
+async def rank_candidates():
+    ranked = []
+
+    for m in list(CANDIDATES):
+        try:
+            a = await alpha(m)
+            w = wallet_score(m)
+            s = await sniper(m)
+
+            combo = a + (w * 0.01) + s
+            ranked.append((m, combo, a, w))
+
+        except:
+            continue
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked[:15]
 
 # ================= AI LOOP =================
 async def ai_loop():
@@ -177,9 +182,6 @@ async def ai_loop():
                 else:
                     AI_PARAMS["entry_threshold"] *= 1.05
                     AI_PARAMS["size_multiplier"] *= 0.95
-
-                AI_PARAMS["entry_threshold"] = max(0.001, min(0.01, AI_PARAMS["entry_threshold"]))
-                AI_PARAMS["size_multiplier"] = max(0.5, min(2.0, AI_PARAMS["size_multiplier"]))
 
         except Exception as e:
             log_once("ai", str(e))
@@ -198,7 +200,7 @@ def can_buy(m):
         return False
     return True
 
-async def buy(m, a):
+async def buy(m, a, combo):
     if not can_buy(m):
         return
 
@@ -206,13 +208,10 @@ async def buy(m, a):
     if not price:
         return
 
-    combo = a * wallet_score(m)
     size = MAX_POSITION_SOL * max(0.2, combo * 8) * AI_PARAMS["size_multiplier"]
 
     if combo > 0.02:
         size *= 1.3
-    elif combo > 0.01:
-        size *= 1.1
 
     size = max(MIN_POSITION_SOL, min(size, MAX_POSITION_SOL))
 
@@ -230,17 +229,14 @@ async def buy(m, a):
 
     TOKEN_COOLDOWN[m] = now()
     engine.stats["buys"] += 1
-    engine.last_trade = f"BUY {m[:6]}"
-
-    log(f"BUY {m[:6]} alpha={a:.4f} size={size:.6f}")
+    log(f"BUY {m[:6]} combo={combo:.4f}")
 
 async def sell(p):
     price = await get_price(p["token"])
     if not price:
         return
 
-    entry = p["entry_price"]
-    pnl = (price - entry) / entry
+    pnl = (price - p["entry_price"]) / p["entry_price"]
 
     engine.positions.remove(p)
 
@@ -261,12 +257,9 @@ async def monitor():
             if not price:
                 continue
 
-            entry = p["entry_price"]
-            pnl = (price - entry) / entry
-
+            pnl = (price - p["entry_price"]) / p["entry_price"]
             peak = max(p["peak_price"], price)
             p["peak_price"] = peak
-            p["last_price"] = price
             p["pnl_pct"] = pnl
 
             drawdown = (price - peak) / peak if peak else 0
@@ -277,11 +270,38 @@ async def monitor():
 
         await asyncio.sleep(6)
 
+# ================= SOURCES =================
+async def pump():
+    while True:
+        data = await http_get(PUMP_API)
+        if isinstance(data, list):
+            for c in data[:20]:
+                m = c.get("mint")
+                if valid_mint(m):
+                    CANDIDATES.add(m)
+        await asyncio.sleep(10)
+
+async def jup():
+    while True:
+        data = await http_get(JUP_TOKENS_API)
+        if isinstance(data, list):
+            for t in data[:50]:
+                CANDIDATES.add(t.get("address"))
+        await asyncio.sleep(120)
+
+async def mempool_loop():
+    while True:
+        try:
+            await mempool_stream(lambda e: CANDIDATES.add(e.get("mint")))
+        except:
+            await asyncio.sleep(5)
+
 # ================= MAIN =================
 async def main():
-    log("🚀 v1308 FULL BOT START")
+    log("🚀 v1309 FULL BOT START")
 
-    await inject_fallback()
+    for m in FALLBACK_TOKENS:
+        CANDIDATES.add(m)
 
     asyncio.create_task(pump())
     asyncio.create_task(jup())
@@ -291,12 +311,11 @@ async def main():
 
     while True:
         try:
-            if len(CANDIDATES) < 5:
-                await inject_fallback()
+            await build_wallet_graph()
 
-            engine.candidate_count = len(CANDIDATES)
+            ranked = await rank_candidates()
 
-            for m in random.sample(list(CANDIDATES), min(15, len(CANDIDATES))):
+            for m, combo, a, w in ranked:
                 engine.stats["signals"] += 1
 
                 if not await liquidity_ok(m):
@@ -305,19 +324,15 @@ async def main():
                 if not await anti_rug(m):
                     continue
 
-                a = await alpha(m)
-                combo = a * wallet_score(m)
-
-                engine.last_signal = f"{m[:6]} alpha={a:.4f} combo={combo:.4f}"
+                engine.last_signal = f"{m[:6]} a={a:.4f} w={w:.2f} c={combo:.4f}"
 
                 if combo > AI_PARAMS["entry_threshold"]:
-                    await buy(m, a)
+                    await buy(m, a, combo)
 
             await asyncio.sleep(6)
 
         except Exception as e:
             engine.stats["errors"] += 1
-            engine.bot_error = str(e)
             log(f"ERR {e}")
             await asyncio.sleep(5)
 
