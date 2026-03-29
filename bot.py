@@ -1,4 +1,4 @@
-# ================= v1301_REAL_MARKET_BOT (最終修正版 - 2026.03) =================
+# ================= v1301_REAL_MARKET_BOT (完整補齊版 - 2026.03) =================
 import asyncio
 import time
 import random
@@ -112,6 +112,23 @@ async def get_liquidity_and_impact(mint: str):
     except Exception:
         return 0, 1.0
 
+# ================= FILTER =================
+async def liquidity_ok(mint: str) -> bool:
+    out, impact = await get_liquidity_and_impact(mint)
+    return out > 5000 and impact < 0.40   # 提高流動性門檻
+
+async def anti_rug(mint: str) -> bool:
+    try:
+        r = await HTTP.get(
+            "https://lite-api.jup.ag/swap/v1/quote",
+            params={"inputMint": mint, "outputMint": SOL, "amount": "1000000"},
+        )
+        if r.status_code != 200:
+            return False
+        return int(r.json().get("outAmount", 0) or 0) > 0
+    except Exception:
+        return False
+
 # ================= TOKEN SOURCES =================
 async def pump_scanner():
     while True:
@@ -157,7 +174,7 @@ async def refresh_token_universe():
 async def alpha_engine(mint: str) -> float:
     try:
         p1 = await get_price(mint)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.08)
         p2 = await get_price(mint)
         if not p1 or not p2 or p1 <= 0:
             return 0.01
@@ -167,15 +184,14 @@ async def alpha_engine(mint: str) -> float:
         return 0.01
 
 def pick_engine(alpha: float) -> str:
-    """修正版：確保 weights 是 list"""
     if alpha > 0.07:
         return "sniper"
     if alpha > 0.03:
         return random.choices(["stable", "degen", "sniper"], weights=[0.2, 0.5, 0.3])[0]
     
-    # 強制轉成 list，避免 slice 錯誤
-    weights = [ENGINE_ALLOCATOR["stable"], ENGINE_ALLOCATOR["degen"], ENGINE_ALLOCATOR["sniper"]]
-    return random.choices(["stable", "degen", "sniper"], weights=weights)[0]
+    # 強制轉 list，避免 slice 錯誤
+    weights_list = [ENGINE_ALLOCATOR["stable"], ENGINE_ALLOCATOR["degen"], ENGINE_ALLOCATOR["sniper"]]
+    return random.choices(["stable", "degen", "sniper"], weights=weights_list)[0]
 
 def update_allocator():
     engine.engine_stats = ENGINE_STATS.copy()
@@ -200,7 +216,7 @@ async def buy(mint: str, alpha: float) -> bool:
     if not price or price <= 0:
         return False
 
-    s = MAX_POSITION_SOL * 0.6   # 簡化大小控制
+    s = MAX_POSITION_SOL * min(1.0, alpha * 8)
     amount = s / price
 
     engine.positions.append({
@@ -217,7 +233,7 @@ async def buy(mint: str, alpha: float) -> bool:
     TOKEN_COOLDOWN[mint] = now()
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {mint[:8]}"
-    log(f"BUY {mint[:8]} eng={eng} alpha={alpha:.4f}")
+    log(f"BUY {mint[:8]} eng={eng} alpha={alpha:.4f} size={s:.6f}")
     return True
 
 async def sell(p: dict) -> None:
@@ -256,7 +272,7 @@ async def monitor_positions():
             log(f"MONITOR ERROR: {e}")
         await asyncio.sleep(6)
 
-# ================= MAIN =================
+# ================= MAIN LOOP =================
 async def main():
     log("🚀 v1301_REAL_MARKET_BOT 已啟動 (PAPER MODE)")
     asyncio.create_task(pump_scanner())
@@ -269,7 +285,7 @@ async def main():
             update_allocator()
 
             for mint in list(CANDIDATES)[:10]:
-                if await liquidity_ok(mint) and await anti_rug(mint):   # 需補 liquidity_ok 和 anti_rug
+                if await liquidity_ok(mint) and await anti_rug(mint):
                     alpha = await alpha_engine(mint)
                     if alpha > 0.012:
                         await buy(mint, alpha)
