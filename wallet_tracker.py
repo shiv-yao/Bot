@@ -1,6 +1,7 @@
 import time
 from collections import defaultdict
 import httpx
+import asyncio
 
 HTTP = httpx.AsyncClient(timeout=10)
 
