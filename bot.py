@@ -1,4 +1,4 @@
-# ================= v1314 REAL TRADING (JUP V2 ORDER + EXECUTE) =================
+# ================= v1314 REAL TRADING HARDENED FINAL (JUP V2 ORDER + EXECUTE) =================
 import os
 import json
 import time
@@ -32,15 +32,31 @@ MAX_POSITION_SOL = float(os.environ.get("MAX_POSITION_SOL", "0.0025"))
 MIN_POSITION_SOL = float(os.environ.get("MIN_POSITION_SOL", "0.001"))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 
-PUMP_API = "https://frontend-api.pump.fun/coins/latest"
-JUP_TOKENS_API = "https://token.jup.ag/all"
-JUP_BASE_API = "https://api.jup.ag/swap/v2"
+PUMP_API = os.environ.get("PUMP_API", "https://frontend-api.pump.fun/coins/latest")
+JUP_TOKENS_API = os.environ.get("JUP_TOKENS_API", "https://token.jup.ag/all")
+JUP_BASE_API = os.environ.get("JUP_BASE_API", "https://api.jup.ag/swap/v2")
 JUP_ORDER_API = f"{JUP_BASE_API}/order"
 JUP_EXECUTE_API = f"{JUP_BASE_API}/execute"
 
-RPC_HTTP = os.environ.get("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com")
-RPC_WS = os.environ.get("SOLANA_RPC_WS", "wss://api.mainnet-beta.solana.com")
-JITO_BUNDLE_URL = os.environ.get("JITO_BUNDLE_URL", "")
+RPC_HTTPS = [
+    x.strip()
+    for x in os.environ.get(
+        "SOLANA_RPC_HTTPS",
+        os.environ.get("SOLANA_RPC_HTTP", "https://api.mainnet-beta.solana.com"),
+    ).split(",")
+    if x.strip()
+]
+
+RPC_WSS = [
+    x.strip()
+    for x in os.environ.get(
+        "SOLANA_RPC_WSS",
+        os.environ.get("SOLANA_RPC_WS", "wss://api.mainnet-beta.solana.com"),
+    ).split(",")
+    if x.strip()
+]
+
+JITO_BUNDLE_URL = os.environ.get("JITO_BUNDLE_URL", "").strip()
 USE_JITO = os.environ.get("USE_JITO", "false").lower() == "true"
 
 REAL_TRADING = os.environ.get("REAL_TRADING", "false").lower() == "true"
@@ -49,7 +65,31 @@ JUP_API_KEY = os.environ.get("JUP_API_KEY", "").strip()
 PRIVATE_KEY_JSON = os.environ.get("PRIVATE_KEY_JSON", "").strip()
 PRIVATE_KEY_B58 = os.environ.get("PRIVATE_KEY_B58", "").strip()
 
+RPC_MAX_CONCURRENCY = int(os.environ.get("RPC_MAX_CONCURRENCY", "6"))
+RPC_TIMEOUT = float(os.environ.get("RPC_TIMEOUT", "12"))
+RPC_RETRY = int(os.environ.get("RPC_RETRY", "4"))
+WS_RECV_TIMEOUT = int(os.environ.get("WS_RECV_TIMEOUT", "45"))
+WS_BACKOFF_MIN = int(os.environ.get("WS_BACKOFF_MIN", "2"))
+WS_BACKOFF_MAX = int(os.environ.get("WS_BACKOFF_MAX", "20"))
+
+EARLY_LIQ_MIN_OUT = int(os.environ.get("EARLY_LIQ_MIN_OUT", "1"))
+EARLY_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("EARLY_LIQ_MAX_PRICE_IMPACT", "0.60"))
+STRICT_LIQ_MAX_PRICE_IMPACT = float(os.environ.get("STRICT_LIQ_MAX_PRICE_IMPACT", "0.30"))
+
+FORCE_EARLY_ENTRY = os.environ.get("FORCE_EARLY_ENTRY", "true").lower() == "true"
+EARLY_ENTRY_BONUS = float(os.environ.get("EARLY_ENTRY_BONUS", "0.012"))
+
 HTTP = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+
+# ================= RPC POOL STATE =================
+RPC_ROLE_INDEX = {
+    "default": 0,
+    "confirm": 0,
+    "send": 0,
+    "ws": 0,
+}
+RPC_BAD_UNTIL = {}
+RPC_SEM = asyncio.Semaphore(RPC_MAX_CONCURRENCY)
 
 # ================= WALLET =================
 def load_keypair():
@@ -114,8 +154,21 @@ STRATEGY_LOCAL_STATS = {
     "sniper": {"trades": 0, "wins": 0, "pnl": 0.0},
 }
 
+# ================= MEMPOOL / EARLY LIQ STATE =================
+SNIPER_CACHE = set()
+RECENT_MEMPOOL_MINTS = {}
+EARLY_LIQ_CACHE = {}
+WATCH_PROGRAMS = set(filter(None, [
+    os.environ.get("WATCH_PROGRAM_1", ""),
+    os.environ.get("WATCH_PROGRAM_2", ""),
+]))
+
 # ================= UTIL =================
 def now() -> float:
+    return time.time()
+
+
+def rpc_now() -> float:
     return time.time()
 
 
@@ -200,6 +253,65 @@ def repair():
     if not hasattr(engine, "bot_error"):
         engine.bot_error = ""
 
+
+def pick_rpc_http(role="default"):
+    if not RPC_HTTPS:
+        raise RuntimeError("NO_RPC_HTTP_CONFIG")
+
+    start = RPC_ROLE_INDEX.get(role, 0)
+    n = len(RPC_HTTPS)
+
+    for i in range(n):
+        idx = (start + i) % n
+        url = RPC_HTTPS[idx]
+        if rpc_now() >= RPC_BAD_UNTIL.get(url, 0):
+            RPC_ROLE_INDEX[role] = (idx + 1) % n
+            return url
+
+    idx = start % n
+    RPC_ROLE_INDEX[role] = (idx + 1) % n
+    return RPC_HTTPS[idx]
+
+
+def pick_rpc_ws():
+    if not RPC_WSS:
+        raise RuntimeError("NO_RPC_WS_CONFIG")
+
+    start = RPC_ROLE_INDEX.get("ws", 0)
+    n = len(RPC_WSS)
+
+    for i in range(n):
+        idx = (start + i) % n
+        url = RPC_WSS[idx]
+        if rpc_now() >= RPC_BAD_UNTIL.get(url, 0):
+            RPC_ROLE_INDEX["ws"] = (idx + 1) % n
+            return url
+
+    idx = start % n
+    RPC_ROLE_INDEX["ws"] = (idx + 1) % n
+    return RPC_WSS[idx]
+
+
+def mark_rpc_bad(url: str, cooldown: int = 20):
+    RPC_BAD_UNTIL[url] = rpc_now() + cooldown
+
+
+def is_rate_limit_error_text(s: str) -> bool:
+    s = str(s).lower()
+    return (
+        "429" in s
+        or "rate limit" in s
+        or "too many requests" in s
+        or "timeout" in s
+        or "temporarily unavailable" in s
+    )
+
+
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
 # ================= HTTP =================
 def jup_headers():
     headers = {"Accept": "application/json"}
@@ -209,37 +321,92 @@ def jup_headers():
 
 
 async def http_get_json(url, params=None, headers=None):
-    try:
-        r = await HTTP.get(url, params=params, headers=headers)
-        if r.status_code != 200:
+    last_err = None
+    for attempt in range(RPC_RETRY):
+        try:
+            async with RPC_SEM:
+                r = await HTTP.get(url, params=params, headers=headers)
+
+            if r.status_code == 200:
+                return r.json()
+
+            last_err = f"GET {url} status={r.status_code}"
+            if r.status_code in (408, 425, 429, 500, 502, 503, 504):
+                await asyncio.sleep(min(1.5 * (attempt + 1), 5))
+                continue
             return None
-        return r.json()
-    except Exception:
-        return None
+
+        except Exception as e:
+            last_err = str(e)
+            await asyncio.sleep(min(1.2 * (attempt + 1), 5))
+
+    log_once(f"http_get_{url}", f"HTTP_GET_ERR {last_err}", 20)
+    return None
 
 
 async def http_post_json(url, payload=None, headers=None):
-    try:
-        r = await HTTP.post(url, json=payload, headers=headers)
-        if r.status_code != 200:
+    last_err = None
+    for attempt in range(RPC_RETRY):
+        try:
+            async with RPC_SEM:
+                r = await HTTP.post(url, json=payload, headers=headers)
+
+            if r.status_code == 200:
+                return r.json()
+
+            last_err = f"POST {url} status={r.status_code}"
+            if r.status_code in (408, 425, 429, 500, 502, 503, 504):
+                await asyncio.sleep(min(1.5 * (attempt + 1), 5))
+                continue
             return None
-        return r.json()
-    except Exception:
-        return None
+
+        except Exception as e:
+            last_err = str(e)
+            await asyncio.sleep(min(1.2 * (attempt + 1), 5))
+
+    log_once(f"http_post_{url}", f"HTTP_POST_ERR {last_err}", 20)
+    return None
 
 
-async def rpc_post(method: str, params):
-    try:
-        r = await HTTP.post(
-            RPC_HTTP,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        )
-        if r.status_code != 200:
+async def rpc_post(method: str, params, role: str = "default"):
+    last_err = None
+
+    for attempt in range(RPC_RETRY):
+        rpc_url = pick_rpc_http(role)
+
+        try:
+            async with RPC_SEM:
+                r = await HTTP.post(
+                    rpc_url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                    timeout=RPC_TIMEOUT,
+                )
+
+            if r.status_code == 200:
+                data = r.json()
+                if "error" in data and data["error"]:
+                    err_txt = str(data["error"])
+                    if is_rate_limit_error_text(err_txt):
+                        mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
+                        await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+                        continue
+                return data.get("result")
+
+            last_err = f"{rpc_url} status={r.status_code}"
+            if r.status_code in (408, 425, 429, 500, 502, 503, 504):
+                mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
+                await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+                continue
+
             return None
-        data = r.json()
-        return data.get("result")
-    except Exception:
-        return None
+
+        except Exception as e:
+            last_err = f"{rpc_url} {e}"
+            mark_rpc_bad(rpc_url, cooldown=20 + attempt * 5)
+            await asyncio.sleep(min(1.0 * (attempt + 1), 4))
+
+    log_once(f"rpc_{method}", f"RPC_ERR {method} {last_err}", 20)
+    return None
 
 # ================= TOKEN META =================
 async def preload_token_decimals():
@@ -276,10 +443,6 @@ async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int)
 
 
 def sign_transaction_base64(tx_b64: str) -> str:
-    """
-    Keep any placeholder / existing signatures and only replace the taker signature.
-    This is safer for JupiterZ / RFQ style routes than rebuilding from scratch.
-    """
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
     msg_bytes = solders_message.to_bytes_versioned(raw_tx.message)
     taker_sig = KEYPAIR.sign_message(msg_bytes)
@@ -295,12 +458,6 @@ def sign_transaction_base64(tx_b64: str) -> str:
 
 
 async def jupiter_execute(order: dict):
-    """
-    Official Jupiter flow:
-    1) GET /order
-    2) sign returned transaction locally
-    3) POST /execute with signedTransaction + requestId
-    """
     tx_b64 = order.get("transaction")
     request_id = order.get("requestId")
     last_valid_block_height = order.get("lastValidBlockHeight")
@@ -346,19 +503,33 @@ async def jupiter_execute(order: dict):
 
 async def confirm_signature(signature: str, timeout_sec: int = 35):
     deadline = now() + timeout_sec
+    sleep_sec = 1.2
+
     while now() < deadline:
         result = await rpc_post(
             "getSignatureStatuses",
             [[signature], {"searchTransactionHistory": True}],
+            role="confirm",
         )
+
         if result and result.get("value"):
             item = result["value"][0]
-            if item and item.get("confirmationStatus") in ("confirmed", "finalized"):
-                return True
-        await asyncio.sleep(1.5)
+            if item:
+                status = item.get("confirmationStatus")
+                err = item.get("err")
+                if err:
+                    log_once(f"confirm_err_{signature}", f"CONFIRM_ERR {signature[:10]} {err}", 30)
+                    return False
+                if status in ("confirmed", "finalized"):
+                    return True
+
+        await asyncio.sleep(sleep_sec)
+        sleep_sec = min(2.2, sleep_sec + 0.2)
+
+    log_once(f"confirm_timeout_{signature}", f"CONFIRM_TIMEOUT {signature[:10]}", 30)
     return False
 
-# optional hook, kept
+
 async def jito_send_bundle(serialized_txs):
     if not USE_JITO or not JITO_BUNDLE_URL:
         return {"ok": False, "reason": "JITO_DISABLED"}
@@ -370,7 +541,8 @@ async def jito_send_bundle(serialized_txs):
             "method": "sendBundle",
             "params": [serialized_txs],
         }
-        r = await HTTP.post(JITO_BUNDLE_URL, json=payload)
+        async with RPC_SEM:
+            r = await HTTP.post(JITO_BUNDLE_URL, json=payload)
         if r.status_code != 200:
             return {"ok": False, "reason": f"http_{r.status_code}"}
         return {"ok": True, "result": r.json()}
@@ -385,6 +557,8 @@ async def get_price(m):
     data = await jupiter_order(m, SOL, 1_000_000)
     if not data:
         return None
+    if data.get("errorCode") or data.get("error"):
+        return None
 
     out_amount = ensure_int(data.get("outAmount"), 0)
     price = (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
@@ -392,14 +566,65 @@ async def get_price(m):
     return price
 
 
+async def early_liquidity_ok(m):
+    cache = EARLY_LIQ_CACHE.get(m)
+    if cache and now() - cache["ts"] < 15:
+        return cache["ok"]
+
+    test_sizes = [500_000, 1_000_000, 2_000_000]
+
+    ok = False
+    for amt in test_sizes:
+        data = await jupiter_order(SOL, m, amt)
+        if not data:
+            continue
+        if data.get("errorCode") or data.get("error"):
+            continue
+
+        out_amount = ensure_int(data.get("outAmount"), 0)
+        price_impact = ensure_float(data.get("priceImpactPct"), 999)
+
+        if out_amount >= EARLY_LIQ_MIN_OUT and price_impact < EARLY_LIQ_MAX_PRICE_IMPACT:
+            ok = True
+            break
+
+    EARLY_LIQ_CACHE[m] = {"ok": ok, "ts": now()}
+    return ok
+
+
 async def liquidity_ok(m):
-    data = await jupiter_order(SOL, m, 10_000_000)
-    return bool(data and ensure_int(data.get("outAmount"), 0) > 5000)
+    cache = EARLY_LIQ_CACHE.get(f"strict:{m}")
+    if cache and now() - cache["ts"] < 15:
+        return cache["ok"]
+
+    test_sizes = [2_000_000, 5_000_000, 10_000_000]
+
+    ok = False
+    for amt in test_sizes:
+        data = await jupiter_order(SOL, m, amt)
+        if not data:
+            continue
+        if data.get("errorCode") or data.get("error"):
+            continue
+
+        out_amount = ensure_int(data.get("outAmount"), 0)
+        price_impact = ensure_float(data.get("priceImpactPct"), 999)
+
+        if out_amount > 0 and price_impact < STRICT_LIQ_MAX_PRICE_IMPACT:
+            ok = True
+            break
+
+    EARLY_LIQ_CACHE[f"strict:{m}"] = {"ok": ok, "ts": now()}
+    return ok
 
 
 async def anti_rug(m):
     data = await jupiter_order(m, SOL, 1_000_000)
-    return bool(data and ensure_int(data.get("outAmount"), 0) > 0)
+    if not data:
+        return False
+    if data.get("errorCode") or data.get("error"):
+        return False
+    return ensure_int(data.get("outAmount"), 0) > 0
 
 # ================= WALLET GRAPH =================
 async def build_wallet_graph():
@@ -410,8 +635,9 @@ async def build_wallet_graph():
     LAST_WALLET_GRAPH_TS = now()
 
     try:
-        wallets = await extract_wallets_from_mints(RPC_HTTP, list(CANDIDATES)[-20:])
-        behaviors = await track_wallet_behavior(RPC_HTTP, wallets)
+        rpc_for_graph = pick_rpc_http("default")
+        wallets = await extract_wallets_from_mints(rpc_for_graph, list(CANDIDATES)[-20:])
+        behaviors = await track_wallet_behavior(rpc_for_graph, wallets)
 
         for item in behaviors:
             wallet = item["wallet"]
@@ -431,32 +657,46 @@ def wallet_score(m):
     return min(score, 3.0)
 
 # ================= TRUE MEMPOOL SNIPER =================
-SNIPER_CACHE = set()
-RECENT_MEMPOOL_MINTS = {}
-WATCH_PROGRAMS = set(filter(None, [
-    os.environ.get("WATCH_PROGRAM_1", ""),
-    os.environ.get("WATCH_PROGRAM_2", ""),
-]))
-
-
 async def mempool_decode_loop():
+    backoff = 3
     while True:
         try:
-            await mempool_stream(lambda e: add_candidate(e.get("mint"), source="mempool"))
+            async def _cb(e):
+                mint = None
+                if isinstance(e, dict):
+                    mint = e.get("mint")
+                if valid_mint(mint):
+                    RECENT_MEMPOOL_MINTS[mint] = now()
+                    await add_candidate(mint, source="mempool")
+
+            await _maybe_await(mempool_stream(_cb))
+            backoff = 3
         except Exception as e:
-            log_once("mempool_stream", f"MEMPOOL_STREAM_ERR {e}", 30)
-            await asyncio.sleep(5)
+            log_once("mempool_stream", f"MEMPOOL_STREAM_ERR {e}", 15)
+            await asyncio.sleep(backoff)
+            backoff = min(20, backoff * 2)
 
 
 async def mempool_logs_subscribe_loop():
     if not WATCH_PROGRAMS:
         return
 
+    backoff = WS_BACKOFF_MIN
+
     while True:
+        ws_url = None
         try:
             import websockets
 
-            async with websockets.connect(RPC_WS, ping_interval=20, ping_timeout=20) as ws:
+            ws_url = pick_rpc_ws()
+
+            async with websockets.connect(
+                ws_url,
+                ping_interval=15,
+                ping_timeout=15,
+                close_timeout=5,
+                max_size=2**20,
+            ) as ws:
                 sub_ids = []
 
                 for program_id in WATCH_PROGRAMS:
@@ -474,18 +714,20 @@ async def mempool_logs_subscribe_loop():
                     if "result" in resp:
                         sub_ids.append(resp["result"])
 
-                log_once("mempool_logs", f"LOGS_SUB_READY {len(sub_ids)}", 60)
+                log_once("mempool_logs_ready", f"LOGS_SUB_READY {len(sub_ids)} via={ws_url}", 30)
+                backoff = WS_BACKOFF_MIN
 
                 while True:
-                    raw = await ws.recv()
+                    raw = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
                     msg = json.loads(raw)
+
                     params = msg.get("params", {})
                     result = params.get("result", {})
                     value = result.get("value", {})
                     logs = value.get("logs", []) or []
 
                     for line in logs:
-                        parts = str(line).split()
+                        parts = str(line).replace(",", " ").replace(":", " ").split()
                         for part in parts:
                             if valid_mint(part):
                                 RECENT_MEMPOOL_MINTS[part] = now()
@@ -493,8 +735,11 @@ async def mempool_logs_subscribe_loop():
                                 break
 
         except Exception as e:
-            log_once("mempool_logs", f"LOGS_SUB_ERR {e}", 30)
-            await asyncio.sleep(5)
+            if ws_url:
+                mark_rpc_bad(ws_url, cooldown=30)
+            log_once("mempool_logs_err", f"LOGS_SUB_ERR {e}", 15)
+            await asyncio.sleep(backoff)
+            backoff = min(WS_BACKOFF_MAX, backoff * 2)
 
 
 async def sniper_bonus(m):
@@ -507,6 +752,9 @@ async def sniper_bonus(m):
 
     if m in RECENT_MEMPOOL_MINTS and now() - RECENT_MEMPOOL_MINTS[m] < 30:
         bonus += 0.02
+
+    if FORCE_EARLY_ENTRY and await early_liquidity_ok(m):
+        bonus += EARLY_ENTRY_BONUS
 
     if bonus > 0:
         SNIPER_CACHE.add(m)
@@ -543,7 +791,7 @@ def position_size(combo):
 
 async def rank_candidates():
     ranked = []
-    for m in list(CANDIDATES):
+    for m in list(CANDIDATES)[-40:]:
         try:
             a = await alpha(m)
             w = wallet_score(m)
@@ -713,6 +961,10 @@ async def buy(m, a, combo, w, s):
             exec_result = await jupiter_execute(order)
             tx_sig = exec_result.get("signature")
             tx_meta = exec_result.get("result")
+
+            if USE_JITO and JITO_BUNDLE_URL and exec_result.get("signed_transaction"):
+                asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
+
         except Exception as e:
             log_once("buy_exec", f"BUY_EXEC_ERR {m[:6]} {e}", 15)
             return
@@ -779,8 +1031,13 @@ async def sell(p):
                 exec_result = await jupiter_execute(order)
                 tx_sig = exec_result.get("signature")
                 tx_meta = exec_result.get("result")
+
+                if USE_JITO and JITO_BUNDLE_URL and exec_result.get("signed_transaction"):
+                    asyncio.create_task(jito_send_bundle([exec_result["signed_transaction"]]))
+
                 if tx_sig:
                     await confirm_signature(tx_sig)
+
             except Exception as e:
                 log_once("sell_exec", f"SELL_EXEC_ERR {p['token'][:6]} {e}", 15)
         else:
@@ -916,7 +1173,11 @@ async def main():
     await preload_token_decimals()
 
     mode = "REAL" if real_trading_ready() else "PAPER"
-    log(f"🚀 v1314 START mode={mode}")
+    log(
+        f"🚀 v1314 START mode={mode} "
+        f"http_rpcs={len(RPC_HTTPS)} ws_rpcs={len(RPC_WSS)} "
+        f"use_jito={USE_JITO}"
+    )
 
     if REAL_TRADING and not real_trading_ready():
         log("REAL_TRADING requested but PRIVATE_KEY_B58/PRIVATE_KEY_JSON or JUP_API_KEY invalid; falling back to PAPER")
@@ -949,7 +1210,12 @@ async def main():
                 engine.stats["signals"] += 1
 
                 liq_ok = await liquidity_ok(m)
-                if not liq_ok:
+                early_ok = False
+
+                if not liq_ok and FORCE_EARLY_ENTRY:
+                    early_ok = await early_liquidity_ok(m)
+
+                if not liq_ok and not early_ok:
                     log_once(
                         f"skip_liq_{m}",
                         f"SKIP {m[:6]} NO_LIQ combo={combo:.4f}",
@@ -966,22 +1232,24 @@ async def main():
                     )
                     continue
 
+                effective_combo = combo + (EARLY_ENTRY_BONUS if early_ok and not liq_ok else 0.0)
+
                 engine.last_signal = (
                     f"{m[:6]} a={a:.4f} w={w:.2f} s={s:.4f} "
-                    f"c={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}"
+                    f"c={effective_combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}"
                 )
 
-                if combo > AI_PARAMS["entry_threshold"]:
+                if effective_combo > AI_PARAMS["entry_threshold"]:
                     log_once(
                         f"try_buy_{m}",
-                        f"TRY_BUY {m[:6]} combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
+                        f"TRY_BUY {m[:6]} combo={effective_combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
                         15,
                     )
-                    await buy(m, a, combo, w, s)
+                    await buy(m, a, effective_combo, w, s)
                 else:
                     log_once(
                         f"skip_thr_{m}",
-                        f"SKIP {m[:6]} THRESHOLD combo={combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
+                        f"SKIP {m[:6]} THRESHOLD combo={effective_combo:.4f} thr={AI_PARAMS['entry_threshold']:.4f}",
                         30,
                     )
 
