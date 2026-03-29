@@ -192,8 +192,6 @@ def wallet_score(mint: str) -> float:
     return base * decay
 
 
-# ================= discovery helpers =================
-
 async def extract_wallets_from_mints(rpc_url: str, mints):
     wallets = set()
 
