@@ -11,8 +11,6 @@ from state import engine
 BOT_TASK = None
 
 
-# ================= SAFE HELPERS =================
-
 def ensure_list(x):
     return x if isinstance(x, list) else []
 
@@ -38,8 +36,6 @@ def ensure_str(x, default=""):
         return default
 
 
-# ================= INIT =================
-
 def init_engine():
     engine.running = bool(getattr(engine, "running", True))
     engine.mode = ensure_str(getattr(engine, "mode", "PAPER"), "PAPER")
@@ -54,6 +50,7 @@ def init_engine():
         "buys": ensure_int(raw_stats.get("buys", 0)),
         "sells": ensure_int(raw_stats.get("sells", 0)),
         "errors": ensure_int(raw_stats.get("errors", 0)),
+        "adds": ensure_int(raw_stats.get("adds", 0)),
     }
 
     engine.last_trade = ensure_str(getattr(engine, "last_trade", ""))
@@ -105,8 +102,6 @@ def log(msg: str):
     print(f"[APP] {msg}")
 
 
-# ================= BOT =================
-
 async def start_bot():
     global BOT_TASK
     init_engine()
@@ -116,7 +111,6 @@ async def start_bot():
 
     try:
         from bot import bot_loop
-
         BOT_TASK = asyncio.create_task(bot_loop(), name="bot_loop_task")
         engine.bot_ok = True
         engine.bot_error = ""
@@ -151,8 +145,6 @@ async def stop_bot():
     BOT_TASK = None
 
 
-# ================= LIFESPAN =================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_engine()
@@ -165,8 +157,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
-# ================= HELPERS =================
 
 def normalize_position(p: dict):
     if not isinstance(p, dict):
@@ -219,8 +209,6 @@ def normalize_trade(x):
     }
 
 
-# ================= API =================
-
 @app.get("/health")
 def health():
     init_engine()
@@ -270,8 +258,6 @@ async def restart_bot():
     }
 
 
-# ================= UI =================
-
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -280,7 +266,7 @@ def home():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Quant Dashboard v1302</title>
+<title>Quant Dashboard v1305 Pro</title>
 <style>
 body {
   background: #0b1020;
@@ -304,27 +290,16 @@ body {
   border-radius: 10px;
   overflow: auto;
 }
-.full {
-  grid-column: 1 / -1;
-}
-.two {
-  grid-column: span 2;
-}
-h2 {
-  margin-top: 0;
-}
-.small {
-  font-size: 12px;
-  color: #9fb0d1;
-}
+.full { grid-column: 1 / -1; }
+.two { grid-column: span 2; }
+h2 { margin-top: 0; }
+.small { font-size: 12px; color: #9fb0d1; }
 pre {
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
 }
-.row {
-  margin-bottom: 8px;
-}
+.row { margin-bottom: 8px; }
 button {
   background: #1f6feb;
   color: white;
@@ -333,9 +308,7 @@ button {
   padding: 10px 14px;
   cursor: pointer;
 }
-button:hover {
-  opacity: 0.92;
-}
+button:hover { opacity: 0.92; }
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr 1fr; }
   .two { grid-column: span 2; }
@@ -348,7 +321,7 @@ button:hover {
 </head>
 <body>
 <div class="wrap">
-  <h2>Quant Dashboard v1302</h2>
+  <h2>Quant Dashboard v1305 Pro</h2>
   <div style="margin-bottom: 12px;">
     <button onclick="restartBot()">Restart Bot</button>
   </div>
@@ -505,8 +478,6 @@ setInterval(load, 2000);
 </html>
     """
 
-
-# ================= RUN =================
 
 if __name__ == "__main__":
     import uvicorn
