@@ -1,5 +1,6 @@
 import os
 import asyncio
+from init_engine import init_engine
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
