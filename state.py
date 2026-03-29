@@ -8,8 +8,6 @@ class EngineState:
         self._lock = threading.Lock()
         self.reset()
 
-    # ================= SAFE CAST =================
-
     def _ensure_list(self, x):
         return x if isinstance(x, list) else []
 
@@ -33,8 +31,6 @@ class EngineState:
             return int(x)
         except Exception:
             return default
-
-    # ================= RESET =================
 
     def reset(self):
         with self._lock:
@@ -77,8 +73,6 @@ class EngineState:
 
             self.candidate_count = 0
 
-    # ================= SELF-HEAL =================
-
     def repair(self):
         with self._lock:
             self.running = bool(getattr(self, "running", True))
@@ -94,7 +88,6 @@ class EngineState:
                 p for p in self._ensure_list(getattr(self, "positions", []))
                 if isinstance(p, dict)
             ]
-
             self.trade_history = self._ensure_list(getattr(self, "trade_history", []))
 
             current_logs = getattr(self, "logs", deque(maxlen=300))
@@ -146,8 +139,6 @@ class EngineState:
 
             self.candidate_count = self._ensure_int(getattr(self, "candidate_count", 0), 0)
 
-    # ================= LOG / ERROR =================
-
     def log(self, message: str):
         with self._lock:
             if not isinstance(self.logs, deque):
@@ -170,8 +161,6 @@ class EngineState:
         with self._lock:
             self.bot_ok = True
             self.bot_error = ""
-
-    # ================= SNAPSHOT =================
 
     def snapshot(self):
         self.repair()
