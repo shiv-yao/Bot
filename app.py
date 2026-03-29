@@ -1,47 +1,45 @@
-# ================= v1317 DEBUG FIXED APP =================
+# ================= v1318 SEMI-LIVE TRADING =================
 import asyncio
 import time
+import random
 from collections import defaultdict
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-
 from state import engine
 
 # ================= GLOBAL =================
 CANDIDATES = set()
-CANDIDATE_META = {}
 TOKEN_COOLDOWN = defaultdict(float)
 
 IN_FLIGHT_BUY = set()
 IN_FLIGHT_SELL = set()
 
-SMART_MONEY = {}
-SMART_MONEY_SCORE = {}
-
 LAST_LOG = {}
 
 # ================= CONFIG =================
-MAX_POSITIONS = 5
-MIN_POSITION_SOL = 0.001
-MAX_POSITION_SOL = 0.003
-BUY_SIZE_SOL = 0.0015
+MAX_POSITIONS = 2
+BASE_SIZE = 0.0015
+
+ENTRY_THRESHOLD = 0.03
+MIN_THRESHOLD = 0.015
+MAX_THRESHOLD = 0.08
+
+TAKE_PROFIT = 0.12
+STOP_LOSS = -0.05
 
 # ================= UTIL =================
 def now():
     return time.time()
 
 def ensure_engine():
-    if not hasattr(engine, "positions") or not isinstance(engine.positions, list):
+    if not hasattr(engine, "positions"):
         engine.positions = []
-    if not hasattr(engine, "trade_history") or not isinstance(engine.trade_history, list):
+    if not hasattr(engine, "trade_history"):
         engine.trade_history = []
-    if not hasattr(engine, "logs") or not isinstance(engine.logs, list):
+    if not hasattr(engine, "logs"):
         engine.logs = []
-    if not hasattr(engine, "stats") or not isinstance(engine.stats, dict):
+    if not hasattr(engine, "stats"):
         engine.stats = {"buys": 0, "sells": 0, "errors": 0}
-    if not hasattr(engine, "candidate_count"):
-        engine.candidate_count = 0
 
 def log(msg):
     ensure_engine()
@@ -54,23 +52,28 @@ def log_once(key, msg, sec=10):
         LAST_LOG[key] = now()
         log(msg)
 
-# ================= MOCK PRICE =================
-async def get_price(m):
-    # 穩定一點的假價格
-    base = abs(hash(m)) % 1000
-    return 0.0001 + base / 1e7
+# ================= PRICE（模擬波動） =================
+PRICE_CACHE = {}
 
-# ================= ALPHA（加速版） =================
+async def get_price(m):
+    base = abs(hash(m)) % 1000 / 1e7
+
+    noise = (time.time() % 1) * 0.00002
+    drift = random.uniform(-0.00001, 0.00002)
+
+    price = 0.0001 + base + noise + drift
+
+    PRICE_CACHE[m] = price
+    return price
+
+# ================= ALPHA =================
 async def alpha(m):
     p1 = await get_price(m)
-    if not p1:
-        return 0.0
-
-    await asyncio.sleep(0.15)
-
+    await asyncio.sleep(0.2)
     p2 = await get_price(m)
-    if not p2:
-        return 0.0
+
+    if not p1 or not p2:
+        return 0
 
     return (p2 - p1) / p1
 
@@ -79,100 +82,53 @@ def wallet_score(m):
     return 1.0
 
 async def sniper_bonus(m):
-    return 0.01
-
-# ================= SMART MONEY =================
-def update_smart_money():
-    ensure_engine()
-
-    for t in engine.trade_history[-100:]:
-        w = t.get("wallet")
-        pnl = t.get("pnl_pct", 0)
-
-        if not w:
-            continue
-
-        if w not in SMART_MONEY:
-            SMART_MONEY[w] = {"pnl": 0, "trades": 0}
-
-        SMART_MONEY[w]["pnl"] += pnl
-        SMART_MONEY[w]["trades"] += 1
-
-    for w, s in SMART_MONEY.items():
-        if s["trades"] >= 3:
-            SMART_MONEY_SCORE[w] = max(0.5, min(3.0, 1 + s["pnl"]))
-
-def smart_money_score(m):
-    return 1.0
-
-def insider_score(m):
-    return 0.02
-
-def cluster_score(m):
-    return 0.02
-
-def fake_pump_filter(m, a, w, s):
-    return not (a > 0.05 and w < 1.1)
+    return random.uniform(0.005, 0.02)
 
 # ================= RANK =================
 async def rank_candidates():
-    update_smart_money()
-
     pool = list(CANDIDATES)
     ranked = []
 
-    for m in pool[:15]:
+    for m in pool[:10]:
         try:
             a = await alpha(m)
             w = wallet_score(m)
             s = await sniper_bonus(m)
 
             combo = a + (w * 0.01) + s
-            combo += (smart_money_score(m) * 0.01)
-            combo += insider_score(m)
-            combo += cluster_score(m)
-
-            if not fake_pump_filter(m, a, w, s):
-                continue
 
             ranked.append((m, combo, a, w, s))
 
-        except Exception as e:
-            log_once(f"rank_err_{m}", f"RANK_ERR {m} {e}", 10)
+        except Exception:
             continue
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    return ranked[:10]
+    return ranked[:5]
 
-# ================= JUP MOCK =================
-async def jupiter_order(a, b, amt):
-    return {
-        "transaction": "ok",
-        "outAmount": amt * 2
-    }
-
-async def safe_jupiter_order(a, b, amt):
-    for _ in range(3):
-        d = await jupiter_order(a, b, amt)
-        if d and d.get("transaction"):
-            return d
-        await asyncio.sleep(0.2)
-    return None
-
-async def safe_jupiter_execute(o):
-    return {"signature": "tx_" + str(time.time())}
+# ================= ORDER =================
+async def safe_order():
+    await asyncio.sleep(0.05)
+    return True
 
 # ================= BUY =================
 def can_buy(m):
-    ensure_engine()
-
     if len(engine.positions) >= MAX_POSITIONS:
         return False
+
     if m in [p["token"] for p in engine.positions]:
         return False
-    if now() - TOKEN_COOLDOWN[m] < 5:
+
+    if now() - TOKEN_COOLDOWN[m] < 20:
         return False
+
     return True
+
+def position_size(combo):
+    if combo > 0.06:
+        return BASE_SIZE * 1.5
+    elif combo > 0.04:
+        return BASE_SIZE
+    return BASE_SIZE * 0.6
 
 async def buy(m, combo):
     if m in IN_FLIGHT_BUY:
@@ -181,34 +137,31 @@ async def buy(m, combo):
     IN_FLIGHT_BUY.add(m)
 
     try:
-        ensure_engine()
-
         if not can_buy(m):
             return
 
-        order = await safe_jupiter_order("SOL", m, 1000)
-        if not order:
-            log_once(f"buy_fail_{m}", f"BUY_FAIL {m}", 5)
+        ok = await safe_order()
+        if not ok:
             return
 
-        exec_res = await safe_jupiter_execute(order)
-        entry_price = await get_price(m)
+        price = await get_price(m)
+        size = position_size(combo)
 
-        pos = {
+        engine.positions.append({
             "token": m,
-            "entry_price": entry_price,
-            "last_price": entry_price,
-            "peak_price": entry_price,
+            "entry_price": price,
+            "last_price": price,
+            "peak_price": price,
             "entry_ts": now(),
-            "signature": exec_res["signature"],
+            "size": size,
             "combo": combo,
-            "pnl_pct": 0.0,
-        }
+            "pnl_pct": 0,
+        })
 
-        engine.positions.append(pos)
         TOKEN_COOLDOWN[m] = now()
         engine.stats["buys"] += 1
-        log(f"BUY {m} combo={combo:.4f}")
+
+        log(f"BUY {m} combo={combo:.4f} size={size:.4f}")
 
     finally:
         IN_FLIGHT_BUY.discard(m)
@@ -223,12 +176,9 @@ async def sell(p):
     IN_FLIGHT_SELL.add(m)
 
     try:
-        ensure_engine()
+        price = await get_price(m)
 
-        exit_price = await get_price(m)
-        pnl = 0.0
-        if p.get("entry_price"):
-            pnl = (exit_price - p["entry_price"]) / p["entry_price"]
+        pnl = (price - p["entry_price"]) / p["entry_price"]
 
         if p in engine.positions:
             engine.positions.remove(p)
@@ -238,78 +188,80 @@ async def sell(p):
             "pnl_pct": pnl,
             "ts": now(),
         })
+
         engine.stats["sells"] += 1
         log(f"SELL {m} pnl={pnl:.4f}")
 
     finally:
         IN_FLIGHT_SELL.discard(m)
 
-# ================= TAKE PROFIT =================
-async def take_profit_logic(p):
-    price = await get_price(p["token"])
-    if not price:
-        return False
-
-    pnl = (price - p["entry_price"]) / p["entry_price"]
-
-    if pnl >= 0.10:
-        return True
-
-    return False
-
 # ================= MONITOR =================
-async def monitor_loop():
+async def monitor():
     while True:
         try:
-            ensure_engine()
-
             for p in list(engine.positions):
                 price = await get_price(p["token"])
-                if not price:
-                    continue
 
                 pnl = (price - p["entry_price"]) / p["entry_price"]
-                peak = max(p.get("peak_price", price), price)
+                peak = max(p["peak_price"], price)
 
-                p["last_price"] = price
                 p["peak_price"] = peak
+                p["last_price"] = price
                 p["pnl_pct"] = pnl
 
-                drawdown = (price - peak) / peak if peak else 0.0
+                drawdown = (price - peak) / peak
 
-                if await take_profit_logic(p):
+                if pnl > TAKE_PROFIT:
                     await sell(p)
                     continue
 
-                if pnl <= -0.05 or drawdown <= -0.05:
+                if pnl < STOP_LOSS or drawdown < STOP_LOSS:
                     await sell(p)
 
         except Exception as e:
-            ensure_engine()
             engine.stats["errors"] += 1
-            log_once("monitor_err", f"MONITOR_ERR {e}", 10)
+            log(f"MONITOR_ERR {e}")
 
         await asyncio.sleep(2)
 
-# ================= LOOP =================
+# ================= AI（自動調參） =================
+async def ai_loop():
+    global ENTRY_THRESHOLD
+
+    while True:
+        try:
+            trades = engine.trade_history[-20:]
+
+            if trades:
+                avg = sum(t["pnl_pct"] for t in trades) / len(trades)
+
+                if avg > 0:
+                    ENTRY_THRESHOLD *= 0.95
+                else:
+                    ENTRY_THRESHOLD *= 1.05
+
+                ENTRY_THRESHOLD = max(MIN_THRESHOLD, min(MAX_THRESHOLD, ENTRY_THRESHOLD))
+
+                log_once("ai", f"AI threshold={ENTRY_THRESHOLD:.4f}", 15)
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(10)
+
+# ================= MAIN =================
 async def main_loop():
     while True:
         try:
-            ensure_engine()
-
-            engine.candidate_count = len(CANDIDATES)
-            log_once("cand", f"CANDIDATE_COUNT {engine.candidate_count}", 5)
-
             ranked = await rank_candidates()
-            log_once("rank", f"RANKED_COUNT {len(ranked)}", 5)
 
-            for m, combo, a, w, s in ranked:
-                log_once(f"rank_{m}", f"RANK {m} combo={combo:.4f} a={a:.4f} w={w:.2f} s={s:.4f}", 8)
-                if combo > 0:
+            log_once("rank", f"RANKED {len(ranked)}", 5)
+
+            for m, combo, *_ in ranked:
+                if combo > ENTRY_THRESHOLD:
                     await buy(m, combo)
 
         except Exception as e:
-            ensure_engine()
             engine.stats["errors"] += 1
             log(f"ERR {e}")
 
@@ -321,47 +273,32 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
+
     engine.positions = []
     engine.trade_history = []
     engine.logs = []
     engine.stats = {"buys": 0, "sells": 0, "errors": 0}
 
-    # 測試候選
-    CANDIDATES.clear()
-    CANDIDATES.update({"BONK", "JUP", "WIF", "MYRO", "POPCAT"})
+    CANDIDATES.update({"BONK", "WIF", "JUP", "MYRO", "POPCAT"})
 
     asyncio.create_task(main_loop())
-    asyncio.create_task(monitor_loop())
+    asyncio.create_task(monitor())
+    asyncio.create_task(ai_loop())
 
 @app.get("/")
 def root():
-    ensure_engine()
     return {
-        "ok": True,
         "positions": engine.positions,
         "stats": engine.stats,
-        "candidates": len(CANDIDATES),
-        "logs": engine.logs[-20:],
+        "threshold": ENTRY_THRESHOLD,
+        "logs": engine.logs[-20:]
     }
 
 @app.get("/status")
 def status():
-    ensure_engine()
     return {
-        "ok": True,
         "positions": engine.positions,
-        "stats": engine.stats,
-        "candidate_count": len(CANDIDATES),
-        "trade_history": engine.trade_history[-20:],
-        "logs": engine.logs[-50:],
+        "trades": engine.trade_history[-10:],
+        "threshold": ENTRY_THRESHOLD,
+        "logs": engine.logs[-50:]
     }
-
-@app.get("/add/{mint}")
-def add_candidate(mint: str):
-    CANDIDATES.add(mint)
-    CANDIDATE_META[mint] = {"added_at": now()}
-    return {"ok": True, "mint": mint, "candidate_count": len(CANDIDATES)}
-
-@app.get("/ping")
-def ping():
-    return {"pong": True}
