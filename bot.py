@@ -1,4 +1,4 @@
-# ================= v1303_LIVE_UNIVERSE_BOT =================
+# ================= v1303_1_ANTI_BLOCK_BOT =================
 import asyncio
 import time
 import random
@@ -14,6 +14,8 @@ from mempool import mempool_stream
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wGk3Q3k5Jp3x"
 USDT = "Es9vMFrzaCERm7w7z7y7v4JgJ6pG6fQ5gYdExgkt1Py"
+BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB263kzwc"
+JUP = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
 
 MAX_POSITION_SOL = 0.0025
 MIN_POSITION_SOL = 0.001
@@ -22,144 +24,77 @@ MAX_POSITIONS = 5
 PUMP_API = "https://frontend-api.pump.fun/coins/latest"
 JUP_TOKENS_API = "https://token.jup.ag/all"
 
-SEED_TOKENS = {SOL}
-FALLBACK_TOKENS = {
-    SOL,
-    USDC,
-    USDT,
-    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB263kzwc",   # BONK
-    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",   # JUP
-}
+STATIC_UNIVERSE = {SOL, USDC, USDT, BONK, JUP}
+FALLBACK_TOKENS = set(STATIC_UNIVERSE)
 
 HTTP = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
 
-# ================= SAFE HELPERS =================
-def ensure_list(x):
-    return x if isinstance(x, list) else []
+# ================= STATE =================
+CANDIDATES = set()
+TOKEN_COOLDOWN = defaultdict(float)
 
-def ensure_dict(x):
-    return x if isinstance(x, dict) else {}
+PRICE_CACHE = {}
+ALPHA_CACHE = {}
 
-def ensure_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
+LAST_UNIVERSE_REFRESH = 0
+PUMP_FAILS = 0
+JUP_FAILS = 0
+MEMPOOL_FAILS = 0
 
-def ensure_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
+LAST_LOG_TS = {}
 
-def safe_slice(x, n=10):
-    if isinstance(x, (list, tuple)):
-        return list(x[:n])
-    return []
-
+# ================= UTIL =================
 def now():
     return time.time()
 
 def valid_mint(m):
     return isinstance(m, str) and 32 <= len(m) <= 44
 
-def repair_engine_state():
-    engine.positions = ensure_list(getattr(engine, "positions", []))
-    engine.trade_history = ensure_list(getattr(engine, "trade_history", []))
+def ensure_list(x):
+    return x if isinstance(x, list) else []
 
-    logs = getattr(engine, "logs", [])
+def ensure_dict(x):
+    return x if isinstance(x, dict) else {}
+
+def ensure_float(x, d=0):
     try:
-        engine.logs = list(logs)[-300:]
-    except Exception:
-        engine.logs = []
+        return float(x)
+    except:
+        return d
 
-    raw_stats = ensure_dict(getattr(engine, "stats", {}))
-    engine.stats = {
-        "signals": ensure_int(raw_stats.get("signals", 0)),
-        "buys": ensure_int(raw_stats.get("buys", 0)),
-        "sells": ensure_int(raw_stats.get("sells", 0)),
-        "errors": ensure_int(raw_stats.get("errors", 0)),
-        "adds": ensure_int(raw_stats.get("adds", 0)),
-    }
+def ensure_int(x, d=0):
+    try:
+        return int(x)
+    except:
+        return d
 
-    engine.running = bool(getattr(engine, "running", True))
-    engine.mode = str(getattr(engine, "mode", "PAPER"))
-    engine.capital = ensure_float(getattr(engine, "capital", 1.0), 1.0)
-    engine.sol_balance = ensure_float(getattr(engine, "sol_balance", 1.0), 1.0)
-    engine.last_trade = str(getattr(engine, "last_trade", ""))
-    engine.last_signal = str(getattr(engine, "last_signal", ""))
-    engine.bot_ok = bool(getattr(engine, "bot_ok", True))
-    engine.bot_error = str(getattr(engine, "bot_error", ""))
-    engine.candidate_count = ensure_int(getattr(engine, "candidate_count", 0), 0)
-
-    if not hasattr(engine, "engine_stats") or not isinstance(engine.engine_stats, dict):
-        engine.engine_stats = {
-            "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
-            "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
-            "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
-        }
-
-    if not hasattr(engine, "engine_allocator") or not isinstance(engine.engine_allocator, dict):
-        engine.engine_allocator = {
-            "stable": 0.4,
-            "degen": 0.4,
-            "sniper": 0.2,
-        }
+def safe_slice(x, n):
+    return list(x[:n]) if isinstance(x, (list, tuple)) else []
 
 def log(msg):
-    repair_engine_state()
     engine.logs.append(str(msg))
     engine.logs = engine.logs[-300:]
-    print(f"[BOT] {msg}")
+    print("[BOT]", msg)
 
-def normalize_position(p):
-    if not isinstance(p, dict):
-        return None
-    token = p.get("token")
-    if not valid_mint(token):
-        return None
-    return {
-        "token": token,
-        "amount": ensure_float(p.get("amount", 0.0), 0.0),
-        "entry_price": ensure_float(p.get("entry_price", 0.0), 0.0),
-        "last_price": ensure_float(p.get("last_price", 0.0), 0.0),
-        "peak_price": ensure_float(p.get("peak_price", 0.0), 0.0),
-        "pnl_pct": ensure_float(p.get("pnl_pct", 0.0), 0.0),
-        "engine": str(p.get("engine", "stable")),
-        "alpha": ensure_float(p.get("alpha", 0.0), 0.0),
+def log_once(key, msg, cooldown=60):
+    t = now()
+    if t - LAST_LOG_TS.get(key, 0) > cooldown:
+        LAST_LOG_TS[key] = t
+        log(msg)
+
+def repair():
+    engine.positions = ensure_list(getattr(engine, "positions", []))
+    engine.logs = ensure_list(getattr(engine, "logs", []))
+    engine.trade_history = ensure_list(getattr(engine, "trade_history", []))
+
+    s = ensure_dict(getattr(engine, "stats", {}))
+    engine.stats = {
+        "signals": ensure_int(s.get("signals")),
+        "buys": ensure_int(s.get("buys")),
+        "sells": ensure_int(s.get("sells")),
+        "errors": ensure_int(s.get("errors")),
+        "adds": ensure_int(s.get("adds")),
     }
-
-def repair_positions():
-    repair_engine_state()
-    fixed = []
-    for p in engine.positions:
-        np = normalize_position(p)
-        if np is not None:
-            fixed.append(np)
-    engine.positions = fixed[:MAX_POSITIONS]
-
-# ================= ENGINE =================
-ENGINE_STATS = {
-    "stable": {"pnl": 0.0, "trades": 0, "wins": 0},
-    "degen": {"pnl": 0.0, "trades": 0, "wins": 0},
-    "sniper": {"pnl": 0.0, "trades": 0, "wins": 0},
-}
-
-ENGINE_ALLOCATOR = {
-    "stable": 0.4,
-    "degen": 0.4,
-    "sniper": 0.2,
-}
-
-# ================= STATE =================
-CANDIDATES = set()
-TOKEN_COOLDOWN = defaultdict(float)
-PRICE_CACHE = {}
-ALPHA_CACHE = {}
-
-LAST_UNIVERSE_REFRESH = 0.0
-LAST_JUP_REFRESH = 0.0
-LAST_PUMP_REFRESH = 0.0
 
 # ================= HTTP =================
 async def http_get_json(url, params=None):
@@ -167,442 +102,218 @@ async def http_get_json(url, params=None):
         r = await HTTP.get(url, params=params)
         if r.status_code != 200:
             return None, r.status_code
-        try:
-            return r.json(), 200
-        except Exception:
-            return None, 200
-    except Exception:
+        return r.json(), 200
+    except:
         return None, None
 
-# ================= QUOTES =================
-async def get_quote(input_mint, output_mint, amount):
-    data, status = await http_get_json(
-        "https://lite-api.jup.ag/swap/v1/quote",
-        params={
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-        },
-    )
-    if status != 200 or not isinstance(data, dict):
-        return None
-    return data
-
+# ================= MARKET =================
 async def get_price(mint):
     if not valid_mint(mint):
         return None
 
-    cached = PRICE_CACHE.get(mint)
-    if isinstance(cached, tuple) and len(cached) == 2 and now() - cached[1] < 4:
-        return cached[0]
+    c = PRICE_CACHE.get(mint)
+    if c and now() - c[1] < 5:
+        return c[0]
 
-    quote = await get_quote(mint, SOL, 1_000_000)
-    if not quote:
+    data, status = await http_get_json(
+        "https://lite-api.jup.ag/swap/v1/quote",
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+    )
+
+    if status != 200 or not isinstance(data, dict):
         return None
 
-    out_amount = ensure_int(quote.get("outAmount", 0), 0)
-    price = (out_amount / 1e9) / 1_000_000 if out_amount > 0 else None
+    out = ensure_int(data.get("outAmount"))
+    price = (out / 1e9) / 1_000_000 if out > 0 else None
+
     PRICE_CACHE[mint] = (price, now())
     return price
 
-async def get_liquidity_and_impact(mint):
-    if not valid_mint(mint):
-        return 0, 1.0
-
-    quote = await get_quote(SOL, mint, 10_000_000)
-    if not quote:
-        return 0, 1.0
-
-    out_amount = ensure_int(quote.get("outAmount", 0), 0)
-    impact = ensure_float(quote.get("priceImpactPct", 1.0), 1.0)
-    return out_amount, impact
-
-# ================= FILTERS =================
 async def liquidity_ok(mint):
-    out_amount, impact = await get_liquidity_and_impact(mint)
-    return out_amount > 5000 and impact < 0.40
+    data, _ = await http_get_json(
+        "https://lite-api.jup.ag/swap/v1/quote",
+        {"inputMint": SOL, "outputMint": mint, "amount": "10000000"}
+    )
+    if not isinstance(data, dict):
+        return False
+
+    return ensure_int(data.get("outAmount")) > 5000
 
 async def anti_rug(mint):
-    quote = await get_quote(mint, SOL, 1_000_000)
-    if not quote:
-        return False
-    return ensure_int(quote.get("outAmount", 0), 0) > 0
+    data, _ = await http_get_json(
+        "https://lite-api.jup.ag/swap/v1/quote",
+        {"inputMint": mint, "outputMint": SOL, "amount": "1000000"}
+    )
+    return isinstance(data, dict) and ensure_int(data.get("outAmount")) > 0
 
-# ================= TOKEN SOURCES =================
-async def add_candidate(mint, source="unknown"):
-    if not valid_mint(mint):
-        return False
-    if mint in CANDIDATES:
-        return False
-    CANDIDATES.add(mint)
-    repair_engine_state()
-    engine.stats["adds"] += 1
-    return True
+# ================= TOKEN =================
+async def add_candidate(mint):
+    if valid_mint(mint):
+        CANDIDATES.add(mint)
 
-async def inject_fallback_tokens(reason="fallback"):
-    added = 0
-    for mint in FALLBACK_TOKENS:
-        ok = await add_candidate(mint, reason)
-        if ok:
-            added += 1
-    if added > 0:
-        log(f"FALLBACK_OK +{added} reason={reason}")
+async def inject_fallback():
+    for m in FALLBACK_TOKENS:
+        await add_candidate(m)
 
 async def pump_scanner():
-    global LAST_PUMP_REFRESH
+    global PUMP_FAILS
+
     while True:
-        try:
-            data, status = await http_get_json(PUMP_API)
+        data, status = await http_get_json(PUMP_API)
 
-            if status != 200:
-                log(f"PUMP_HTTP_{status}")
-                await inject_fallback_tokens(f"pump_http_{status}")
-                await asyncio.sleep(8)
-                continue
+        if status != 200 or not isinstance(data, list):
+            PUMP_FAILS += 1
+            log_once("pump", f"PUMP_HTTP_{status}")
+            await inject_fallback()
+            await asyncio.sleep(min(10 * PUMP_FAILS, 120))
+            continue
 
-            if not isinstance(data, list):
-                log("PUMP_BAD_PAYLOAD")
-                await inject_fallback_tokens("pump_bad_payload")
-                await asyncio.sleep(8)
-                continue
+        PUMP_FAILS = 0
 
-            added = 0
-            for row in safe_slice(data, 20):
-                if not isinstance(row, dict):
-                    continue
-                mint = row.get("mint")
-                if await add_candidate(mint, "pump"):
-                    added += 1
+        for c in safe_slice(data, 20):
+            if isinstance(c, dict):
+                await add_candidate(c.get("mint"))
 
-            LAST_PUMP_REFRESH = now()
-            if added > 0:
-                log(f"PUMP_OK +{added}")
+        await asyncio.sleep(10)
 
-        except Exception as e:
-            repair_engine_state()
-            engine.stats["errors"] += 1
-            log(f"PUMP_ERR {str(e)[:100]}")
-            await inject_fallback_tokens("pump_exception")
+async def jup_scanner():
+    global JUP_FAILS
 
-        await asyncio.sleep(8)
-
-async def jup_token_scanner():
-    global LAST_JUP_REFRESH
     while True:
-        try:
-            data, status = await http_get_json(JUP_TOKENS_API)
+        data, status = await http_get_json(JUP_TOKENS_API)
 
-            if status != 200 or not isinstance(data, list):
-                log(f"JUP_TOKENLIST_ERR {status}")
-                await asyncio.sleep(60)
-                continue
+        if status != 200 or not isinstance(data, list):
+            JUP_FAILS += 1
+            log_once("jup", f"JUP_ERR {status}")
+            await asyncio.sleep(min(30 * JUP_FAILS, 300))
+            continue
 
-            random.shuffle(data)
-            added = 0
+        JUP_FAILS = 0
 
-            for row in safe_slice(data, 60):
-                if not isinstance(row, dict):
-                    continue
-                mint = row.get("address") or row.get("mint")
-                if await add_candidate(mint, "jup"):
-                    added += 1
+        random.shuffle(data)
 
-            LAST_JUP_REFRESH = now()
-            if added > 0:
-                log(f"JUP_TOKENLIST_OK +{added}")
-
-        except Exception as e:
-            repair_engine_state()
-            engine.stats["errors"] += 1
-            log(f"JUP_TOKENLIST_EX {str(e)[:100]}")
+        for t in safe_slice(data, 50):
+            await add_candidate(t.get("address"))
 
         await asyncio.sleep(180)
 
-async def handle_mempool(event):
-    try:
-        if not isinstance(event, dict):
-            return
-        mint = event.get("mint")
-        if await add_candidate(mint, "mempool"):
-            log(f"MEMPOOL_ADD {mint[:8]}")
-    except Exception as e:
-        repair_engine_state()
-        engine.stats["errors"] += 1
-        log(f"MEMPOOL_HANDLE_ERR {str(e)[:100]}")
-
 async def mempool_runner():
+    global MEMPOOL_FAILS
+
     while True:
         try:
-            await mempool_stream(handle_mempool)
+            await mempool_stream(lambda e: add_candidate(e.get("mint")))
+            MEMPOOL_FAILS = 0
         except Exception as e:
-            repair_engine_state()
-            engine.stats["errors"] += 1
-            log(f"MEMPOOL_STREAM_ERR {str(e)[:120]}")
-            await asyncio.sleep(3)
+            MEMPOOL_FAILS += 1
+            msg = str(e)
 
-async def refresh_token_universe():
-    global LAST_UNIVERSE_REFRESH
-    if now() - LAST_UNIVERSE_REFRESH < 90:
-        return
+            if "429" in msg:
+                log_once("mp429", "MEMPOOL 429 BLOCK")
+                await asyncio.sleep(min(60 * MEMPOOL_FAILS, 600))
+            else:
+                log_once("mp", msg)
+                await asyncio.sleep(min(5 * MEMPOOL_FAILS, 120))
 
-    LAST_UNIVERSE_REFRESH = now()
+# ================= STRATEGY =================
+async def alpha(mint):
+    p1 = await get_price(mint)
+    await asyncio.sleep(0.1)
+    p2 = await get_price(mint)
 
-    CANDIDATES.update(SEED_TOKENS)
+    if not p1 or not p2:
+        return 0
 
-    if len(CANDIDATES) < 5:
-        await inject_fallback_tokens("low_universe")
+    return max(0, min((p2 - p1) / p1 * 0.6, 0.08))
 
-    engine.candidate_count = len(CANDIDATES)
-    log(f"UNIVERSE_REFRESH total={len(CANDIDATES)}")
-
-# ================= ALPHA =================
-async def alpha_engine(mint):
-    try:
-        cache_key = f"a:{mint}"
-        cached = ALPHA_CACHE.get(cache_key)
-        if isinstance(cached, tuple) and len(cached) == 2 and now() - cached[1] < 5:
-            return cached[0]
-
-        p1 = await get_price(mint)
-        await asyncio.sleep(0.08)
-        p2 = await get_price(mint)
-
-        if not p1 or not p2 or p1 <= 0:
-            alpha = 0.01
-        else:
-            momentum = (p2 - p1) / p1
-            alpha = max(0.0, min(momentum * 0.6, 0.08))
-
-        ALPHA_CACHE[cache_key] = (alpha, now())
-        return alpha
-    except Exception:
-        return 0.01
-
-def pick_engine(alpha):
-    if alpha > 0.07:
-        return "sniper"
-    if alpha > 0.03:
-        return random.choices(
-            ["stable", "degen", "sniper"],
-            weights=[0.2, 0.5, 0.3],
-            k=1,
-        )[0]
-    return random.choices(
-        ["stable", "degen", "sniper"],
-        weights=[0.4, 0.4, 0.2],
-        k=1,
-    )[0]
-
-def update_allocator():
-    engine.engine_stats = {
-        k: {
-            "pnl": ensure_float(v.get("pnl", 0.0)),
-            "trades": ensure_int(v.get("trades", 0)),
-            "wins": ensure_int(v.get("wins", 0)),
-        }
-        for k, v in ENGINE_STATS.items()
-    }
-    engine.engine_allocator = dict(ENGINE_ALLOCATOR)
-
-# ================= EXEC =================
 def can_buy(mint):
-    repair_positions()
-
-    if not valid_mint(mint):
-        return False
     if mint in {SOL, USDC, USDT}:
         return False
     if len(engine.positions) >= MAX_POSITIONS:
         return False
-    if any(isinstance(p, dict) and p.get("token") == mint for p in engine.positions):
-        return False
-    if now() - TOKEN_COOLDOWN[mint] < 20:
-        return False
     return True
 
-async def buy(mint, alpha):
-    repair_positions()
-
+async def buy(mint, a):
     if not can_buy(mint):
-        return False
-
-    eng = pick_engine(alpha)
-    price = await get_price(mint)
-    if not price or price <= 0:
-        return False
-
-    size_sol = MAX_POSITION_SOL * min(1.0, max(0.2, alpha * 8))
-    size_sol = max(MIN_POSITION_SOL, min(size_sol, MAX_POSITION_SOL))
-    amount = size_sol / price if price > 0 else 0.0
-
-    pos = {
-        "token": mint,
-        "amount": amount,
-        "entry_price": price,
-        "last_price": price,
-        "peak_price": price,
-        "pnl_pct": 0.0,
-        "engine": eng,
-        "alpha": alpha,
-    }
-
-    engine.positions.append(pos)
-    engine.positions = engine.positions[:MAX_POSITIONS]
-
-    TOKEN_COOLDOWN[mint] = now()
-    engine.stats["buys"] += 1
-    engine.last_trade = f"BUY {mint[:8]}"
-    engine.last_signal = f"{eng}:{alpha:.4f}"
-
-    log(f"BUY {mint[:8]} eng={eng} alpha={alpha:.4f} size={size_sol:.6f}")
-    return True
-
-async def sell(p):
-    repair_positions()
-
-    token = p.get("token")
-    if not valid_mint(token):
         return
 
-    price = await get_price(token)
+    price = await get_price(mint)
     if not price:
         return
 
-    entry = ensure_float(p.get("entry_price", price), price)
-    pnl_pct = (price - entry) / entry if entry > 0 else 0.0
-    eng = str(p.get("engine", "stable"))
-    if eng not in ENGINE_STATS:
-        eng = "stable"
+    size = MAX_POSITION_SOL * max(0.2, a * 8)
 
-    ENGINE_STATS[eng]["trades"] += 1
-    ENGINE_STATS[eng]["pnl"] += pnl_pct
-    if pnl_pct > 0:
-        ENGINE_STATS[eng]["wins"] += 1
-
-    engine.trade_history.append({
-        "token": token,
-        "entry_price": entry,
-        "exit_price": price,
-        "pnl_pct": pnl_pct,
-        "engine": eng,
-        "alpha": ensure_float(p.get("alpha", 0.0), 0.0),
-        "side": "SELL",
-        "ts": now(),
+    engine.positions.append({
+        "token": mint,
+        "entry_price": price,
+        "amount": size / price,
+        "engine": "degen",
+        "alpha": a
     })
-    engine.trade_history = engine.trade_history[-300:]
 
-    engine.positions = [
-        pos for pos in engine.positions
-        if isinstance(pos, dict) and pos.get("token") != token
-    ]
+    engine.stats["buys"] += 1
+    log(f"BUY {mint[:6]} alpha={a:.3f}")
 
-    engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {token[:8]}"
-    log(f"SELL {token[:8]} pnl%={pnl_pct*100:+.2f}")
-
-# ================= MONITOR =================
-async def monitor_positions():
+async def monitor():
     while True:
-        try:
-            repair_positions()
+        for p in list(engine.positions):
+            price = await get_price(p["token"])
+            if not price:
+                continue
 
-            for p in list(engine.positions):
-                token = p.get("token")
-                if not valid_mint(token):
-                    continue
+            pnl = (price - p["entry_price"]) / p["entry_price"]
 
-                price = await get_price(token)
-                if not price:
-                    continue
-
-                entry = ensure_float(p.get("entry_price", 0.0), 0.0)
-                pnl_pct = (price - entry) / entry if entry > 0 else 0.0
-
-                p["last_price"] = price
-                p["pnl_pct"] = pnl_pct
-                p["peak_price"] = max(ensure_float(p.get("peak_price", price), price), price)
-
-                if pnl_pct >= 0.18 or pnl_pct <= -0.09:
-                    await sell(p)
-
-        except Exception as e:
-            repair_engine_state()
-            engine.stats["errors"] += 1
-            log(f"MONITOR_ERR {str(e)[:120]}")
-            log(traceback.format_exc()[:500])
+            if pnl > 0.18 or pnl < -0.1:
+                engine.positions.remove(p)
+                engine.stats["sells"] += 1
+                log(f"SELL {p['token'][:6]} pnl={pnl:.2f}")
 
         await asyncio.sleep(6)
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 async def main():
-    log("🚀 v1303_LIVE_UNIVERSE_BOT 已啟動 (PAPER MODE)")
+    log("🚀 v1303.1 BOT START")
 
-    await inject_fallback_tokens("boot")
+    await inject_fallback()
 
     asyncio.create_task(pump_scanner())
-    asyncio.create_task(jup_token_scanner())
+    asyncio.create_task(jup_scanner())
     asyncio.create_task(mempool_runner())
-    asyncio.create_task(monitor_positions())
+    asyncio.create_task(monitor())
 
     while True:
         try:
-            repair_engine_state()
-            repair_positions()
-            update_allocator()
-            await refresh_token_universe()
+            repair()
 
-            candidates = list(CANDIDATES)
-            random.shuffle(candidates)
-            candidate_batch = safe_slice(candidates, 15)
+            if len(CANDIDATES) < 5:
+                await inject_fallback()
 
-            for mint in candidate_batch:
-                try:
-                    if not valid_mint(mint):
-                        continue
+            engine.candidate_count = len(CANDIDATES)
 
-                    engine.stats["signals"] += 1
+            for mint in safe_slice(list(CANDIDATES), 15):
+                engine.stats["signals"] += 1
 
-                    if not await liquidity_ok(mint):
-                        continue
-                    if not await anti_rug(mint):
-                        continue
+                if not await liquidity_ok(mint):
+                    continue
 
-                    alpha = await alpha_engine(mint)
-                    if alpha > 0.012:
-                        await buy(mint, alpha)
+                if not await anti_rug(mint):
+                    continue
 
-                except Exception as inner_e:
-                    repair_engine_state()
-                    engine.stats["errors"] += 1
-                    short = mint[:8] if isinstance(mint, str) else "UNKNOWN"
-                    log(f"TOKEN_ERR {short} {str(inner_e)[:100]}")
+                a = await alpha(mint)
 
-            await asyncio.sleep(7)
+                if a > 0.01:
+                    await buy(mint, a)
+
+            await asyncio.sleep(6)
 
         except Exception as e:
-            repair_engine_state()
-            engine.bot_ok = False
-            engine.bot_error = str(e)
             engine.stats["errors"] += 1
-            log(f"MAIN_LOOP_ERR {str(e)[:120]}")
-            log(traceback.format_exc()[:500])
-            await asyncio.sleep(8)
+            log(f"MAIN_ERR {str(e)[:80]}")
+            await asyncio.sleep(5)
 
-# ================= FASTAPI ENTRY =================
+# ================= ENTRY =================
 async def bot_loop():
     try:
         await main()
-    except asyncio.CancelledError:
-        log("BOT_STOPPED")
-        raise
     except Exception as e:
-        repair_engine_state()
-        engine.bot_ok = False
-        engine.bot_error = str(e)
-        engine.stats["errors"] += 1
-        log(f"BOT_FATAL {str(e)[:120]}")
-        log(traceback.format_exc()[:500])
-        raise
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        log(f"FATAL {e}")
