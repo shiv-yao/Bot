@@ -1,4 +1,4 @@
-import asyncio
+# ================= wallet_tracker.py =================
 import time
 from collections import defaultdict
 
@@ -88,9 +88,11 @@ def extract_candidate_mints(tx: dict):
     for row in pre_token_balances:
         if not isinstance(row, dict):
             continue
+
         mint = row.get("mint")
         ui = row.get("uiTokenAmount") or {}
         amt = ui.get("uiAmount")
+
         if valid_mint(mint):
             try:
                 pre_by_mint[mint] = float(amt or 0.0)
@@ -100,9 +102,11 @@ def extract_candidate_mints(tx: dict):
     for row in post_token_balances:
         if not isinstance(row, dict):
             continue
+
         mint = row.get("mint")
         ui = row.get("uiTokenAmount") or {}
         amt = ui.get("uiAmount")
+
         if not valid_mint(mint):
             continue
 
@@ -130,11 +134,14 @@ async def poll_wallet_once(rpc_url: str, wallet: str):
     for row in sigs:
         if not isinstance(row, dict):
             continue
+
         sig = row.get("signature")
         if not sig:
             continue
+
         if sig == seen_sig:
             break
+
         fresh.append(sig)
 
     if sigs and isinstance(sigs[0], dict):
@@ -166,12 +173,12 @@ async def wallet_tracker_loop(rpc_url: str, wallets: list[str], on_token):
                 for mint in found:
                     await on_token(mint, source="wallet")
 
-                await asyncio.sleep(0.25)
+                await __sleep(0.25)
 
         except Exception:
-            await asyncio.sleep(3)
+            await __sleep(3)
 
-        await asyncio.sleep(4)
+        await __sleep(4)
 
 
 def wallet_score(mint: str) -> float:
@@ -185,7 +192,7 @@ def wallet_score(mint: str) -> float:
     return base * decay
 
 
-# ================= 你原本那組：整合強化版 =================
+# ================= discovery helpers =================
 
 async def extract_wallets_from_mints(rpc_url: str, mints):
     wallets = set()
@@ -221,7 +228,7 @@ async def extract_wallets_from_mints(rpc_url: str, mints):
             except Exception:
                 continue
 
-        await asyncio.sleep(0.15)
+        await __sleep(0.15)
 
     return list(wallets)
 
@@ -257,16 +264,17 @@ async def track_wallet_behavior(rpc_url: str, wallets):
                 continue
 
         if tokens:
-            results.append({
+            item = {
                 "wallet": w,
                 "tokens": list(tokens),
-            })
+            }
+            results.append(item)
             WALLET_CACHE[w] = {
                 "tokens": list(tokens),
                 "ts": now(),
             }
 
-        await asyncio.sleep(0.15)
+        await __sleep(0.15)
 
     return results
 
@@ -279,6 +287,7 @@ async def discover_active_wallets_from_candidates(rpc_url: str, candidate_mints)
     for row in behaviors:
         wallet = row.get("wallet")
         tokens = row.get("tokens", [])
+
         if not valid_pubkey(wallet):
             continue
 
@@ -291,3 +300,8 @@ async def discover_active_wallets_from_candidates(rpc_url: str, candidate_mints)
 
     scored_wallets.sort(key=lambda x: x["score"], reverse=True)
     return scored_wallets
+
+
+async def __sleep(seconds: float):
+    import asyncio
+    await asyncio.sleep(seconds)
