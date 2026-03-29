@@ -33,7 +33,11 @@ MIN_POSITION_SOL = float(os.environ.get("MIN_POSITION_SOL", "0.001"))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 
 PUMP_API = os.environ.get("PUMP_API", "https://frontend-api.pump.fun/coins/latest")
-JUP_TOKENS_API = os.environ.get("JUP_TOKENS_API", "https://token.jup.ag/all")
+# ❗改成這樣（只留一個）
+JUP_TOKENS_API = os.environ.get(
+    "JUP_TOKENS_API",
+    "https://lite-api.jup.ag/tokens"
+)
 JUP_BASE_API = os.environ.get("JUP_BASE_API", "https://api.jup.ag/swap/v2")
 JUP_ORDER_API = f"{JUP_BASE_API}/order"
 JUP_EXECUTE_API = f"{JUP_BASE_API}/execute"
@@ -489,7 +493,21 @@ async def http_post_json(url, payload=None, headers=None):
 
     log_once(f"http_post_{url}", f"HTTP_POST_ERR {last_err}", 20)
     return None
+# ================= JUP TOKEN FETCH (MULTI SOURCE) =================
+async def fetch_jup_tokens():
+    urls = [
+        "https://lite-api.jup.ag/tokens",
+        "https://cache.jup.ag/tokens",
+        "https://token.jup.ag/all",
+    ]
 
+    for url in urls:
+        data = await http_get_json(url)
+
+        if isinstance(data, list) and len(data) > 0:
+            return data
+
+    return None
 
 async def rpc_post(method: str, params, role: str = "default"):
     last_err = None
@@ -559,7 +577,9 @@ async def rpc_post(method: str, params, role: str = "default"):
 async def preload_token_decimals():
     if TOKEN_DECIMALS:
         return
-    data = await http_get_json(JUP_TOKENS_API)
+
+    data = await fetch_jup_tokens()
+
     if isinstance(data, list):
         for t in data:
             mint = t.get("address")
@@ -1393,13 +1413,18 @@ async def pump():
 
 async def jup():
     while True:
-        data = await http_get_json(JUP_TOKENS_API)
+        data = await fetch_jup_tokens()
+
         if isinstance(data, list):
             for t in data[:50]:
                 m = t.get("address")
                 if valid_mint(m):
-                    TOKEN_DECIMALS[m] = ensure_int(t.get("decimals"), TOKEN_DECIMALS.get(m, 6))
+                    TOKEN_DECIMALS[m] = ensure_int(
+                        t.get("decimals"),
+                        TOKEN_DECIMALS.get(m, 6)
+                    )
                     await add_candidate(m, source="jup")
+
         await asyncio.sleep(120)
 
 # ================= MAIN =================
