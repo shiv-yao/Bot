@@ -124,21 +124,100 @@ async def jupiter_order(input_mint, output_mint, amount):
     return None
 
 
-async def safe_jupiter_order(a, b, amt):
-    for _ in range(3):
-        d = await jupiter_order(a, b, amt)
+async def jupiter_order(input_mint: str, output_mint: str, amount: int):
+    """
+    Jupiter V2 order + Quote fallback
+    保證：
+    1. 有 transaction → 可 execute
+    2. 沒交易路徑 → 回 _quote_only（不會再亂 BUY_FAIL）
+    """
 
-        if d and d.get("transaction"):
-            return d
+    # ===== DEBUG =====
+    log_once(
+        f"jup_call_{input_mint}_{output_mint}",
+        f"CALL JUP {input_mint[:4]}->{output_mint[:4]}",
+        2
+    )
 
-        await asyncio.sleep(0.3)
+    # ================= PRIMARY: V2 ORDER =================
+    url = "https://api.jup.ag/swap/v2/order"
+
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(int(amount)),
+        "swapMode": "ExactIn",
+        "slippageBps": 100,
+    }
+
+    try:
+        r = await HTTP.get(url, params=params)
+
+        # ===== 成功 =====
+        if r.status_code == 200:
+            data = r.json()
+
+            # 👉 有 transaction → 可執行
+            if data.get("transaction") and data.get("requestId"):
+                return data
+
+            # 👉 有回應但沒交易 → 當 fallback
+            log_once(
+                "jup_no_tx",
+                f"JUP_NO_TX {input_mint[:4]}->{output_mint[:4]}",
+                5
+            )
+
+        # ===== rate limit =====
+        elif r.status_code == 429:
+            log_once("jup_429", "JUP RATE LIMIT", 5)
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        log_once("jup_err", f"JUP_ERR {str(e)}", 5)
+
+    # ================= FALLBACK: QUOTE =================
+    log_once(
+        "jup_fallback",
+        f"JUP_FALLBACK {input_mint[:4]}->{output_mint[:4]}",
+        5
+    )
+
+    try:
+        q = await HTTP.get(
+            "https://quote-api.jup.ag/v6/quote",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(int(amount)),
+                "slippageBps": 100,
+            },
+        )
+
+        if q.status_code == 200:
+            data = q.json()
+
+            if data.get("data"):
+                route = data["data"][0]
+
+                return {
+                    "_quote_only": True,   # ❗關鍵標記
+                    "outAmount": route.get("outAmount"),
+                    "priceImpactPct": route.get("priceImpactPct"),
+                    "routePlan": route.get("routePlan"),
+                }
+
+    except Exception as e:
+        log_once("jup_quote_err", f"QUOTE_ERR {e}", 5)
+
+    # ================= FAIL =================
+    log_once(
+        "jup_fail",
+        f"JUP_FAIL {input_mint[:4]}->{output_mint[:4]}",
+        5
+    )
 
     return None
-
-
-async def safe_jupiter_execute(o):
-    # ⚠️ 這裡目前 mock（真實版下一步補）
-    return {"signature": "tx_" + str(time.time())}
 
 # ================= RANK =================
 async def rank_candidates():
