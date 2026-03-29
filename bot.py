@@ -522,7 +522,6 @@ async def preload_token_decimals():
 
 def token_decimals(mint: str) -> int:
     return TOKEN_DECIMALS.get(mint, 6)
-
 # ================= JUPITER ORDER (v1315 FINAL) =================
 async def jupiter_order(input_mint: str, output_mint: str, amount_smallest: int):
     params = {
@@ -1142,6 +1141,11 @@ async def buy(m, a, combo, w, s):
         lamports_in = int(size * 1e9)
         order = await jupiter_order(SOL, m, lamports_in)
 
+        # ❗ fallback quote-only 防護（你現在缺這個）
+        if order and order.get("_quote_only"):
+            log_once("buy_quote_only", f"BUY_QUOTE_ONLY {m[:6]}", 10)
+            return
+
         if not order:
             log_once("buy_order", f"BUY_ORDER_ERR {m[:6]} no_response", 15)
             return
@@ -1149,7 +1153,7 @@ async def buy(m, a, combo, w, s):
         if order.get("errorCode") or order.get("error"):
             log_once(
                 "buy_order",
-                f"BUY_ORDER_FAIL {m[:6]} {order.get('errorMessage') or order.get('error') or order.get('errorCode')}",
+                f"BUY_ORDER_FAIL {m[:6]} {order.get('errorMessage') or order.get('error')}",
                 15,
             )
             return
@@ -1196,14 +1200,12 @@ async def buy(m, a, combo, w, s):
         "entry_signature": tx_sig,
         "entry_tx_meta": tx_meta,
     }
+
     engine.positions.append(pos)
 
     TOKEN_COOLDOWN[m] = now()
     engine.stats["buys"] += 1
     engine.last_trade = f"BUY {m[:6]}"
-    engine.last_signal = (
-        f"{m[:6]} a={a:.4f} w={w:.2f} s={s:.4f} c={combo:.4f} eng={engine_type}"
-    )
 
     log(f"BUY {m[:6]} {engine_type} combo={combo:.4f} size={size:.6f} mode={trade_mode} sig={tx_sig}")
 
@@ -1229,6 +1231,12 @@ async def sell(p):
             )
 
         order = await jupiter_order(p["token"], SOL, raw_amount)
+
+        # ❗ fallback quote-only 防護
+        if order and order.get("_quote_only"):
+            log_once("sell_quote_only", f"SELL_QUOTE_ONLY {p['token'][:6]}", 10)
+            return
+
         if order and order.get("transaction") and order.get("requestId") and not order.get("errorCode") and not order.get("error"):
             try:
                 exec_result = await jupiter_execute(order)
@@ -1251,37 +1259,13 @@ async def sell(p):
     except ValueError:
         return
 
-    trade = {
+    engine.trade_history.append({
         "token": p["token"],
         "pnl_pct": pnl,
         "ts": now(),
-        "engine": p.get("engine", "degen"),
-        "entry_price": p.get("entry_price"),
-        "exit_price": price,
-        "alpha": p.get("alpha", 0.0),
-        "combo": p.get("combo", 0.0),
-        "wallet_score": p.get("wallet_score", 0.0),
-        "sniper_score": p.get("sniper_score", 0.0),
-        "trade_mode": p.get("trade_mode", "PAPER"),
-        "entry_signature": p.get("entry_signature"),
-        "exit_signature": tx_sig,
-        "exit_tx_meta": tx_meta,
-    }
-    engine.trade_history.append(trade)
+    })
 
-    eng = p.get("engine", "degen")
-    STRATEGY_LOCAL_STATS[eng]["trades"] += 1
-    STRATEGY_LOCAL_STATS[eng]["pnl"] += pnl
-    engine.engine_stats[eng]["trades"] += 1
-    engine.engine_stats[eng]["pnl"] += pnl
-    if pnl > 0:
-        STRATEGY_LOCAL_STATS[eng]["wins"] += 1
-        engine.engine_stats[eng]["wins"] += 1
-
-    engine.capital = max(1.0, ensure_float(engine.capital, 30.0) * (1.0 + pnl * 0.1))
     engine.stats["sells"] += 1
-    engine.last_trade = f"SELL {p['token'][:6]}"
-    log(f"SELL {p['token'][:6]} pnl={pnl:.4f} eng={eng} mode={p.get('trade_mode', 'PAPER')} sig={tx_sig}")
 
 # ================= MONITOR =================
 async def monitor():
