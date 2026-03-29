@@ -1,11 +1,20 @@
-# ================= v1318 SEMI-LIVE TRADING =================
+# ================= v1319 SEMI + REAL =================
 import asyncio
 import time
 import random
+import os
+import base64
+import base58
 from collections import defaultdict
+
+import httpx
 
 from fastapi import FastAPI
 from state import engine
+
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solders import message as solders_message
 
 # ================= GLOBAL =================
 CANDIDATES = set()
@@ -26,6 +35,19 @@ MAX_THRESHOLD = 0.08
 
 TAKE_PROFIT = 0.12
 STOP_LOSS = -0.05
+
+REAL = os.getenv("REAL_TRADING", "false").lower() == "true"
+PRIVATE_KEY = os.getenv("PRIVATE_KEY_B58", "")
+
+HTTP = httpx.AsyncClient(timeout=10)
+
+# ================= WALLET =================
+KEYPAIR = None
+if PRIVATE_KEY:
+    KEYPAIR = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
+
+def wallet():
+    return str(KEYPAIR.pubkey()) if KEYPAIR else ""
 
 # ================= UTIL =================
 def now():
@@ -52,19 +74,78 @@ def log_once(key, msg, sec=10):
         LAST_LOG[key] = now()
         log(msg)
 
-# ================= PRICE（模擬波動） =================
-PRICE_CACHE = {}
-
+# ================= PRICE（真實 + fallback） =================
 async def get_price(m):
+    try:
+        r = await HTTP.get(
+            "https://api.jup.ag/swap/v2/order",
+            params={
+                "inputMint": m,
+                "outputMint": "So11111111111111111111111111111111111111112",
+                "amount": "1000000"
+            }
+        )
+        data = r.json()
+        out = int(data.get("outAmount", 0))
+        if out:
+            return out / 1e9 / 1e6
+    except:
+        pass
+
+    # fallback（你原本的）
     base = abs(hash(m)) % 1000 / 1e7
+    return 0.0001 + base
 
-    noise = (time.time() % 1) * 0.00002
-    drift = random.uniform(-0.00001, 0.00002)
+# ================= JUP =================
+async def jupiter_order(input_mint, output_mint, amount):
+    try:
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),
+            "slippageBps": 80
+        }
 
-    price = 0.0001 + base + noise + drift
+        if REAL:
+            params["taker"] = wallet()
 
-    PRICE_CACHE[m] = price
-    return price
+        r = await HTTP.get("https://api.jup.ag/swap/v2/order", params=params)
+        data = r.json()
+
+        if not data.get("transaction"):
+            log_once("quote", "QUOTE_ONLY_SKIP", 5)
+            return None
+
+        return data
+    except:
+        return None
+
+def sign_tx(tx):
+    raw = VersionedTransaction.from_bytes(base64.b64decode(tx))
+    msg = solders_message.to_bytes_versioned(raw.message)
+    sig = KEYPAIR.sign_message(msg)
+
+    return base64.b64encode(
+        bytes(VersionedTransaction.populate(raw.message, [sig]))
+    ).decode()
+
+async def jupiter_execute(order):
+    signed = sign_tx(order["transaction"])
+
+    r = await HTTP.post(
+        "https://api.jup.ag/swap/v2/execute",
+        json={
+            "signedTransaction": signed,
+            "requestId": order["requestId"]
+        }
+    )
+
+    data = r.json()
+
+    if data.get("status") != "Success":
+        raise Exception(data)
+
+    return data["signature"]
 
 # ================= ALPHA =================
 async def alpha(m):
@@ -96,31 +177,22 @@ async def rank_candidates():
             s = await sniper_bonus(m)
 
             combo = a + (w * 0.01) + s
-
             ranked.append((m, combo, a, w, s))
 
-        except Exception:
+        except:
             continue
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked[:5]
 
-# ================= ORDER =================
-async def safe_order():
-    await asyncio.sleep(0.05)
-    return True
-
 # ================= BUY =================
 def can_buy(m):
     if len(engine.positions) >= MAX_POSITIONS:
         return False
-
     if m in [p["token"] for p in engine.positions]:
         return False
-
     if now() - TOKEN_COOLDOWN[m] < 20:
         return False
-
     return True
 
 def position_size(combo):
@@ -140,12 +212,29 @@ async def buy(m, combo):
         if not can_buy(m):
             return
 
-        ok = await safe_order()
-        if not ok:
-            return
+        size = position_size(combo)
+
+        # 🔥 REAL TRADING
+        if REAL:
+            order = await jupiter_order(
+                "So11111111111111111111111111111111111111112",
+                m,
+                int(size * 1e9)
+            )
+
+            if not order:
+                return
+
+            try:
+                sig = await jupiter_execute(order)
+                log(f"REAL BUY {m} sig={sig}")
+            except Exception as e:
+                log(f"EXEC ERR {e}")
+                return
+        else:
+            log(f"[PAPER BUY] {m}")
 
         price = await get_price(m)
-        size = position_size(combo)
 
         engine.positions.append({
             "token": m,
@@ -161,8 +250,6 @@ async def buy(m, combo):
         TOKEN_COOLDOWN[m] = now()
         engine.stats["buys"] += 1
 
-        log(f"BUY {m} combo={combo:.4f} size={size:.4f}")
-
     finally:
         IN_FLIGHT_BUY.discard(m)
 
@@ -177,8 +264,10 @@ async def sell(p):
 
     try:
         price = await get_price(m)
-
         pnl = (price - p["entry_price"]) / p["entry_price"]
+
+        if REAL:
+            log(f"REAL SELL {m}")
 
         if p in engine.positions:
             engine.positions.remove(p)
@@ -190,7 +279,6 @@ async def sell(p):
         })
 
         engine.stats["sells"] += 1
-        log(f"SELL {m} pnl={pnl:.4f}")
 
     finally:
         IN_FLIGHT_SELL.discard(m)
@@ -224,7 +312,7 @@ async def monitor():
 
         await asyncio.sleep(2)
 
-# ================= AI（自動調參） =================
+# ================= AI =================
 async def ai_loop():
     global ENTRY_THRESHOLD
 
@@ -244,7 +332,7 @@ async def ai_loop():
 
                 log_once("ai", f"AI threshold={ENTRY_THRESHOLD:.4f}", 15)
 
-        except Exception:
+        except:
             pass
 
         await asyncio.sleep(10)
@@ -254,8 +342,6 @@ async def main_loop():
     while True:
         try:
             ranked = await rank_candidates()
-
-            log_once("rank", f"RANKED {len(ranked)}", 5)
 
             for m, combo, *_ in ranked:
                 if combo > ENTRY_THRESHOLD:
@@ -291,14 +377,6 @@ def root():
         "positions": engine.positions,
         "stats": engine.stats,
         "threshold": ENTRY_THRESHOLD,
+        "mode": "REAL" if REAL else "PAPER",
         "logs": engine.logs[-20:]
-    }
-
-@app.get("/status")
-def status():
-    return {
-        "positions": engine.positions,
-        "trades": engine.trade_history[-10:],
-        "threshold": ENTRY_THRESHOLD,
-        "logs": engine.logs[-50:]
     }
