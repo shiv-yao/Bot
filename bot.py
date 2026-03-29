@@ -1631,3 +1631,170 @@ async def sell(p):
 
     finally:
         IN_FLIGHT_SELL.discard(m)
+
+# ================= SMART MONEY =================
+SMART_MONEY = {}
+SMART_MONEY_SCORE = {}
+
+def update_smart_money():
+    for t in engine.trade_history[-200:]:
+        wallet = t.get("wallet")
+        pnl = ensure_float(t.get("pnl_pct"), 0)
+
+        if not wallet:
+            continue
+
+        if wallet not in SMART_MONEY:
+            SMART_MONEY[wallet] = {"pnl": 0.0, "trades": 0}
+
+        SMART_MONEY[wallet]["pnl"] += pnl
+        SMART_MONEY[wallet]["trades"] += 1
+
+    for w, s in SMART_MONEY.items():
+        if s["trades"] >= 3:
+            SMART_MONEY_SCORE[w] = max(0.5, min(3.0, 1 + s["pnl"]))
+
+
+def smart_money_score(m):
+    score = 1.0
+    for wallet, tokens in WALLET_GRAPH.items():
+        if m in tokens:
+            score += SMART_MONEY_SCORE.get(wallet, 0.0)
+    return min(score, 4.0)
+
+
+# ================= INSIDER DETECT =================
+def insider_score(m):
+    meta = CANDIDATE_META.get(m, {})
+    age = candidate_age_sec(m)
+
+    score = 0.0
+
+    if age < 20:
+        score += 0.03
+
+    if meta.get("hits", 0) <= 2:
+        score += 0.02
+
+    if "mempool" in meta.get("sources", []):
+        score += 0.03
+
+    return score
+
+
+# ================= CLUSTER DETECT =================
+def cluster_score(m):
+    count = 0
+    for wallet, tokens in WALLET_GRAPH.items():
+        if m in tokens:
+            count += 1
+
+    if count >= 3:
+        return 0.03
+    if count >= 2:
+        return 0.015
+    return 0.0
+
+
+# ================= FAKE PUMP FILTER =================
+def fake_pump_filter(m, a, w, s):
+    if a > 0.05 and w < 1.1 and s < 0.01:
+        return False
+
+    if w < 1.05 and s < 0.01:
+        return False
+
+    return True
+
+
+# ================= TAKE PROFIT AI =================
+async def take_profit_logic(p):
+    price = await get_price(p["token"])
+    if not price:
+        return False
+
+    pnl = (price - p["entry_price"]) / p["entry_price"]
+
+    # 分段止盈
+    if pnl > 0.25:
+        return True
+    if pnl > 0.15 and p["sniper_score"] < 0.01:
+        return True
+    if pnl > 0.10 and p["wallet_score"] < 1.2:
+        return True
+
+    return False
+
+
+# ================= PATCH RANK =================
+_original_rank = rank_candidates
+
+async def rank_candidates():
+    update_smart_money()
+
+    ranked = await _original_rank()
+    new_ranked = []
+
+    for m, combo, a, w, s in ranked:
+        sm = smart_money_score(m)
+        ins = insider_score(m)
+        cl = cluster_score(m)
+
+        combo2 = combo + (sm * 0.01) + ins + cl
+
+        new_ranked.append((m, combo2, a, w, s))
+
+    new_ranked.sort(key=lambda x: x[1], reverse=True)
+    return new_ranked
+
+
+# ================= PATCH BUY FILTER =================
+_original_can_buy = can_buy
+
+def can_buy(m):
+    if not _original_can_buy(m):
+        return False
+
+    meta = CANDIDATE_META.get(m, {})
+    a = 0
+    w = wallet_score(m)
+    s = 0
+
+    if not fake_pump_filter(m, a, w, s):
+        return False
+
+    return True
+
+
+# ================= PATCH MONITOR =================
+_original_monitor = monitor
+
+async def monitor():
+    while True:
+        try:
+            for p in list(engine.positions):
+
+                if await take_profit_logic(p):
+                    await sell(p)
+                    continue
+
+                price = await get_price(p["token"])
+                if not price:
+                    continue
+
+                pnl = (price - p["entry_price"]) / p["entry_price"]
+                peak = max(p["peak_price"], price)
+
+                p["peak_price"] = peak
+                p["last_price"] = price
+                p["pnl_pct"] = pnl
+
+                drawdown = (price - peak) / peak if peak else 0.0
+
+                if pnl < -AI_PARAMS["trailing_stop"] or drawdown < -AI_PARAMS["trailing_stop"]:
+                    await sell(p)
+
+        except Exception as e:
+            log_once("monitor_v1315", f"MONITOR_ERR {e}", 30)
+
+        await asyncio.sleep(5)
