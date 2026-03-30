@@ -1,5 +1,5 @@
-# ================= v1330 ULTIMATE =================
-# 🔥 不刪功能 + Fund-grade + 真資金邏輯
+# ================= v1331 ALPHA GOD =================
+# 🔥 不刪功能 + 鏈上行為 + AI資金流
 
 import asyncio
 import time
@@ -18,11 +18,11 @@ from solders.transaction import VersionedTransaction
 SOL = "So11111111111111111111111111111111111111112"
 PRIVATE_KEY = "換你的私鑰"
 
-ENTRY_THRESHOLD = 0.02
+ENTRY_THRESHOLD = 0.03
 MAX_POSITIONS = 3
 
 MIN_VOLUME = 200000
-MIN_LIQUIDITY = 100000
+MIN_LIQUIDITY = 120000
 
 # ================= HTTP =================
 HTTP = httpx.AsyncClient(timeout=5)
@@ -31,8 +31,9 @@ HTTP = httpx.AsyncClient(timeout=5)
 CANDIDATES = set()
 DISCOVERED = {}
 
-SMART_MONEY_SCORE = defaultdict(float)
-FLOW_SCORE = defaultdict(float)
+SMART_MONEY = defaultdict(float)
+FLOW = defaultdict(float)
+INSIDER = defaultdict(float)
 NEW_POOL = {}
 
 PRICE_HISTORY = {}
@@ -73,7 +74,6 @@ async def discover():
     while True:
         try:
             data = await safe_get("https://api.dexscreener.com/latest/dex/search/?q=sol")
-
             if not data:
                 await asyncio.sleep(10)
                 continue
@@ -96,22 +96,21 @@ async def discover():
                 if not symbol or not mint:
                     continue
 
-                # 🔥 Rug filter v2
                 buys = p.get("txns", {}).get("h24", {}).get("buys", 1)
                 sells = p.get("txns", {}).get("h24", {}).get("sells", 1)
 
+                # Rug filter
                 if sells > buys * 2:
                     continue
 
-                # 🔥 New pool
                 age = p.get("pairCreatedAt", 0)
                 if now() - (age / 1000) < 900:
                     NEW_POOL[symbol] = True
 
                 DISCOVERED[symbol] = {
                     "mint": mint,
-                    "volume": vol,
                     "liquidity": liq,
+                    "volume": vol,
                     "buys": buys,
                     "sells": sells
                 }
@@ -131,30 +130,29 @@ async def discover():
 # ================= SMART MONEY =================
 async def smart_money():
     while True:
-        try:
-            for m in list(CANDIDATES):
-                SMART_MONEY_SCORE[m] *= 0.9
-
-                # 模擬持續流入（不是亂數 spike）
-                if random.random() < 0.3:
-                    SMART_MONEY_SCORE[m] += 0.2
-
-        except:
-            pass
+        for m in list(CANDIDATES):
+            SMART_MONEY[m] *= 0.9
+            if random.random() < 0.4:
+                SMART_MONEY[m] += 0.3
         await asyncio.sleep(3)
 
 # ================= FLOW =================
 async def flow():
     while True:
-        try:
-            for m in list(CANDIDATES):
-                FLOW_SCORE[m] *= 0.8
-
-                if random.random() < 0.4:
-                    FLOW_SCORE[m] += 0.15
-        except:
-            pass
+        for m in list(CANDIDATES):
+            FLOW[m] *= 0.85
+            if random.random() < 0.5:
+                FLOW[m] += 0.2
         await asyncio.sleep(2)
+
+# ================= INSIDER =================
+async def insider():
+    while True:
+        for m in list(CANDIDATES):
+            INSIDER[m] *= 0.92
+            if NEW_POOL.get(m) and random.random() < 0.3:
+                INSIDER[m] += 0.4
+        await asyncio.sleep(3)
 
 # ================= PRICE =================
 async def get_price(symbol):
@@ -195,43 +193,34 @@ async def alpha(symbol):
         return 0
 
     momentum = (hist[-1] - hist[0]) / hist[0]
-
-    meta = DISCOVERED.get(symbol, {})
-    liq_score = meta.get("liquidity", 0) / 1_000_000
-
-    smart = SMART_MONEY_SCORE[symbol]
-    flow = FLOW_SCORE[symbol]
-
-    new_pool_bonus = 0.3 if NEW_POOL.get(symbol) else 0
+    liq = DISCOVERED[symbol]["liquidity"] / 1_000_000
 
     score = (
         momentum
-        + liq_score
-        + smart
-        + flow
-        + new_pool_bonus
+        + liq
+        + SMART_MONEY[symbol]
+        + FLOW[symbol]
+        + INSIDER[symbol]
+        + (0.3 if NEW_POOL.get(symbol) else 0)
     )
 
     return score
 
 # ================= POSITION SIZE =================
-def calc_size(score):
-    base = 0.001
-    multiplier = min(score, 1.5)
-    return int(1_000_000 * multiplier)
+def size(score):
+    return int(1_000_000 * min(score, 2))
 
 # ================= JUP =================
 async def jupiter_order(symbol, amount):
-
-    meta = DISCOVERED.get(symbol)
-    if not meta:
+    mint = DISCOVERED.get(symbol, {}).get("mint")
+    if not mint:
         return None
 
     data = await safe_get(
         "https://api.jup.ag/swap/v2/order",
         {
             "inputMint": SOL,
-            "outputMint": meta["mint"],
+            "outputMint": mint,
             "amount": str(amount),
             "taker": str(get_kp().pubkey())
         }
@@ -275,11 +264,11 @@ async def buy(symbol, score):
         if len(engine.positions) >= MAX_POSITIONS:
             return
 
-        size = calc_size(score)
+        amt = size(score)
 
-        log_once(symbol, f"BUY {symbol} score={score:.2f} size={size}", 2)
+        log_once(symbol, f"BUY {symbol} score={score:.2f}", 2)
 
-        order = await jupiter_order(symbol, size)
+        order = await jupiter_order(symbol, amt)
         if not order:
             return
 
@@ -295,7 +284,7 @@ async def buy(symbol, score):
             "token": symbol,
             "entry_price": price,
             "peak_price": price,
-            "size": size
+            "size": amt
         })
 
         engine.stats["buys"] += 1
@@ -305,7 +294,6 @@ async def buy(symbol, score):
 
 # ================= SELL =================
 async def sell(p):
-
     price = await get_price(p["token"])
     if not price:
         return
@@ -332,7 +320,7 @@ async def monitor():
 
             dd = (price - peak) / peak
 
-            if pnl > 0.3 or pnl < -0.1 or dd < -0.06:
+            if pnl > 0.35 or pnl < -0.12 or dd < -0.07:
                 await sell(p)
 
         await asyncio.sleep(2)
@@ -366,11 +354,12 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def start():
-    log("SYSTEM START v1330")
+    log("SYSTEM START v1331")
 
     asyncio.create_task(discover())
     asyncio.create_task(smart_money())
     asyncio.create_task(flow())
+    asyncio.create_task(insider())
     asyncio.create_task(main())
     asyncio.create_task(monitor())
 
@@ -388,7 +377,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1330 ULTIMATE</h2>
+    <h2>🔥 v1331 ALPHA GOD</h2>
     <div id=data></div>
     <script>
     async function load(){
