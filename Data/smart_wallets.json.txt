@@ -1,7 +1,0 @@
-{
-  "wallets": ["wallet1_base58...", "wallet2_base58..."],
-  "weights": {
-    "wallet1_base58...": 1.0,
-    "wallet2_base58...": 0.85
-  }
-}
