@@ -1,223 +1,333 @@
-# ================= v1322 FIXED (NO CRASH) =================
 import os
 import base64
 import asyncio
 import random
-import httpx
 from collections import defaultdict
 
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, HTMLResponse
-
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 
 from state import engine
 
-# ================= CONFIG =================
 RPCS = [
     os.getenv("RPC_1", "https://api.mainnet-beta.solana.com"),
     os.getenv("RPC_2", "https://rpc.ankr.com/solana"),
 ]
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "300"))
-BASE_SIZE = float(os.getenv("BASE_SIZE", "0.02"))
-
+BASE_SIZE_SOL = float(os.getenv("BASE_SIZE", "0.02"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-TAKE_PROFIT = float(os.getenv("TP", "0.3"))
+TAKE_PROFIT = float(os.getenv("TP", "0.30"))
 STOP_LOSS = float(os.getenv("SL", "0.15"))
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-SOL = "So11111111111111111111111111111111111111112"
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# ================= GLOBAL =================
 rpc_index = 0
-client = AsyncClient(RPCS[rpc_index])
+rpc_client = AsyncClient(RPCS[rpc_index], timeout=15)
+token_cooldown = defaultdict(float)
+last_log_time = {}
 
-TOKEN_COOLDOWN = defaultdict(float)
-last_log = {}
+app = FastAPI(title="Sniper Bot")
 
-# ================= UTIL =================
-def log_once(k, msg, sec=5):
+def init_engine():
+    if not hasattr(engine, "positions"):
+        engine.positions = []
+    if not hasattr(engine, "logs"):
+        engine.logs = []
+    if not hasattr(engine, "stats"):
+        engine.stats = {
+            "signals": 0,
+            "buys": 0,
+            "sells": 0,
+            "errors": 0,
+        }
+    if not hasattr(engine, "running"):
+        engine.running = True
+    if not hasattr(engine, "mode"):
+        engine.mode = "DRY_RUN" if DRY_RUN else "REAL"
+
+def log_once(key: str, msg: str, sec: float = 5.0):
     now = asyncio.get_event_loop().time()
-    if now - last_log.get(k, 0) > sec:
-        print(msg)
+    if now - last_log_time.get(key, 0) >= sec:
+        print(msg, flush=True)
         engine.logs.append(msg)
-        last_log[k] = now
+        engine.logs = engine.logs[-200:]
+        last_log_time[key] = now
 
-def get_client():
-    global rpc_index, client
-    try:
-        return client
-    except:
-        rpc_index = (rpc_index + 1) % len(RPCS)
-        client = AsyncClient(RPCS[rpc_index])
-        return client
-
-def keypair():
+def get_keypair() -> Keypair:
+    if not PRIVATE_KEY:
+        raise ValueError("PRIVATE_KEY is empty")
     return Keypair.from_base58_string(PRIVATE_KEY)
 
-# ================= JUP =================
-async def jup_swap(input_mint, output_mint, amount):
-    async with httpx.AsyncClient(timeout=10) as s:
-        q = await s.get("https://quote-api.jup.ag/v6/quote", params={
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": int(amount * 1e9),
-            "slippageBps": SLIPPAGE_BPS,
-        })
-        data = q.json()
+def get_client() -> AsyncClient:
+    global rpc_client
+    return rpc_client
 
-        if not data.get("data"):
-            log_once("no_route", f"NO ROUTE {output_mint}")
+async def rotate_client():
+    global rpc_index, rpc_client
+    try:
+        await rpc_client.close()
+    except Exception:
+        pass
+    rpc_index = (rpc_index + 1) % len(RPCS)
+    rpc_client = AsyncClient(RPCS[rpc_index], timeout=15)
+    log_once("rpc_rotate", f"RPC ROTATE -> {RPCS[rpc_index]}", 1)
+
+async def jup_swap_tx(input_mint: str, output_mint: str, amount_sol: float) -> str | None:
+    lamports = int(amount_sol * 1_000_000_000)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        quote_resp = await client.get(
+            "https://quote-api.jup.ag/v6/quote",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": lamports,
+                "slippageBps": SLIPPAGE_BPS,
+            },
+        )
+        quote_resp.raise_for_status()
+        quote_data = quote_resp.json()
+
+        routes = quote_data.get("data", [])
+        if not routes:
+            log_once(f"no_route_{output_mint}", f"NO ROUTE {output_mint}", 2)
             return None
 
-        route = data["data"][0]
+        route = routes[0]
 
-        res = await s.post("https://quote-api.jup.ag/v6/swap", json={
+        swap_body = {
             "route": route,
-            "userPublicKey": str(keypair().pubkey()),
-            "wrapAndUnwrapSol": True
-        })
+            "userPublicKey": str(get_keypair().pubkey()),
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+        }
 
-        j = res.json()
-        return j.get("swapTransaction")
+        swap_resp = await client.post(
+            "https://quote-api.jup.ag/v6/swap",
+            json=swap_body,
+        )
+        swap_resp.raise_for_status()
+        swap_data = swap_resp.json()
 
-# ================= SEND =================
-async def send_tx(tx_base64):
+        tx_b64 = swap_data.get("swapTransaction")
+        if not tx_b64:
+            log_once(f"no_tx_{output_mint}", f"NO TX {output_mint}", 2)
+            return None
+
+        return tx_b64
+
+async def send_tx(tx_base64: str) -> str | None:
+    if DRY_RUN:
+        fake_sig = f"DRYRUN_{random.randint(100000, 999999)}"
+        log_once("dry_send", f"DRY SENT {fake_sig}", 1)
+        return fake_sig
+
     try:
-        kp = keypair()
-        tx = VersionedTransaction.from_bytes(base64.b64decode(tx_base64))
-        tx.sign([kp])
+        keypair = get_keypair()
+        raw_tx = base64.b64decode(tx_base64)
+        tx = VersionedTransaction.from_bytes(raw_tx)
+        signed_tx = VersionedTransaction(tx.message, [keypair])
 
         client = get_client()
-        sig = await client.send_raw_transaction(bytes(tx))
+        resp = await client.send_raw_transaction(bytes(signed_tx))
+        sig = str(resp.value)
+        log_once("tx_sent", f"SENT {sig}", 1)
 
-        log_once("send", f"SENT {sig.value}")
-        return sig.value
+        for _ in range(10):
+            status = await client.get_signature_statuses([sig])
+            value = status.value[0]
+            if value is not None and value.confirmation_status is not None:
+                log_once("tx_ok", f"CONFIRMED {sig}", 1)
+                return sig
+            await asyncio.sleep(1)
+
+        log_once("tx_timeout", f"TIMEOUT {sig}", 1)
+        return sig
 
     except Exception as e:
-        log_once("send_err", f"ERR {e}")
+        log_once("send_fail", f"SEND FAIL {type(e).__name__}: {e}", 1)
+        await rotate_client()
         return None
 
-# ================= BUY =================
-async def buy(token, score):
+async def buy_token(token_mint: str, score: float):
+    now = asyncio.get_event_loop().time()
+
     if len(engine.positions) >= MAX_POSITIONS:
         return
-
-    if TOKEN_COOLDOWN[token] > asyncio.get_event_loop().time():
+    if token_cooldown[token_mint] > now:
         return
 
-    log_once("buy_try", f"BUY {token} s={score:.3f}")
+    log_once(f"buy_try_{token_mint}", f"TRY BUY {token_mint} score={score:.4f}", 1)
 
-    tx = await jup_swap(SOL, token, BASE_SIZE)
+    try:
+        tx_b64 = await jup_swap_tx(SOL_MINT, token_mint, BASE_SIZE_SOL)
+        if not tx_b64:
+            log_once(f"buy_fail_{token_mint}", f"BUY FAIL {token_mint}", 1)
+            token_cooldown[token_mint] = now + 20
+            return
 
-    if not tx:
-        log_once("no_tx", f"NO TX {token}")
-        return
+        sig = await send_tx(tx_b64)
+        if not sig:
+            log_once(f"buy_send_fail_{token_mint}", f"BUY SEND FAIL {token_mint}", 1)
+            token_cooldown[token_mint] = now + 20
+            return
 
-    sig = await send_tx(tx)
-
-    if sig:
-        engine.positions.append({
-            "token": token,
-            "entry_score": score,
-            "size": BASE_SIZE,
-            "tx": sig
-        })
+        entry_price = random.uniform(0.8, 1.2)
+        engine.positions.append(
+            {
+                "token": token_mint,
+                "size_sol": BASE_SIZE_SOL,
+                "entry_score": score,
+                "entry_price": entry_price,
+                "last_price": entry_price,
+                "tx": sig,
+            }
+        )
         engine.stats["buys"] += 1
+        log_once(f"buy_ok_{token_mint}", f"BUY OK {token_mint}", 1)
+        token_cooldown[token_mint] = now + 30
 
-    TOKEN_COOLDOWN[token] = asyncio.get_event_loop().time() + 20
+    except Exception as e:
+        engine.stats["errors"] += 1
+        log_once(f"buy_err_{token_mint}", f"BUY ERR {token_mint} {type(e).__name__}: {e}", 1)
 
-# ================= SELL =================
-async def sell(pos):
-    token = pos["token"]
+async def sell_position(pos: dict):
+    token_mint = pos["token"]
 
-    tx = await jup_swap(token, SOL, pos["size"])
-    if not tx:
-        return
+    try:
+        if DRY_RUN:
+            sig = f"DRYSELL_{random.randint(100000, 999999)}"
+            log_once(f"sell_ok_{token_mint}", f"SELL OK {token_mint} {sig}", 1)
+        else:
+            tx_b64 = await jup_swap_tx(token_mint, SOL_MINT, pos["size_sol"])
+            if not tx_b64:
+                log_once(f"sell_fail_{token_mint}", f"SELL FAIL {token_mint}", 1)
+                return
+            sig = await send_tx(tx_b64)
+            if not sig:
+                log_once(f"sell_send_fail_{token_mint}", f"SELL SEND FAIL {token_mint}", 1)
+                return
 
-    sig = await send_tx(tx)
-
-    if sig:
-        engine.positions.remove(pos)
+        if pos in engine.positions:
+            engine.positions.remove(pos)
         engine.stats["sells"] += 1
-        log_once("sell", f"SELL {token}")
 
-# ================= RISK =================
-async def risk_loop():
-    while True:
-        for p in list(engine.positions):
-            pnl = random.uniform(-0.3, 0.5)
+    except Exception as e:
+        engine.stats["errors"] += 1
+        log_once(f"sell_err_{token_mint}", f"SELL ERR {token_mint} {type(e).__name__}: {e}", 1)
 
-            if pnl > TAKE_PROFIT or pnl < -STOP_LOSS:
-                await sell(p)
-
-        await asyncio.sleep(3)
-
-# ================= ALPHA =================
-def score():
+def mock_score() -> float:
     return random.random()
 
-# ================= MAIN =================
 async def bot_loop():
     while True:
         try:
-            tokens = [
-                ("EKpQGSJtjMFqKZ...", score()),  # 改成真 mint
-                ("DezXAZ8z7Pnrn...", score()),
+            if not engine.running:
+                await asyncio.sleep(2)
+                continue
+
+            # 先用這幾個示意 mint；要實盤請換成你自己的真 mint 列表
+            watchlist = [
+                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB2633PBnd",  # BONK
+                "EKpQGSJtjMFqKZqQanSqYXRcF6j6G4Vd8s4eJc5qQyQ",   # 範例，占位
             ]
 
-            ranked = sorted(tokens, key=lambda x: x[1], reverse=True)
+            ranked = []
+            for mint in watchlist:
+                s = mock_score()
+                engine.stats["signals"] += 1
+                ranked.append((mint, s))
 
-            for token, s in ranked:
-                if s > 0.6:
-                    await buy(token, s)
+            ranked.sort(key=lambda x: x[1], reverse=True)
 
-            await asyncio.sleep(2)
+            for mint, score in ranked:
+                if score > 0.6:
+                    await buy_token(mint, score)
+
+            await asyncio.sleep(3)
 
         except Exception as e:
             engine.stats["errors"] += 1
-            print("ERR", e)
-            await asyncio.sleep(2)
+            log_once("bot_loop_err", f"BOT LOOP ERR {type(e).__name__}: {e}", 1)
+            await asyncio.sleep(3)
 
-# ================= API =================
-app = FastAPI()
+async def risk_loop():
+    while True:
+        try:
+            for pos in list(engine.positions):
+                drift = random.uniform(-0.08, 0.12)
+                pos["last_price"] = max(0.0001, pos["last_price"] * (1 + drift))
+                pnl = (pos["last_price"] - pos["entry_price"]) / pos["entry_price"]
+
+                if pnl >= TAKE_PROFIT:
+                    log_once(f"tp_{pos['token']}", f"TAKE PROFIT {pos['token']} pnl={pnl:.3f}", 1)
+                    await sell_position(pos)
+                elif pnl <= -STOP_LOSS:
+                    log_once(f"sl_{pos['token']}", f"STOP LOSS {pos['token']} pnl={pnl:.3f}", 1)
+                    await sell_position(pos)
+
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            engine.stats["errors"] += 1
+            log_once("risk_loop_err", f"RISK LOOP ERR {type(e).__name__}: {e}", 1)
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
-async def start():
+async def startup():
+    init_engine()
     asyncio.create_task(bot_loop())
     asyncio.create_task(risk_loop())
+    log_once("startup", f"STARTUP mode={engine.mode}", 1)
 
 @app.get("/")
 async def root():
-    return JSONResponse({
-        "positions": engine.positions,
-        "stats": engine.stats,
-        "logs": engine.logs[-50:]
-    })
+    return JSONResponse(
+        {
+            "mode": engine.mode,
+            "positions": engine.positions,
+            "stats": engine.stats,
+            "logs": engine.logs[-50:],
+        }
+    )
 
-# ================= UI =================
+@app.get("/health")
+async def health():
+    return {"ok": True, "mode": engine.mode}
+
 @app.get("/ui")
 async def ui():
-    return HTMLResponse("""
-    <html>
-    <body style="background:black;color:lime;font-family:monospace">
-    <h2>🔥 SNIPER BOT v1322</h2>
-    <div id="data"></div>
-
-    <script>
-    async function load(){
-        let res = await fetch('/');
-        let d = await res.json();
-        document.getElementById("data").innerHTML =
-            "<pre>"+JSON.stringify(d,null,2)+"</pre>";
+    return HTMLResponse(
+        """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Sniper Bot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body style="background:#000;color:#0f0;font-family:monospace;padding:16px;">
+  <h2>🔥 SNIPER BOT</h2>
+  <div id="data">loading...</div>
+  <script>
+    async function load() {
+      const res = await fetch('/');
+      const data = await res.json();
+      document.getElementById('data').innerHTML =
+        '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
     }
-    setInterval(load,2000);
+    setInterval(load, 2000);
     load();
-    </script>
-    </body>
-    </html>
-    """)
+  </script>
+</body>
+</html>
+"""
+    )
