@@ -1,5 +1,6 @@
-# ================= v1327 AUTO TOKEN IDENTIFY =================
-# 🔥 保留全部功能 + 自動識別 token(symbol->mint) + 修 NO PRICE 問題
+# ================= v1327.1 DISCOVERY + FILTER =================
+# 保留原功能：buy / sell / monitor / watchdog / mempool / ui / debug
+# 新增：自動發現熱門 token + volume/liquidity filter + symbol->mint 自動識別
 
 import os
 import asyncio
@@ -17,7 +18,7 @@ from solders.transaction import VersionedTransaction
 
 # ================= HTTP =================
 HTTP = httpx.AsyncClient(
-    timeout=httpx.Timeout(5.0),
+    timeout=httpx.Timeout(6.0),
     limits=httpx.Limits(max_connections=20, max_keepalive_connections=5)
 )
 
@@ -26,8 +27,8 @@ SOL = "So11111111111111111111111111111111111111112"
 JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 
-# 你原本保留的候選
-CANDIDATES = {"BONK", "WIF", "JUP", "MYRO", "POPCAT"}
+# 保留你原本固定候選
+BASE_CANDIDATES = {"BONK", "WIF", "JUP", "MYRO", "POPCAT"}
 
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.005"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
@@ -38,7 +39,14 @@ TRAIL_DD_PCT = float(os.getenv("TRAIL_DD_PCT", "0.05"))
 
 BUY_LAMPORTS = int(os.getenv("BUY_LAMPORTS", "1000000"))
 
-# 優先用你自己已知 mapping；沒填的會自動查
+# 發現與過濾
+DISCOVERY_REFRESH_SEC = int(os.getenv("DISCOVERY_REFRESH_SEC", "60"))
+DISCOVERY_LIMIT = int(os.getenv("DISCOVERY_LIMIT", "12"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "25000"))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "2500"))
+MAX_TOKEN_AGE_MIN = int(os.getenv("MAX_TOKEN_AGE_MIN", "720"))  # 12h
+
+# 你已知的 token map；沒填的會自動查
 TOKEN_MAP = {
     "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB2633PBnd",
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
@@ -47,6 +55,7 @@ TOKEN_MAP = {
     "POPCAT": os.getenv("POPCAT_MINT", "").strip(),
 }
 
+# ================= GLOBAL =================
 TOKEN_COOLDOWN = defaultdict(float)
 IN_FLIGHT_BUY = set()
 IN_FLIGHT_SELL = set()
@@ -55,14 +64,32 @@ LAST_LOG = {}
 PRICE_HISTORY = {}
 MEMPOOL_SIGNAL = {}
 
-# symbol / mint 自動識別快取
 TOKEN_SEARCH_CACHE = {}
 TOKEN_SEARCH_TS = {}
 TOKEN_SEARCH_TTL = 60 * 30
 
+DISCOVERED = {}     # symbol -> meta
+DISCOVERED_TS = 0
+
 # ================= UTIL =================
 def now():
     return time.time()
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+        return default
 
 def ensure_list(v):
     if isinstance(v, list):
@@ -100,13 +127,14 @@ def ensure_engine():
         "sells": int(current_stats.get("sells", 0)),
         "errors": int(current_stats.get("errors", 0)),
         "signals": int(current_stats.get("signals", 0)),
+        "discovered": int(current_stats.get("discovered", 0)),
     }
 
 def log(msg):
     ensure_engine()
     engine.logs.append(str(msg))
-    if len(engine.logs) > 200:
-        engine.logs = engine.logs[-200:]
+    if len(engine.logs) > 300:
+        engine.logs = engine.logs[-300:]
     print(msg, flush=True)
 
 def log_once(k, msg, sec=5):
@@ -120,9 +148,7 @@ def get_kp():
     return Keypair.from_base58_string(PRIVATE_KEY)
 
 def looks_like_mint(v: str) -> bool:
-    if not isinstance(v, str):
-        return False
-    return len(v) >= 32 and " " not in v and "." not in v and "/" not in v
+    return isinstance(v, str) and len(v) >= 32 and " " not in v and "/" not in v
 
 # ================= SAFE HTTP =================
 async def safe_get(url, params=None, headers=None):
@@ -138,36 +164,25 @@ async def safe_get(url, params=None, headers=None):
 
 # ================= TOKEN IDENTIFY =================
 async def search_jupiter_token(query: str):
-    """
-    優先使用手動 TOKEN_MAP。
-    如果沒有，再走 Jupiter Tokens API 搜尋。
-    回傳 mint；找不到就回原值。
-    """
     if not query:
         return query
 
     q = str(query).strip()
     uq = q.upper()
 
-    # 1) 已經像 mint
     if looks_like_mint(q):
         return q
 
-    # 2) 手動 mapping 優先
     mapped = TOKEN_MAP.get(uq)
     if mapped:
         return mapped
 
-    # 3) 快取
-    ts = TOKEN_SEARCH_TS.get(uq, 0)
     cached = TOKEN_SEARCH_CACHE.get(uq)
+    ts = TOKEN_SEARCH_TS.get(uq, 0)
     if cached and now() - ts < TOKEN_SEARCH_TTL:
         return cached
 
-    # 4) Jupiter Tokens API V2 搜尋
-    # 文件有 Tokens API V2 搜尋能力；這裡做多端點容錯
     headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
-
     endpoints = [
         "https://api.jup.ag/tokens/v2/search",
         "https://api.jup.ag/tokens/v1/search",
@@ -178,29 +193,28 @@ async def search_jupiter_token(query: str):
         if not data:
             continue
 
-        candidates = []
+        tokens = []
         if isinstance(data, dict):
             if isinstance(data.get("tokens"), list):
-                candidates = data["tokens"]
+                tokens = data["tokens"]
             elif isinstance(data.get("data"), list):
-                candidates = data["data"]
+                tokens = data["data"]
             elif isinstance(data.get("results"), list):
-                candidates = data["results"]
+                tokens = data["results"]
         elif isinstance(data, list):
-            candidates = data
+            tokens = data
 
-        if not candidates:
+        if not tokens:
             continue
 
-        # 優先 exact symbol，再來 verified / organic score 高的
         def rank_token(t):
             sym = str(t.get("symbol", "")).upper()
             verified = 1 if t.get("verified") else 0
-            organic = float(t.get("organicScore", 0) or 0)
+            organic = safe_float(t.get("organicScore"), 0)
             exact = 1 if sym == uq else 0
             return (exact, verified, organic)
 
-        best = sorted(candidates, key=rank_token, reverse=True)[0]
+        best = sorted(tokens, key=rank_token, reverse=True)[0]
         mint = best.get("address") or best.get("mint") or best.get("id")
 
         if mint:
@@ -212,9 +226,139 @@ async def search_jupiter_token(query: str):
     log_once(f"token_resolve_fail_{uq}", f"TOKEN_RESOLVE_FAIL {uq}", 30)
     return q
 
+# ================= DEXSCREENER DISCOVERY =================
+async def ds_latest_profiles():
+    data = await safe_get("https://api.dexscreener.com/token-profiles/latest/v1")
+    if isinstance(data, list):
+        return [x for x in data if x.get("chainId") == "solana"]
+    return []
+
+async def ds_latest_boosts():
+    data = await safe_get("https://api.dexscreener.com/token-boosts/latest/v1")
+    if isinstance(data, list):
+        return [x for x in data if x.get("chainId") == "solana"]
+    return []
+
+async def ds_top_boosts():
+    data = await safe_get("https://api.dexscreener.com/token-boosts/top/v1")
+    if isinstance(data, list):
+        return [x for x in data if x.get("chainId") == "solana"]
+    return []
+
+async def ds_token_pairs(mint: str):
+    data = await safe_get(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}")
+    return data if isinstance(data, list) else []
+
+def pick_best_pair(pairs):
+    if not pairs:
+        return None
+
+    def pair_score(p):
+        liq = safe_float((p.get("liquidity") or {}).get("usd"), 0)
+        vol5 = safe_float((p.get("volume") or {}).get("m5"), 0)
+        buys5 = safe_int((((p.get("txns") or {}).get("m5") or {}).get("buys")), 0)
+        sells5 = safe_int((((p.get("txns") or {}).get("m5") or {}).get("sells")), 0)
+        return liq + vol5 * 2 + (buys5 - sells5) * 20
+
+    return sorted(pairs, key=pair_score, reverse=True)[0]
+
+async def refresh_discovery():
+    global DISCOVERED, DISCOVERED_TS
+
+    try:
+        profiles, boosts, top_boosts = await asyncio.gather(
+            ds_latest_profiles(),
+            ds_latest_boosts(),
+            ds_top_boosts(),
+        )
+
+        raw = {}
+        for item in profiles + boosts + top_boosts:
+            mint = item.get("tokenAddress")
+            if not mint:
+                continue
+            raw[mint] = {
+                "mint": mint,
+                "symbol": (item.get("symbol") or mint[:6]).upper(),
+                "boost_amount": safe_float(item.get("amount"), 0),
+                "boost_total": safe_float(item.get("totalAmount"), 0),
+            }
+
+        selected_mints = list(raw.keys())[:DISCOVERY_LIMIT]
+        fresh = {}
+
+        now_ms = int(now() * 1000)
+
+        for mint in selected_mints:
+            pairs = await ds_token_pairs(mint)
+            best = pick_best_pair(pairs)
+            await asyncio.sleep(0.05)
+
+            if not best:
+                continue
+
+            liquidity_usd = safe_float((best.get("liquidity") or {}).get("usd"), 0)
+            volume_5m = safe_float((best.get("volume") or {}).get("m5"), 0)
+            price_usd = safe_float(best.get("priceUsd"), 0)
+            pair_created_at = safe_int(best.get("pairCreatedAt"), 0)
+
+            age_min = 999999
+            if pair_created_at > 0:
+                age_min = max(0, int((now_ms - pair_created_at) / 60000))
+
+            if liquidity_usd < MIN_LIQUIDITY_USD:
+                continue
+            if volume_5m < MIN_VOLUME_5M_USD:
+                continue
+            if age_min > MAX_TOKEN_AGE_MIN:
+                continue
+
+            base = best.get("baseToken") or {}
+            symbol = str(base.get("symbol") or raw[mint]["symbol"]).upper()
+
+            fresh[symbol] = {
+                "symbol": symbol,
+                "mint": mint,
+                "price_usd": price_usd,
+                "liquidity_usd": liquidity_usd,
+                "volume_5m": volume_5m,
+                "price_change_5m": safe_float((best.get("priceChange") or {}).get("m5"), 0),
+                "buys_5m": safe_int((((best.get("txns") or {}).get("m5") or {}).get("buys")), 0),
+                "sells_5m": safe_int((((best.get("txns") or {}).get("m5") or {}).get("sells")), 0),
+                "age_min": age_min,
+                "boost_total": raw[mint]["boost_total"],
+                "pair_url": best.get("url"),
+                "dex_id": best.get("dexId"),
+            }
+
+            TOKEN_SEARCH_CACHE[symbol] = mint
+            TOKEN_SEARCH_TS[symbol] = now()
+
+        DISCOVERED = fresh
+        DISCOVERED_TS = now()
+        ensure_engine()
+        engine.stats["discovered"] = len(DISCOVERED)
+        log_once("discover", f"DISCOVERED {len(DISCOVERED)}", 10)
+
+    except Exception as e:
+        ensure_engine()
+        engine.stats["errors"] += 1
+        log_once("discover_err", f"DISCOVERY_ERR {e}", 10)
+
+async def discovery_loop():
+    while True:
+        await refresh_discovery()
+        await asyncio.sleep(DISCOVERY_REFRESH_SEC)
+
 # ================= PRICE =================
 async def get_price(token_or_mint):
     mint = await search_jupiter_token(token_or_mint)
+
+    # 先優先用 discovery 的最新 price
+    if token_or_mint in DISCOVERED:
+        px = safe_float(DISCOVERED[token_or_mint].get("price_usd"), 0)
+        if px > 0:
+            return px
 
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
@@ -258,8 +402,25 @@ async def alpha(m):
 
     momentum = (hist[-1] - hist[0]) / hist[0]
     volatility = max(hist) - min(hist)
-
     score = momentum + volatility * 2
+
+    # 發現層加分：volume / liquidity / orderflow / early age
+    meta = DISCOVERED.get(m, {})
+    if meta:
+        volume_boost = min(safe_float(meta.get("volume_5m"), 0) / 100000.0, 0.08)
+        liquidity_boost = min(safe_float(meta.get("liquidity_usd"), 0) / 500000.0, 0.05)
+        flow_boost = min(max((safe_int(meta.get("buys_5m"), 0) - safe_int(meta.get("sells_5m"), 0)) / 200.0, -0.05), 0.08)
+
+        age_min = safe_float(meta.get("age_min"), 999999)
+        early_boost = 0.0
+        if age_min <= 15:
+            early_boost = 0.08
+        elif age_min <= 60:
+            early_boost = 0.05
+        elif age_min <= 180:
+            early_boost = 0.02
+
+        score += volume_boost + liquidity_boost + flow_boost + early_boost
 
     if MEMPOOL_SIGNAL.get(m):
         score += 0.2
@@ -270,7 +431,11 @@ async def alpha(m):
 async def mempool():
     while True:
         try:
-            m = random.choice(list(CANDIDATES))
+            candidate_pool = list(BASE_CANDIDATES) + list(DISCOVERED.keys())
+            if not candidate_pool:
+                await asyncio.sleep(1)
+                continue
+            m = random.choice(candidate_pool)
             MEMPOOL_SIGNAL[m] = now()
             log_once("mempool", f"MEMPOOL {m}", 2)
         except Exception as e:
@@ -447,9 +612,17 @@ async def rank_candidates():
     ensure_engine()
     ranked = []
 
-    log_once("rank_debug", f"SCANNING {len(CANDIDATES)}", 3)
+    # 固定候選 + 新發現熱門 token
+    candidate_pool = list(BASE_CANDIDATES) + list(DISCOVERED.keys())
 
-    for m in list(CANDIDATES):
+    log_once("rank_debug", f"SCANNING {len(candidate_pool)}", 3)
+
+    seen = set()
+    for m in candidate_pool:
+        if m in seen:
+            continue
+        seen.add(m)
+
         try:
             a = await alpha(m)
             ranked.append((m, a))
@@ -458,7 +631,7 @@ async def rank_candidates():
             log_once("rank_err", f"RANK_ERR {m} {e}", 5)
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    return ranked[:5]
+    return ranked[:10]
 
 # ================= MAIN =================
 async def main():
@@ -496,6 +669,7 @@ async def start():
         engine.normalize()
     log("SYSTEM STARTED")
 
+    asyncio.create_task(discovery_loop())
     asyncio.create_task(main())
     asyncio.create_task(monitor())
     asyncio.create_task(mempool())
@@ -512,6 +686,8 @@ def root():
         "logs": engine.logs[-20:] if isinstance(engine.logs, list) else ["SYSTEM BOOTING..."],
         "token_map": TOKEN_MAP,
         "token_cache": TOKEN_SEARCH_CACHE,
+        "discovered": DISCOVERED,
+        "discovered_ts": DISCOVERED_TS,
     }
 
 @app.get("/debug")
@@ -525,6 +701,7 @@ def debug():
         "engine_positions_type": str(type(engine.positions)),
         "engine_trade_history_type": str(type(engine.trade_history)),
         "token_cache_size": len(TOKEN_SEARCH_CACHE),
+        "discovered_count": len(DISCOVERED),
     }
 
 @app.get("/ui")
@@ -532,7 +709,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1327 AUTO TOKEN IDENTIFY</h2>
+    <h2>🔥 v1327.1 DISCOVERY + FILTER</h2>
     <div id=data>Loading...</div>
     <script>
     async function load(){
