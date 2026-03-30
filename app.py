@@ -1,6 +1,7 @@
-# ================= v1326.3 FINAL SAFE FIX =================
-# 🔥 不刪功能 + 修 engine 型別問題 + 不再 startup crash
+# ================= v1327 AUTO TOKEN IDENTIFY =================
+# 🔥 保留全部功能 + 自動識別 token(symbol->mint) + 修 NO PRICE 問題
 
+import os
 import asyncio
 import time
 import random
@@ -20,14 +21,31 @@ HTTP = httpx.AsyncClient(
     limits=httpx.Limits(max_connections=20, max_keepalive_connections=5)
 )
 
+# ================= CONFIG =================
 SOL = "So11111111111111111111111111111111111111112"
-JUP_API_KEY = ""
-PRIVATE_KEY = "改成你新的私鑰，不要再用舊的"
+JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip()
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 
+# 你原本保留的候選
 CANDIDATES = {"BONK", "WIF", "JUP", "MYRO", "POPCAT"}
 
-ENTRY_THRESHOLD = 0.005
-MAX_POSITIONS = 2
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.005"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+
+TP_PCT = float(os.getenv("TP_PCT", "0.10"))
+SL_PCT = float(os.getenv("SL_PCT", "0.05"))
+TRAIL_DD_PCT = float(os.getenv("TRAIL_DD_PCT", "0.05"))
+
+BUY_LAMPORTS = int(os.getenv("BUY_LAMPORTS", "1000000"))
+
+# 優先用你自己已知 mapping；沒填的會自動查
+TOKEN_MAP = {
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB2633PBnd",
+    "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "WIF": os.getenv("WIF_MINT", "").strip(),
+    "MYRO": os.getenv("MYRO_MINT", "").strip(),
+    "POPCAT": os.getenv("POPCAT_MINT", "").strip(),
+}
 
 TOKEN_COOLDOWN = defaultdict(float)
 IN_FLIGHT_BUY = set()
@@ -36,6 +54,11 @@ LAST_LOG = {}
 
 PRICE_HISTORY = {}
 MEMPOOL_SIGNAL = {}
+
+# symbol / mint 自動識別快取
+TOKEN_SEARCH_CACHE = {}
+TOKEN_SEARCH_TS = {}
+TOKEN_SEARCH_TTL = 60 * 30
 
 # ================= UTIL =================
 def now():
@@ -92,7 +115,14 @@ def log_once(k, msg, sec=5):
         log(msg)
 
 def get_kp():
+    if not PRIVATE_KEY:
+        raise ValueError("PRIVATE_KEY missing")
     return Keypair.from_base58_string(PRIVATE_KEY)
+
+def looks_like_mint(v: str) -> bool:
+    if not isinstance(v, str):
+        return False
+    return len(v) >= 32 and " " not in v and "." not in v and "/" not in v
 
 # ================= SAFE HTTP =================
 async def safe_get(url, params=None, headers=None):
@@ -106,19 +136,99 @@ async def safe_get(url, params=None, headers=None):
             await asyncio.sleep(0.2)
     return None
 
+# ================= TOKEN IDENTIFY =================
+async def search_jupiter_token(query: str):
+    """
+    優先使用手動 TOKEN_MAP。
+    如果沒有，再走 Jupiter Tokens API 搜尋。
+    回傳 mint；找不到就回原值。
+    """
+    if not query:
+        return query
+
+    q = str(query).strip()
+    uq = q.upper()
+
+    # 1) 已經像 mint
+    if looks_like_mint(q):
+        return q
+
+    # 2) 手動 mapping 優先
+    mapped = TOKEN_MAP.get(uq)
+    if mapped:
+        return mapped
+
+    # 3) 快取
+    ts = TOKEN_SEARCH_TS.get(uq, 0)
+    cached = TOKEN_SEARCH_CACHE.get(uq)
+    if cached and now() - ts < TOKEN_SEARCH_TTL:
+        return cached
+
+    # 4) Jupiter Tokens API V2 搜尋
+    # 文件有 Tokens API V2 搜尋能力；這裡做多端點容錯
+    headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
+
+    endpoints = [
+        "https://api.jup.ag/tokens/v2/search",
+        "https://api.jup.ag/tokens/v1/search",
+    ]
+
+    for url in endpoints:
+        data = await safe_get(url, params={"query": q}, headers=headers)
+        if not data:
+            continue
+
+        candidates = []
+        if isinstance(data, dict):
+            if isinstance(data.get("tokens"), list):
+                candidates = data["tokens"]
+            elif isinstance(data.get("data"), list):
+                candidates = data["data"]
+            elif isinstance(data.get("results"), list):
+                candidates = data["results"]
+        elif isinstance(data, list):
+            candidates = data
+
+        if not candidates:
+            continue
+
+        # 優先 exact symbol，再來 verified / organic score 高的
+        def rank_token(t):
+            sym = str(t.get("symbol", "")).upper()
+            verified = 1 if t.get("verified") else 0
+            organic = float(t.get("organicScore", 0) or 0)
+            exact = 1 if sym == uq else 0
+            return (exact, verified, organic)
+
+        best = sorted(candidates, key=rank_token, reverse=True)[0]
+        mint = best.get("address") or best.get("mint") or best.get("id")
+
+        if mint:
+            TOKEN_SEARCH_CACHE[uq] = mint
+            TOKEN_SEARCH_TS[uq] = now()
+            log_once(f"token_map_{uq}", f"TOKEN_MAP {uq}->{mint[:6]}", 30)
+            return mint
+
+    log_once(f"token_resolve_fail_{uq}", f"TOKEN_RESOLVE_FAIL {uq}", 30)
+    return q
+
 # ================= PRICE =================
-async def get_price(m):
+async def get_price(token_or_mint):
+    mint = await search_jupiter_token(token_or_mint)
+
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
         {
             "inputMint": SOL,
-            "outputMint": m,
-            "amount": 1000000
-        }
+            "outputMint": mint,
+            "amount": 1000000,
+            "slippageBps": 100
+        },
+        headers={"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
     )
 
     if not data:
-        log_once("price_none", f"NO PRICE {m}", 5)
+        log_once("price_none", f"NO PRICE {token_or_mint}", 5)
         return None
 
     try:
@@ -169,15 +279,17 @@ async def mempool():
 
 # ================= JUP =================
 async def jupiter_order(inp, out, amt):
+    out_mint = await search_jupiter_token(out)
     headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
 
     data = await safe_get(
         "https://api.jup.ag/swap/v2/order",
         {
             "inputMint": inp,
-            "outputMint": out,
+            "outputMint": out_mint,
             "amount": str(amt),
-            "taker": str(get_kp().pubkey())
+            "taker": str(get_kp().pubkey()),
+            "slippageBps": 100,
         },
         headers=headers
     )
@@ -198,7 +310,8 @@ async def jupiter_exec(order):
             "https://api.jup.ag/swap/v2/execute",
             headers=headers,
             json={
-                "signedTransaction": base64.b64encode(bytes(signed)).decode()
+                "signedTransaction": base64.b64encode(bytes(signed)).decode(),
+                "requestId": order.get("requestId"),
             }
         )
         if r.status_code == 200:
@@ -236,7 +349,7 @@ async def buy(m, combo):
 
         log_once(f"try_{m}", f"TRY BUY {m} {combo:.4f}", 2)
 
-        order = await jupiter_order(SOL, m, 1000000)
+        order = await jupiter_order(SOL, m, BUY_LAMPORTS)
 
         if not order:
             log(f"BUY_FAIL {m}")
@@ -253,8 +366,11 @@ async def buy(m, combo):
             log(f"BUY_NO_PRICE {m}")
             return
 
+        mint = await search_jupiter_token(m)
+
         engine.positions.append({
             "token": m,
+            "mint": mint,
             "entry_price": price,
             "last_price": price,
             "peak_price": price,
@@ -318,7 +434,7 @@ async def monitor():
 
                 dd = (price - peak) / peak
 
-                if pnl > 0.1 or pnl < -0.05 or dd < -0.05:
+                if pnl > TP_PCT or pnl < -SL_PCT or dd < -TRAIL_DD_PCT:
                     await sell(p)
 
         except Exception as e:
@@ -376,6 +492,8 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
+    if hasattr(engine, "normalize"):
+        engine.normalize()
     log("SYSTEM STARTED")
 
     asyncio.create_task(main())
@@ -391,7 +509,9 @@ def root():
         "time": now(),
         "positions": engine.positions,
         "stats": engine.stats,
-        "logs": engine.logs[-20:] if isinstance(engine.logs, list) else ["SYSTEM BOOTING..."]
+        "logs": engine.logs[-20:] if isinstance(engine.logs, list) else ["SYSTEM BOOTING..."],
+        "token_map": TOKEN_MAP,
+        "token_cache": TOKEN_SEARCH_CACHE,
     }
 
 @app.get("/debug")
@@ -404,6 +524,7 @@ def debug():
         "engine_logs_type": str(type(engine.logs)),
         "engine_positions_type": str(type(engine.positions)),
         "engine_trade_history_type": str(type(engine.trade_history)),
+        "token_cache_size": len(TOKEN_SEARCH_CACHE),
     }
 
 @app.get("/ui")
@@ -411,7 +532,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1326.3 FINAL SAFE FIX</h2>
+    <h2>🔥 v1327 AUTO TOKEN IDENTIFY</h2>
     <div id=data>Loading...</div>
     <script>
     async function load(){
