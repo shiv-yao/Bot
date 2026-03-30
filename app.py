@@ -86,23 +86,30 @@ async def safe_get(url, params=None, headers=None):
     return None
 
 # ================= DISCOVER（🔥升級版） =================
+# ================= DISCOVER FIX v1337.1 =================
 async def discover():
     while True:
         try:
             new = set()
 
-            # ===== DEX =====
-            data = await safe_get("https://api.dexscreener.com/latest/dex/pairs/solana")
+            # ================= 1️⃣ Dexscreener（穩定版 endpoint） =================
+            data = await safe_get("https://api.dexscreener.com/latest/dex/search/?q=sol")
 
             if data and data.get("pairs"):
-                for p in data["pairs"][:50]:
-                    symbol = p["baseToken"]["symbol"].upper()
-                    mint = p["baseToken"]["address"]
+                for p in data["pairs"][:80]:
 
-                    vol = p.get("volume", {}).get("h24", 0)
-                    liq = p.get("liquidity", {}).get("usd", 0)
+                    base = p.get("baseToken", {})
+                    symbol = (base.get("symbol") or "").upper()
+                    mint = base.get("address")
 
-                    if vol < 10000 or liq < 10000:
+                    if not symbol or not mint:
+                        continue
+
+                    vol = (p.get("volume") or {}).get("h24", 0)
+                    liq = (p.get("liquidity") or {}).get("usd", 0)
+
+                    # 🔥 降低門檻（你之前太嚴）
+                    if vol < 2000 or liq < 2000:
                         continue
 
                     DISCOVERED[symbol] = {
@@ -110,13 +117,15 @@ async def discover():
                         "volume": vol,
                         "liquidity": liq
                     }
+
                     new.add(symbol)
 
-            # ===== JUP =====
+            # ================= 2️⃣ Jupiter fallback =================
             jup = await safe_get("https://token.jup.ag/all")
+
             if jup:
-                for t in jup[:30]:
-                    sym = t.get("symbol", "").upper()
+                for t in jup[:50]:
+                    sym = (t.get("symbol") or "").upper()
                     mint = t.get("address")
 
                     if sym and mint:
@@ -127,11 +136,12 @@ async def discover():
                         }
                         new.add(sym)
 
-            # ===== PUMP（最重要）=====
+            # ================= 3️⃣ Pump.fun（🔥最重要） =================
             pump = await safe_get("https://frontend-api.pump.fun/coins/latest")
+
             if pump:
                 for t in pump[:30]:
-                    sym = t.get("symbol", "").upper()
+                    sym = (t.get("symbol") or "").upper()
                     mint = t.get("mint")
 
                     if sym and mint:
@@ -140,15 +150,19 @@ async def discover():
                             "volume": 999999,
                             "liquidity": 999999
                         }
+
                         NEW_POOL[sym] = True
                         new.add(sym)
 
+            # ================= 更新 =================
             if new:
                 CANDIDATES.clear()
                 CANDIDATES.update(new)
-                log(f"🔥 DISCOVER {len(new)} TOKENS")
+
+                log(f"🔥 DISCOVER OK: {len(new)} tokens")
+
             else:
-                log("⚠️ NO TOKENS")
+                log("⚠️ STILL NO TOKENS")
 
         except Exception as e:
             log(f"DISCOVER_ERR {e}")
