@@ -1,0 +1,26 @@
+from fastapi import FastAPI
+import gradio as gr
+from app.engine import engine
+from app.risk.killswitch import activate_killswitch
+import asyncio
+
+app = FastAPI(title="War Trading System - Top Tier")
+
+@app.post("/start")
+async def start_engine():
+    asyncio.create_task(engine.god_main())
+    return {"status": "Trading engine started"}
+
+@app.post("/kill")
+async def kill_engine():
+    activate_killswitch("Manual trigger")
+    return {"status": "Killswitch activated"}
+
+with gr.Blocks(title="War Trading System") as demo:
+    gr.Markdown("# 🛡️ War Trading System - Top Tier 2026")
+    gr.Markdown("Smart Money + Jito + Rug Protection")
+    with gr.Row():
+        gr.Button("🚀 Start Engine", variant="primary").click(start_engine)
+        gr.Button("🛑 Killswitch", variant="stop").click(kill_engine)
+
+app = gr.mount_gradio_app(app, demo, path="/ui")

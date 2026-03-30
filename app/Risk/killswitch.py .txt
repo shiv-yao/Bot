@@ -1,0 +1,11 @@
+from app.storage import save_json
+import time
+
+def activate_killswitch(reason: str):
+    save_json({"killswitch": True, "reason": reason, "time": time.time()}, "state.json")
+    print(f"🔴 KILLSWITCH ACTIVATED: {reason}")
+
+def is_killswitch_active() -> bool:
+    from app.storage import load_json
+    state = load_json("state.json")
+    return state.get("killswitch", False)

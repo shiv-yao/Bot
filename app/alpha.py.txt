@@ -1,0 +1,14 @@
+from app.flow import smart_money_tracker
+from app.config import settings
+import random
+
+class AlphaEngine:
+    def calculate(self, token_data: dict) -> float:
+        volume = min(token_data.get("volume_5m", 0) / 100000, 1) * 0.25
+        liq = min(token_data.get("liquidity_usd", 0) / 50000, 1) * 0.25
+        smart = smart_money_tracker.get_smart_score(token_data.get("mint", "")) * settings.SMART_MONEY_WEIGHT
+        ai = random.random() * 0.2
+        total = volume + liq + smart + ai
+        return min(total, 1.0)
+
+alpha_engine = AlphaEngine()

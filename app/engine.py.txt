@@ -1,0 +1,31 @@
+from app.flow import smart_money_tracker
+from app.alpha import alpha_engine
+from app.execution import execute_swap
+from app.rug_checker import check_rug
+from app.risk.killswitch import is_killswitch_active
+from loguru import logger
+import asyncio
+
+class TradingEngine:
+    async def process_token(self, mint: str):
+        if is_killswitch_active():
+            return
+        rug = await check_rug(mint)
+        if not rug.get("safe", False):
+            return
+        score = alpha_engine.calculate({"mint": mint, "liquidity_usd": 60000})
+        if score > 0.76:
+            await execute_swap(
+                "So11111111111111111111111111111111111111112",
+                mint,
+                int(0.05 * 1e9)
+            )
+
+    async def god_main(self):
+        logger.success("🔥 War Trading System Top Tier Activated")
+        await asyncio.gather(
+            smart_money_tracker.subscribe_raydium_swaps(self.process_token),
+            # discovery listener 可在此擴展
+        )
+
+engine = TradingEngine()

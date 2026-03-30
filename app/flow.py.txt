@@ -1,0 +1,31 @@
+import asyncio
+import time
+from loguru import logger
+from app.config import settings
+from app.storage import load_json
+
+class SmartMoneyTracker:
+    def __init__(self):
+        self.smart_wallets = set()
+        self.wallet_weights = {}
+        self.flow_cache = {}
+        self.load_wallets()
+
+    def load_wallets(self):
+        data = load_json("smart_wallets.json")
+        self.smart_wallets = set(data.get("wallets", []))
+        self.wallet_weights = data.get("weights", {})
+        logger.info(f"📡 Loaded {len(self.smart_wallets)} Smart Money wallets")
+
+    async def subscribe_raydium_swaps(self, callback):
+        logger.info("🚀 Smart Money tracker started (replace with real Helius WS in production)")
+        while True:
+            await asyncio.sleep(30)  # 模擬監聽
+
+    def get_smart_score(self, mint: str) -> float:
+        if mint not in self.flow_cache:
+            return 0.0
+        recent = sum(1 for t in self.flow_cache.values() if time.time() - t < 1800)
+        return min(recent * 0.4, 1.0)
+
+smart_money_tracker = SmartMoneyTracker()
