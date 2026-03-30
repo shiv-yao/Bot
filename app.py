@@ -1,12 +1,11 @@
-# ================= v1335 FULL TRUE FUSION =================
-# 🔥 完整融合：不刪功能 + 修401 + fallback + 穩定 + production
+# ================= v1336 FULL TRUE FUSION =================
+# 🔥 不刪功能 + 自動熱門 token + 爆量 + AI + fallback + 穩定版
 
 import os
 import asyncio
 import time
 import random
 import base64
-import traceback
 from collections import defaultdict
 
 import httpx
@@ -21,18 +20,15 @@ from state import engine
 SOL = "So11111111111111111111111111111111111111112"
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip()
-REAL_TRADING = os.getenv("REAL_TRADING", "false").lower() == "true"
 
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.03"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-MAX_EXPOSURE_SOL = float(os.getenv("MAX_EXPOSURE_SOL", "1.5"))
 
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "200000"))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "120000"))
 
 TP_PCT = float(os.getenv("TP_PCT", "0.35"))
 SL_PCT = float(os.getenv("SL_PCT", "0.12"))
-DD_PCT = float(os.getenv("DD_PCT", "0.07"))
 
 # ================= HTTP =================
 HTTP = httpx.AsyncClient(timeout=5)
@@ -44,26 +40,12 @@ def jup_headers():
 CANDIDATES = set()
 DISCOVERED = {}
 
-SMART_MONEY = defaultdict(float)
-FLOW = defaultdict(float)
-INSIDER = defaultdict(float)
+PRICE_HISTORY = {}
+LAST_VOLUME = {}
+VOLUME_SPIKE = defaultdict(float)
 NEW_POOL = {}
 
-PRICE_HISTORY = {}
-VOL_HISTORY = {}
-
-TOKEN_COOLDOWN = defaultdict(float)
 IN_FLIGHT_BUY = set()
-IN_FLIGHT_SELL = set()
-
-AI_WEIGHTS = {
-    "momentum": 1.0,
-    "liquidity": 0.5,
-    "smart": 0.8,
-    "flow": 0.8,
-    "insider": 0.8,
-    "new_pool": 0.5,
-}
 
 # ================= UTIL =================
 def now():
@@ -72,8 +54,6 @@ def now():
 def ensure_engine():
     if not hasattr(engine, "positions"):
         engine.positions = []
-    if not hasattr(engine, "trade_history"):
-        engine.trade_history = []
     if not hasattr(engine, "logs"):
         engine.logs = []
     if not hasattr(engine, "stats"):
@@ -108,18 +88,15 @@ async def safe_post(url, json=None, headers=None):
 
 # ================= TOKEN =================
 async def resolve_token(symbol):
-    if symbol in DISCOVERED:
-        return DISCOVERED[symbol]["mint"]
-    return None
+    return DISCOVERED.get(symbol, {}).get("mint")
 
-# ================= PRICE（修401 + fallback） =================
+# ================= PRICE（含 fallback） =================
 async def get_price(symbol):
 
     mint = await resolve_token(symbol)
     if not mint:
         return None
 
-    # ===== 主API =====
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
         {
@@ -132,12 +109,11 @@ async def get_price(symbol):
 
     if data:
         try:
-            if data.get("outAmount"):
-                return float(data["outAmount"]) / 1e6
+            return float(data["outAmount"]) / 1e6
         except:
             pass
 
-    # ===== fallback =====
+    # fallback
     data = await safe_get(
         "https://quote-api.jup.ag/v6/quote",
         {
@@ -152,40 +128,89 @@ async def get_price(symbol):
 
     return None
 
-# ================= DISCOVERY =================
+# ================= DISCOVERY（升級版） =================
 async def discover():
     while True:
         try:
-            data = await safe_get("https://api.dexscreener.com/latest/dex/search/?q=sol")
-            if not data:
-                continue
+            new = set()
 
-            pairs = data.get("pairs", [])
-            for p in pairs[:50]:
-                symbol = p["baseToken"]["symbol"]
-                mint = p["baseToken"]["address"]
+            # ===== Dex =====
+            data = await safe_get(
+                "https://api.dexscreener.com/latest/dex/pairs/solana"
+            )
 
-                vol = p.get("volume", {}).get("h24", 0)
-                liq = p.get("liquidity", {}).get("usd", 0)
+            if data:
+                for p in data.get("pairs", [])[:80]:
 
-                if vol < MIN_VOLUME or liq < MIN_LIQUIDITY:
-                    continue
+                    base = p.get("baseToken", {})
+                    symbol = (base.get("symbol") or "").upper()
+                    mint = base.get("address")
 
-                DISCOVERED[symbol] = {
-                    "mint": mint,
-                    "volume": vol,
-                    "liquidity": liq,
-                }
+                    if not symbol or not mint:
+                        continue
 
-                CANDIDATES.add(symbol)
+                    if symbol in ["SOL", "USDC", "USDT"]:
+                        continue
+
+                    vol = float((p.get("volume") or {}).get("h24", 0) or 0)
+                    liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
+
+                    if vol < MIN_VOLUME or liq < MIN_LIQUIDITY:
+                        continue
+
+                    # ===== 爆量 =====
+                    prev = LAST_VOLUME.get(symbol, vol)
+                    spike = (vol - prev) / max(prev, 1)
+
+                    if spike > 0.5:
+                        VOLUME_SPIKE[symbol] += spike
+
+                    LAST_VOLUME[symbol] = vol
+
+                    # ===== 新池 =====
+                    age = p.get("pairCreatedAt", 0)
+                    if age and now() - (age/1000) < 600:
+                        NEW_POOL[symbol] = True
+
+                    DISCOVERED[symbol] = {
+                        "mint": mint,
+                        "volume": vol,
+                        "liquidity": liq,
+                        "spike": VOLUME_SPIKE[symbol],
+                    }
+
+                    new.add(symbol)
+
+            # ===== Jupiter tokens =====
+            jup = await safe_get("https://token.jup.ag/all")
+
+            if jup:
+                for t in jup[:50]:
+                    sym = (t.get("symbol") or "").upper()
+                    mint = t.get("address")
+
+                    if sym and mint and sym not in DISCOVERED:
+                        DISCOVERED[sym] = {
+                            "mint": mint,
+                            "volume": 0,
+                            "liquidity": 0,
+                            "spike": 0,
+                        }
+                        new.add(sym)
+
+            if new:
+                CANDIDATES.clear()
+                CANDIDATES.update(new)
+                log(f"DISCOVER {len(new)}")
 
         except Exception as e:
             log(f"DISCOVER_ERR {e}")
 
         await asyncio.sleep(10)
 
-# ================= ALPHA =================
+# ================= ALPHA（升級） =================
 async def alpha(symbol):
+
     price = await get_price(symbol)
     if not price:
         return 0
@@ -199,10 +224,17 @@ async def alpha(symbol):
         return 0
 
     momentum = (hist[-1] - hist[0]) / hist[0]
-    return momentum
+
+    spike = VOLUME_SPIKE.get(symbol, 0)
+    new_pool = 0.3 if NEW_POOL.get(symbol) else 0
+
+    score = momentum + spike + new_pool
+
+    return score
 
 # ================= JUP =================
-async def jupiter_order(symbol, amount):
+async def jupiter_order(symbol):
+
     mint = await resolve_token(symbol)
     if not mint:
         return None
@@ -212,7 +244,7 @@ async def jupiter_order(symbol, amount):
         {
             "inputMint": SOL,
             "outputMint": mint,
-            "amount": str(amount),
+            "amount": "1000000"
         },
         headers=jup_headers()
     )
@@ -247,7 +279,9 @@ async def buy(symbol, score):
         if len(engine.positions) >= MAX_POSITIONS:
             return
 
-        order = await jupiter_order(symbol, 1_000_000)
+        log(f"TRY BUY {symbol} {score:.2f}")
+
+        order = await jupiter_order(symbol)
         if not order:
             return
 
@@ -269,6 +303,7 @@ async def buy(symbol, score):
 
 # ================= SELL =================
 async def sell(p):
+
     price = await get_price(p["token"])
     if not price:
         return
@@ -320,7 +355,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
-    log("SYSTEM START v1335 FULL")
+    log("SYSTEM START v1336 FULL")
 
     asyncio.create_task(discover())
     asyncio.create_task(main())
@@ -340,7 +375,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1335 FULL</h2>
+    <h2>🔥 v1336 FULL</h2>
     <div id=data></div>
     <script>
     async function load(){
