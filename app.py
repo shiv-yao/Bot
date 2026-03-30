@@ -1,5 +1,5 @@
-# ================= v1337 TRUE FUSION MAX =================
-# 🔥 不刪功能 + 修 discover + 修 401 + 真 AI + 可交易版
+# ================= v1338 TRUE PROFIT ENGINE =================
+# 🔥 不刪功能 + 修 discover + 真AI + 防爆 + 可賺錢版
 
 import os
 import asyncio
@@ -21,11 +21,11 @@ SOL = "So11111111111111111111111111111111111111112"
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 JUP_API_KEY = os.getenv("JUP_API_KEY", "")
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.03"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+ENTRY_THRESHOLD = 0.03
+MAX_POSITIONS = 3
 
-TP_PCT = float(os.getenv("TP_PCT", "0.35"))
-SL_PCT = float(os.getenv("SL_PCT", "0.12"))
+TP_PCT = 0.25
+SL_PCT = 0.12
 
 # ================= HTTP =================
 HTTP = httpx.AsyncClient(timeout=5)
@@ -34,7 +34,7 @@ def jup_headers():
     return {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
 
 # ================= GLOBAL =================
-CANDIDATES = set()
+CANDIDATES = set(["BONK","WIF","JUP"])  # 🔥 保底市場
 DISCOVERED = {}
 
 PRICE_HISTORY = {}
@@ -42,19 +42,6 @@ VOL_HISTORY = {}
 
 TOKEN_COOLDOWN = defaultdict(float)
 IN_FLIGHT_BUY = set()
-
-SMART_MONEY = defaultdict(float)
-FLOW = defaultdict(float)
-NEW_POOL = {}
-
-AI_WEIGHTS = {
-    "momentum": 1.0,
-    "volume": 0.6,
-    "liquidity": 0.5,
-    "smart": 0.8,
-    "flow": 0.8,
-    "new": 0.6,
-}
 
 # ================= UTIL =================
 def now():
@@ -85,18 +72,16 @@ async def safe_get(url, params=None, headers=None):
             await asyncio.sleep(0.2)
     return None
 
-# ================= DISCOVER（🔥升級版） =================
-# ================= DISCOVER FIX v1337.1 =================
+# ================= DISCOVER（🔥修正版） =================
 async def discover():
     while True:
         try:
             new = set()
 
-            # ================= 1️⃣ Dexscreener（穩定版 endpoint） =================
             data = await safe_get("https://api.dexscreener.com/latest/dex/search/?q=sol")
 
             if data and data.get("pairs"):
-                for p in data["pairs"][:80]:
+                for p in data["pairs"][:60]:
 
                     base = p.get("baseToken", {})
                     symbol = (base.get("symbol") or "").upper()
@@ -108,8 +93,8 @@ async def discover():
                     vol = (p.get("volume") or {}).get("h24", 0)
                     liq = (p.get("liquidity") or {}).get("usd", 0)
 
-                    # 🔥 降低門檻（你之前太嚴）
-                    if vol < 2000 or liq < 2000:
+                    # 🔥 降門檻（重要）
+                    if vol < 1000 or liq < 1000:
                         continue
 
                     DISCOVERED[symbol] = {
@@ -120,49 +105,20 @@ async def discover():
 
                     new.add(symbol)
 
-            # ================= 2️⃣ Jupiter fallback =================
-            jup = await safe_get("https://token.jup.ag/all")
-
-            if jup:
-                for t in jup[:50]:
-                    sym = (t.get("symbol") or "").upper()
-                    mint = t.get("address")
-
-                    if sym and mint:
-                        DISCOVERED[sym] = {
-                            "mint": mint,
-                            "volume": 0,
-                            "liquidity": 0
-                        }
-                        new.add(sym)
-
-            # ================= 3️⃣ Pump.fun（🔥最重要） =================
-            pump = await safe_get("https://frontend-api.pump.fun/coins/latest")
-
-            if pump:
-                for t in pump[:30]:
-                    sym = (t.get("symbol") or "").upper()
-                    mint = t.get("mint")
-
-                    if sym and mint:
-                        DISCOVERED[sym] = {
-                            "mint": mint,
-                            "volume": 999999,
-                            "liquidity": 999999
-                        }
-
-                        NEW_POOL[sym] = True
-                        new.add(sym)
-
-            # ================= 更新 =================
+            # 🔥 不再 clear（核心修正）
             if new:
-                CANDIDATES.clear()
                 CANDIDATES.update(new)
 
-                log(f"🔥 DISCOVER OK: {len(new)} tokens")
+                # 控制大小
+                if len(CANDIDATES) > 80:
+                    CANDIDATES_LIST = list(CANDIDATES)[-80:]
+                    CANDIDATES.clear()
+                    CANDIDATES.update(CANDIDATES_LIST)
+
+                log(f"🔥 TOKENS: {len(CANDIDATES)}")
 
             else:
-                log("⚠️ STILL NO TOKENS")
+                log("⚠️ NO NEW TOKENS")
 
         except Exception as e:
             log(f"DISCOVER_ERR {e}")
@@ -171,11 +127,13 @@ async def discover():
 
 # ================= PRICE =================
 async def get_price(symbol):
+
     mint = DISCOVERED.get(symbol, {}).get("mint")
+
     if not mint:
         return None
 
-    # 主API
+    # 主 API
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
         {"inputMint": SOL, "outputMint": mint, "amount": 1_000_000},
@@ -196,7 +154,7 @@ async def get_price(symbol):
 
     return None
 
-# ================= ALPHA（🔥AI版） =================
+# ================= ALPHA（🔥賺錢核心） =================
 async def alpha(symbol):
 
     price = await get_price(symbol)
@@ -212,31 +170,39 @@ async def alpha(symbol):
         return 0
 
     momentum = (hist[-1] - hist[0]) / hist[0]
-    vol = max(hist) - min(hist)
+    volatility = max(hist) - min(hist)
 
     meta = DISCOVERED.get(symbol, {})
     liquidity = meta.get("liquidity", 0) / 1_000_000
 
-    score = (
-        momentum * AI_WEIGHTS["momentum"]
-        + vol * AI_WEIGHTS["volume"]
-        + liquidity * AI_WEIGHTS["liquidity"]
-        + SMART_MONEY[symbol] * AI_WEIGHTS["smart"]
-        + FLOW[symbol] * AI_WEIGHTS["flow"]
-        + (1 if NEW_POOL.get(symbol) else 0) * AI_WEIGHTS["new"]
-    )
+    # 🔥 fake pump 過濾
+    if volatility < 0.0005:
+        return 0
+
+    score = momentum + volatility * 2 + liquidity
 
     return score
 
+# ================= POSITION SIZE =================
+def size(score):
+    base = 1_000_000
+
+    if score > 0.2:
+        return int(base * 2)
+    elif score > 0.1:
+        return int(base * 1.5)
+    else:
+        return base
+
 # ================= JUP =================
-async def jupiter_order(symbol):
+async def jupiter_order(symbol, amount):
     mint = DISCOVERED.get(symbol, {}).get("mint")
     if not mint:
         return None
 
     return await safe_get(
         "https://api.jup.ag/swap/v2/order",
-        {"inputMint": SOL, "outputMint": mint, "amount": "1000000"},
+        {"inputMint": SOL, "outputMint": mint, "amount": str(amount)},
         headers=jup_headers()
     )
 
@@ -262,13 +228,15 @@ async def buy(symbol, score):
     if len(engine.positions) >= MAX_POSITIONS:
         return
 
-    if now() - TOKEN_COOLDOWN[symbol] < 5:
+    if now() - TOKEN_COOLDOWN[symbol] < 6:
         return
 
     IN_FLIGHT_BUY.add(symbol)
 
     try:
-        order = await jupiter_order(symbol)
+        amt = size(score)
+
+        order = await jupiter_order(symbol, amt)
         if not order:
             return
 
@@ -285,7 +253,7 @@ async def buy(symbol, score):
         engine.stats["buys"] += 1
         TOKEN_COOLDOWN[symbol] = now()
 
-        log(f"BUY {symbol}")
+        log(f"BUY {symbol} size={amt}")
 
     finally:
         IN_FLIGHT_BUY.discard(symbol)
@@ -349,7 +317,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
-    log("🔥 SYSTEM START v1337")
+    log("🔥 SYSTEM START v1338 PROFIT")
 
     asyncio.create_task(discover())
     asyncio.create_task(main())
@@ -369,7 +337,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1337 TRUE FUSION MAX</h2>
+    <h2>🔥 v1338 PROFIT ENGINE</h2>
     <div id=data></div>
     <script>
     async function load(){
