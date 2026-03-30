@@ -1,5 +1,5 @@
-# ================= v1326.1 STABLE FIX =================
-# 🔥 不刪功能 + 永遠有輸出 + debug版
+# ================= v1326.2 FINAL FIX =================
+# 🔥 不刪功能 + 修黑畫面 + 強制初始化 + 永遠有輸出
 
 import asyncio
 import time
@@ -22,7 +22,7 @@ HTTP = httpx.AsyncClient(
 
 SOL = "So11111111111111111111111111111111111111112"
 JUP_API_KEY = ""
-PRIVATE_KEY = "3vXyAso1UmTkQTkEGFDivSXw9xuB8Zw2ijeDLQvv7MtKDdDRAfod814Bb6NGXZqKd6jtqnNe2rAJc8bCFD6SnWT2"
+PRIVATE_KEY = "你的私鑰"
 
 CANDIDATES = {"BONK","WIF","JUP","MYRO","POPCAT"}
 
@@ -79,7 +79,6 @@ async def safe_get(url, params=None):
 
 # ================= PRICE =================
 async def get_price(m):
-
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
         {
@@ -314,6 +313,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
+    log("SYSTEM STARTED")   # 🔥 關鍵
 
     asyncio.create_task(main())
     asyncio.create_task(monitor())
@@ -322,16 +322,19 @@ async def start():
 
 @app.get("/")
 def root():
+    ensure_engine()  # 🔥 關鍵（防空）
+
     return {
         "status": "running",
         "time": now(),
         "positions": engine.positions,
         "stats": engine.stats,
-        "logs": engine.logs[-20:]
+        "logs": engine.logs[-20:] or ["SYSTEM BOOTING..."]
     }
 
 @app.get("/debug")
 def debug():
+    ensure_engine()
     return {
         "logs_len": len(engine.logs),
         "positions": len(engine.positions),
@@ -343,14 +346,18 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1326.1 STABLE FIX</h2>
-    <div id=data></div>
+    <h2>🔥 v1326.2 FINAL FIX</h2>
+    <div id=data>Loading...</div>
     <script>
     async function load(){
-        let r = await fetch('/');
-        let d = await r.json();
-        document.getElementById('data').innerHTML =
-        '<pre>'+JSON.stringify(d,null,2)+'</pre>';
+        try{
+            let r = await fetch('/');
+            let d = await r.json();
+            document.getElementById('data').innerHTML =
+            '<pre>'+JSON.stringify(d,null,2)+'</pre>';
+        }catch(e){
+            document.getElementById('data').innerHTML = "ERROR LOADING";
+        }
     }
     setInterval(load,2000);
     load();
