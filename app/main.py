@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 import asyncio
-from app.core.engine import main_loop
-from app.core.state import engine
+
+
 
 app = FastAPI(title="Integrated Trading Stack Merged")
 
