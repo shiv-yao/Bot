@@ -172,55 +172,87 @@ async def get_price(symbol):
 async def discover():
     while True:
         try:
-            data = await safe_get("https://api.dexscreener.com/latest/dex/pairs/solana")
-            if not data:
-                continue
-
             new = set()
 
-            for p in data.get("pairs", [])[:80]:
+            # ================= 來源1：DEX =================
+            data = await safe_get(
+                "https://api.dexscreener.com/latest/dex/pairs/solana"
+            )
 
-                symbol = (p["baseToken"]["symbol"] or "").upper()
-                mint = p["baseToken"]["address"]
+            if data and data.get("pairs"):
+                for p in data["pairs"][:50]:
 
-                if symbol in ["SOL","USDC","USDT"]:
-                    continue
+                    base = p.get("baseToken", {})
+                    symbol = (base.get("symbol") or "").upper()
+                    mint = base.get("address")
 
-                vol = float(p.get("volume",{}).get("h24",0))
-                liq = float(p.get("liquidity",{}).get("usd",0))
+                    if not symbol or not mint:
+                        continue
 
-                if vol < MIN_VOLUME or liq < MIN_LIQUIDITY:
-                    continue
+                    if symbol in ["SOL","USDC","USDT"]:
+                        continue
 
-                prev = LAST_VOLUME.get(symbol, vol)
-                spike = (vol - prev) / max(prev,1)
+                    vol = float((p.get("volume") or {}).get("h24", 0) or 0)
+                    liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
 
-                if spike > 0.5:
-                    VOLUME_SPIKE[symbol] += spike
+                    if vol < MIN_VOLUME or liq < MIN_LIQUIDITY:
+                        continue
 
-                LAST_VOLUME[symbol] = vol
+                    DISCOVERED[symbol] = {
+                        "mint": mint,
+                        "volume": vol,
+                        "liquidity": liq
+                    }
 
-                age = p.get("pairCreatedAt",0)
-                if age and now() - age/1000 < 600:
-                    NEW_POOL[symbol] = True
+                    new.add(symbol)
 
-                DISCOVERED[symbol] = {
-                    "mint": mint,
-                    "volume": vol,
-                    "liquidity": liq
-                }
+            # ================= 來源2：JUP =================
+            jup = await safe_get("https://token.jup.ag/all")
 
-                new.add(symbol)
+            if jup:
+                for t in jup[:50]:
+                    sym = (t.get("symbol") or "").upper()
+                    mint = t.get("address")
 
+                    if sym and mint:
+                        DISCOVERED[sym] = {
+                            "mint": mint,
+                            "volume": 0,
+                            "liquidity": 0
+                        }
+                        new.add(sym)
+
+            # ================= 來源3：PUMP（關鍵） =================
+            pump = await safe_get(
+                "https://frontend-api.pump.fun/coins/latest"
+            )
+
+            if pump:
+                for t in pump[:30]:
+                    sym = (t.get("symbol") or "").upper()
+                    mint = t.get("mint")
+
+                    if sym and mint:
+                        DISCOVERED[sym] = {
+                            "mint": mint,
+                            "volume": 999999,  # 強制通過 filter
+                            "liquidity": 999999
+                        }
+                        new.add(sym)
+
+            # ================= 更新 =================
             if new:
                 CANDIDATES.clear()
                 CANDIDATES.update(new)
-                log(f"DISCOVER {len(new)}")
+                log(f"🔥 DISCOVER {len(new)} TOKENS")
+
+            else:
+                log("⚠️ NO TOKENS FOUND")
 
         except Exception as e:
             log(f"DISCOVER_ERR {e}")
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(8)
 
 # ================= FEATURE =================
 async def features(symbol):
