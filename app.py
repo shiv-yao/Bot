@@ -1,5 +1,5 @@
-# ================= v1326.2 FINAL FIX =================
-# 🔥 不刪功能 + 修黑畫面 + 強制初始化 + 永遠有輸出
+# ================= v1326.3 FINAL SAFE FIX =================
+# 🔥 不刪功能 + 修 engine 型別問題 + 不再 startup crash
 
 import asyncio
 import time
@@ -22,9 +22,9 @@ HTTP = httpx.AsyncClient(
 
 SOL = "So11111111111111111111111111111111111111112"
 JUP_API_KEY = ""
-PRIVATE_KEY = "你的私鑰"
+PRIVATE_KEY = "改成你新的私鑰，不要再用舊的"
 
-CANDIDATES = {"BONK","WIF","JUP","MYRO","POPCAT"}
+CANDIDATES = {"BONK", "WIF", "JUP", "MYRO", "POPCAT"}
 
 ENTRY_THRESHOLD = 0.005
 MAX_POSITIONS = 2
@@ -41,21 +41,50 @@ MEMPOOL_SIGNAL = {}
 def now():
     return time.time()
 
+def ensure_list(v):
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    if isinstance(v, tuple):
+        return list(v)
+    if isinstance(v, set):
+        return list(v)
+    if isinstance(v, dict):
+        return [v]
+    if isinstance(v, str):
+        return [v]
+    try:
+        return list(v)
+    except Exception:
+        return []
+
 def ensure_engine():
-    if not hasattr(engine, "positions"):
-        engine.positions = []
-    if not hasattr(engine, "trade_history"):
-        engine.trade_history = []
-    if not hasattr(engine, "logs"):
-        engine.logs = []
-    if not hasattr(engine, "stats"):
-        engine.stats = {"buys":0,"sells":0,"errors":0,"signals":0}
+    current_positions = getattr(engine, "positions", [])
+    current_trade_history = getattr(engine, "trade_history", [])
+    current_logs = getattr(engine, "logs", [])
+    current_stats = getattr(engine, "stats", {})
+
+    engine.positions = ensure_list(current_positions)
+    engine.trade_history = ensure_list(current_trade_history)
+    engine.logs = ensure_list(current_logs)
+
+    if not isinstance(current_stats, dict):
+        current_stats = {}
+
+    engine.stats = {
+        "buys": int(current_stats.get("buys", 0)),
+        "sells": int(current_stats.get("sells", 0)),
+        "errors": int(current_stats.get("errors", 0)),
+        "signals": int(current_stats.get("signals", 0)),
+    }
 
 def log(msg):
     ensure_engine()
     engine.logs.append(str(msg))
-    engine.logs = engine.logs[-200:]
-    print(msg)
+    if len(engine.logs) > 200:
+        engine.logs = engine.logs[-200:]
+    print(msg, flush=True)
 
 def log_once(k, msg, sec=5):
     if now() - LAST_LOG.get(k, 0) > sec:
@@ -66,14 +95,14 @@ def get_kp():
     return Keypair.from_base58_string(PRIVATE_KEY)
 
 # ================= SAFE HTTP =================
-async def safe_get(url, params=None):
+async def safe_get(url, params=None, headers=None):
     for _ in range(3):
         try:
-            r = await HTTP.get(url, params=params)
+            r = await HTTP.get(url, params=params, headers=headers)
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
-            log_once("http_err", str(e), 5)
+            log_once("http_err", f"HTTP_ERR {e}", 5)
             await asyncio.sleep(0.2)
     return None
 
@@ -99,13 +128,12 @@ async def get_price(m):
         if data.get("data"):
             return float(data["data"][0]["outAmount"]) / 1e6
     except Exception as e:
-        log_once("price_parse", str(e), 5)
+        log_once("price_parse", f"PRICE_PARSE {e}", 5)
 
     return None
 
 # ================= ALPHA =================
 async def alpha(m):
-
     price = await get_price(m)
     if not price:
         return 0
@@ -135,12 +163,14 @@ async def mempool():
             m = random.choice(list(CANDIDATES))
             MEMPOOL_SIGNAL[m] = now()
             log_once("mempool", f"MEMPOOL {m}", 2)
-        except:
-            pass
+        except Exception as e:
+            log_once("mempool_err", f"MEMPOOL_ERR {e}", 5)
         await asyncio.sleep(1)
 
 # ================= JUP =================
 async def jupiter_order(inp, out, amt):
+    headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
+
     data = await safe_get(
         "https://api.jup.ag/swap/v2/order",
         {
@@ -148,7 +178,8 @@ async def jupiter_order(inp, out, amt):
             "outputMint": out,
             "amount": str(amt),
             "taker": str(get_kp().pubkey())
-        }
+        },
+        headers=headers
     )
     if data and data.get("transaction"):
         return data
@@ -156,6 +187,8 @@ async def jupiter_order(inp, out, amt):
 
 async def jupiter_exec(order):
     try:
+        headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
+
         tx = VersionedTransaction.from_bytes(
             base64.b64decode(order["transaction"])
         )
@@ -163,34 +196,41 @@ async def jupiter_exec(order):
 
         r = await HTTP.post(
             "https://api.jup.ag/swap/v2/execute",
-            headers={"x-api-key": JUP_API_KEY},
+            headers=headers,
             json={
                 "signedTransaction": base64.b64encode(bytes(signed)).decode()
             }
         )
-        return r.json()
+        if r.status_code == 200:
+            return r.json()
+
+        log_once("exec_status", f"EXEC_STATUS {r.status_code}", 5)
+        return None
     except Exception as e:
-        log_once("exec_err", str(e), 5)
+        log_once("exec_err", f"EXEC_ERR {e}", 5)
         return None
 
 # ================= BUY =================
 def can_buy(m):
+    ensure_engine()
+
     if len(engine.positions) >= MAX_POSITIONS:
         return False
-    if m in [p["token"] for p in engine.positions]:
+    if m in [p.get("token") for p in engine.positions if isinstance(p, dict)]:
         return False
     if now() - TOKEN_COOLDOWN[m] < 10:
         return False
     return True
 
 async def buy(m, combo):
-
     if m in IN_FLIGHT_BUY:
         return
 
     IN_FLIGHT_BUY.add(m)
 
     try:
+        ensure_engine()
+
         if not can_buy(m):
             return
 
@@ -205,16 +245,20 @@ async def buy(m, combo):
         res = await jupiter_exec(order)
 
         if not res:
+            log(f"EXEC_FAIL {m}")
             return
 
         price = await get_price(m)
+        if not price:
+            log(f"BUY_NO_PRICE {m}")
+            return
 
         engine.positions.append({
             "token": m,
             "entry_price": price,
             "last_price": price,
             "peak_price": price,
-            "pnl":0
+            "pnl": 0
         })
 
         engine.stats["buys"] += 1
@@ -228,23 +272,39 @@ async def buy(m, combo):
 # ================= SELL =================
 async def sell(p):
     try:
+        ensure_engine()
+
         m = p["token"]
         price = await get_price(m)
+        if not price:
+            return
 
         pnl = (price - p["entry_price"]) / p["entry_price"]
 
-        engine.positions.remove(p)
+        if p in engine.positions:
+            engine.positions.remove(p)
         engine.stats["sells"] += 1
 
+        engine.trade_history.append({
+            "token": m,
+            "pnl_pct": pnl,
+            "ts": now()
+        })
+
         log(f"SELL {m} pnl={pnl:.4f}")
-    except:
-        pass
+    except Exception as e:
+        log_once("sell_err", f"SELL_ERR {e}", 5)
 
 # ================= MONITOR =================
 async def monitor():
     while True:
         try:
+            ensure_engine()
+
             for p in list(engine.positions):
+                if not isinstance(p, dict):
+                    continue
+
                 price = await get_price(p["token"])
                 if not price:
                     continue
@@ -268,6 +328,7 @@ async def monitor():
 
 # ================= RANK =================
 async def rank_candidates():
+    ensure_engine()
     ranked = []
 
     log_once("rank_debug", f"SCANNING {len(CANDIDATES)}", 3)
@@ -277,8 +338,8 @@ async def rank_candidates():
             a = await alpha(m)
             ranked.append((m, a))
             engine.stats["signals"] += 1
-        except:
-            pass
+        except Exception as e:
+            log_once("rank_err", f"RANK_ERR {m} {e}", 5)
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked[:5]
@@ -287,6 +348,7 @@ async def rank_candidates():
 async def main():
     while True:
         try:
+            ensure_engine()
             log_once("alive", "RUNNING", 5)
             log_once("heartbeat", "SYSTEM RUNNING", 3)
 
@@ -304,6 +366,7 @@ async def main():
 # ================= WATCHDOG =================
 async def watchdog():
     while True:
+        ensure_engine()
         log_once("watchdog", "SYSTEM OK", 10)
         await asyncio.sleep(5)
 
@@ -313,7 +376,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def start():
     ensure_engine()
-    log("SYSTEM STARTED")   # 🔥 關鍵
+    log("SYSTEM STARTED")
 
     asyncio.create_task(main())
     asyncio.create_task(monitor())
@@ -322,14 +385,13 @@ async def start():
 
 @app.get("/")
 def root():
-    ensure_engine()  # 🔥 關鍵（防空）
-
+    ensure_engine()
     return {
         "status": "running",
         "time": now(),
         "positions": engine.positions,
         "stats": engine.stats,
-        "logs": engine.logs[-20:] or ["SYSTEM BOOTING..."]
+        "logs": engine.logs[-20:] if isinstance(engine.logs, list) else ["SYSTEM BOOTING..."]
     }
 
 @app.get("/debug")
@@ -338,7 +400,10 @@ def debug():
     return {
         "logs_len": len(engine.logs),
         "positions": len(engine.positions),
-        "stats": engine.stats
+        "stats": engine.stats,
+        "engine_logs_type": str(type(engine.logs)),
+        "engine_positions_type": str(type(engine.positions)),
+        "engine_trade_history_type": str(type(engine.trade_history)),
     }
 
 @app.get("/ui")
@@ -346,7 +411,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1326.2 FINAL FIX</h2>
+    <h2>🔥 v1326.3 FINAL SAFE FIX</h2>
     <div id=data>Loading...</div>
     <script>
     async function load(){
