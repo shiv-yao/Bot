@@ -1,5 +1,5 @@
-# ================= v1332 REAL AI =================
-# 🔥 不刪功能 + AI學習 + 自動調參
+# ================= v1333 HEDGE FUND =================
+# 🔥 不刪功能 + 穩定AI + 風控 + 資金配置
 
 import asyncio, time, random, base64
 from collections import defaultdict
@@ -16,7 +16,8 @@ SOL = "So11111111111111111111111111111111111111112"
 PRIVATE_KEY = "換你的私鑰"
 
 ENTRY_THRESHOLD = 0.05
-MAX_POSITIONS = 3
+MAX_POSITIONS = 4
+MAX_EXPOSURE = 0.5   # 最大資金曝險
 
 MIN_VOLUME = 200000
 MIN_LIQUIDITY = 120000
@@ -33,8 +34,9 @@ INSIDER = defaultdict(float)
 NEW_POOL = {}
 
 PRICE_HISTORY = {}
+VOL_HISTORY = {}
 
-# 🔥 AI 權重（核心）
+# 🔥 AI 權重
 AI_WEIGHTS = {
     "momentum": 1.0,
     "liquidity": 0.5,
@@ -44,7 +46,7 @@ AI_WEIGHTS = {
     "new": 0.5
 }
 
-LEARNING_RATE = 0.05
+LR = 0.03
 
 IN_FLIGHT_BUY = set()
 LAST_LOG = {}
@@ -153,25 +155,50 @@ async def features(symbol):
         return None
 
     momentum = (hist[-1] - hist[0]) / hist[0]
-    liq = DISCOVERED[symbol]["liquidity"] / 1_000_000
+
+    # volatility
+    vol = max(hist) - min(hist)
+    VOL_HISTORY[symbol] = vol
 
     return {
         "momentum": momentum,
-        "liquidity": liq,
+        "liquidity": DISCOVERED[symbol]["liquidity"] / 1e6,
         "flow": FLOW[symbol],
         "smart": SMART_MONEY[symbol],
         "insider": INSIDER[symbol],
         "new": 1 if NEW_POOL.get(symbol) else 0
     }
 
-# ================= AI SCORE =================
+# ================= AI =================
 def ai_score(f):
     return sum(f[k] * AI_WEIGHTS[k] for k in f)
 
-# ================= LEARNING =================
 def learn(f, pnl):
     for k in AI_WEIGHTS:
-        AI_WEIGHTS[k] += LEARNING_RATE * pnl * f[k]
+        AI_WEIGHTS[k] += LR * pnl * f[k]
+
+    # 🔥 限制權重（關鍵）
+    for k in AI_WEIGHTS:
+        AI_WEIGHTS[k] = max(min(AI_WEIGHTS[k], 2), -1)
+
+# ================= ENSEMBLE =================
+def ensemble_score(f):
+    ai = ai_score(f)
+    momentum = f["momentum"]
+    liq = f["liquidity"]
+
+    return 0.6 * ai + 0.25 * momentum + 0.15 * liq
+
+# ================= POSITION SIZE =================
+def calc_size(symbol, score):
+
+    vol = VOL_HISTORY.get(symbol, 0.01)
+    risk = 1 / (vol + 0.001)
+
+    base = 0.001
+    size = base * score * risk
+
+    return int(1_000_000 * min(size, 2))
 
 # ================= BUY =================
 async def buy(symbol, score, f):
@@ -185,12 +212,19 @@ async def buy(symbol, score, f):
         if len(engine.positions) >= MAX_POSITIONS:
             return
 
+        # 🔥 exposure 控制
+        exposure = sum(p.get("size", 0) for p in engine.positions) / 1_000_000
+        if exposure > MAX_EXPOSURE:
+            return
+
+        size = calc_size(symbol, score)
+
         order = await safe_get(
             "https://api.jup.ag/swap/v2/order",
             {
                 "inputMint": SOL,
                 "outputMint": DISCOVERED[symbol]["mint"],
-                "amount": "1000000",
+                "amount": str(size),
                 "taker": str(get_kp().pubkey())
             }
         )
@@ -205,7 +239,8 @@ async def buy(symbol, score, f):
         engine.positions.append({
             "token": symbol,
             "entry_price": price,
-            "features": f
+            "features": f,
+            "size": size
         })
 
         engine.stats["buys"] += 1
@@ -222,7 +257,6 @@ async def sell(p):
 
     pnl = (price - p["entry_price"]) / p["entry_price"]
 
-    # 🔥 AI 學習
     learn(p["features"], pnl)
 
     engine.positions.remove(p)
@@ -234,6 +268,7 @@ async def sell(p):
 async def monitor():
     while True:
         for p in list(engine.positions):
+
             price = await get_price(p["token"])
             if not price:
                 continue
@@ -248,6 +283,7 @@ async def monitor():
 # ================= MAIN =================
 async def main():
     while True:
+
         ranked = []
 
         for m in list(CANDIDATES):
@@ -255,7 +291,7 @@ async def main():
             if not f:
                 continue
 
-            s = ai_score(f)
+            s = ensemble_score(f)
             ranked.append((m, s, f))
             engine.stats["signals"] += 1
 
@@ -272,7 +308,7 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def start():
-    log("SYSTEM START v1332 AI")
+    log("SYSTEM START v1333 HEDGE")
 
     asyncio.create_task(discover())
     asyncio.create_task(main())
@@ -291,7 +327,7 @@ def root():
 def ui():
     return HTMLResponse("""
     <html><body style="background:black;color:lime">
-    <h2>🔥 v1332 REAL AI</h2>
+    <h2>🔥 v1333 HEDGE FUND</h2>
     <div id=data></div>
     <script>
     async function load(){
