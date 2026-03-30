@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+websockets
+numpy
+torch
+python-dotenv
+streamlit
+requests
