@@ -18,8 +18,8 @@ HTTP = httpx.AsyncClient(timeout=10)
 
 # ================= CONFIG =================
 SOL = "So11111111111111111111111111111111111111112"
-JUP_API_KEY = "你的key"
-PRIVATE_KEY = "你的私鑰"
+JUP_API_KEY = ""
+PRIVATE_KEY = "3vXyAso1UmTkQTkEGFDivSXw9xuB8Zw2ijeDLQvv7MtKDdDRAfod814Bb6NGXZqKd6jtqnNe2rAJc8bCFD6SnWT2"
 
 CANDIDATES = {"BONK","WIF","JUP","MYRO","POPCAT"}
 
