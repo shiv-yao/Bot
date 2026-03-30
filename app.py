@@ -66,22 +66,25 @@ async def get_price(mint):
 
     try:
         r = await HTTP.get(
-            "https://quote-api.jup.ag/v6/quote",
+            "https://api.jup.ag/swap/v1/quote",
             params={
                 "inputMint": SOL,
                 "outputMint": mint,
-                "amount": 1000000
+                "amount": 1000000,
+                "slippageBps": 100
             }
         )
 
         data = r.json()
 
+        if data.get("outAmount"):
+            return float(data["outAmount"]) / 1e6
+
         if data.get("data"):
-            out = float(data["data"][0]["outAmount"])
-            return out / 1e6
+            return float(data["data"][0]["outAmount"]) / 1e6
 
     except Exception as e:
-        log_once("price_err", str(e), 5)
+        log_once("price_err", f"PRICE_ERR {e}", 5)
 
     return None
 
