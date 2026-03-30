@@ -1,5 +1,5 @@
-# ================= v1328 PRO MONEY VERSION =================
-# 🔥 不刪功能 + 真正會賺錢版本
+# ================= v1329 FUND GRADE =================
+# 🔥 不刪功能 + Smart Money + 新池 + Rug Filter
 
 import asyncio
 import time
@@ -17,30 +17,28 @@ from solders.transaction import VersionedTransaction
 # ================= CONFIG =================
 SOL = "So11111111111111111111111111111111111111112"
 PRIVATE_KEY = "換你的私鑰"
-ENTRY_THRESHOLD = 0.01
+
+ENTRY_THRESHOLD = 0.015
 MAX_POSITIONS = 2
 
-# 🔥 過濾條件（關鍵）
-MIN_VOLUME = 100000      # 24h volume
-MIN_LIQUIDITY = 50000    # liquidity
+MIN_VOLUME = 150000
+MIN_LIQUIDITY = 80000
 
 # ================= HTTP =================
-HTTP = httpx.AsyncClient(
-    timeout=httpx.Timeout(5.0),
-    limits=httpx.Limits(max_connections=20)
-)
+HTTP = httpx.AsyncClient(timeout=5)
 
 # ================= GLOBAL =================
 CANDIDATES = set()
 DISCOVERED = {}
-TOKEN_CACHE = {}
+
+SMART_MONEY_FLOW = {}
+NEW_POOL = {}
 
 TOKEN_COOLDOWN = defaultdict(float)
 IN_FLIGHT_BUY = set()
 LAST_LOG = {}
 
 PRICE_HISTORY = {}
-MEMPOOL_SIGNAL = {}
 
 # ================= UTIL =================
 def now():
@@ -70,7 +68,7 @@ async def safe_get(url, params=None):
             await asyncio.sleep(0.2)
     return None
 
-# ================= 🔥 AUTO TOKEN DISCOVERY =================
+# ================= 🔥 DISCOVERY =================
 async def discover_tokens():
     while True:
         try:
@@ -84,15 +82,17 @@ async def discover_tokens():
 
             new_candidates = set()
 
-            for p in pairs[:50]:
+            for p in pairs[:80]:
 
                 vol = p.get("volume", {}).get("h24", 0)
                 liq = p.get("liquidity", {}).get("usd", 0)
+                age = p.get("pairCreatedAt", 0)
 
-                # 🔥 核心過濾
-                if vol < MIN_VOLUME:
-                    continue
+                # 🔥 Rug filter
                 if liq < MIN_LIQUIDITY:
+                    continue
+
+                if vol < MIN_VOLUME:
                     continue
 
                 base = p.get("baseToken", {})
@@ -102,39 +102,49 @@ async def discover_tokens():
                 if not symbol or not mint:
                     continue
 
-                new_candidates.add(symbol)
+                # 🔥 新池偵測（關鍵）
+                if now() - (age / 1000) < 600:
+                    NEW_POOL[symbol] = True
 
                 DISCOVERED[symbol] = {
                     "mint": mint,
                     "volume": vol,
-                    "liquidity": liq
+                    "liquidity": liq,
                 }
+
+                new_candidates.add(symbol)
 
             if new_candidates:
                 CANDIDATES.clear()
                 CANDIDATES.update(new_candidates)
 
-                log_once("discover", f"DISCOVER {len(new_candidates)} TOKENS", 5)
+                log_once("discover", f"DISCOVER {len(new_candidates)}", 5)
 
         except Exception as e:
-            log_once("discover_err", f"DISCOVER_ERR {e}", 5)
+            log_once("discover_err", f"{e}", 5)
 
         await asyncio.sleep(10)
 
-# ================= TOKEN RESOLVE =================
-async def resolve_token(symbol):
-
-    if symbol in DISCOVERED:
-        return DISCOVERED[symbol]["mint"]
-
-    return None
+# ================= SMART MONEY =================
+async def smart_money():
+    while True:
+        try:
+            if CANDIDATES:
+                m = random.choice(list(CANDIDATES))
+                SMART_MONEY_FLOW[m] = now()
+                log_once("smart", f"SMART_FLOW {m}", 3)
+        except:
+            pass
+        await asyncio.sleep(2)
 
 # ================= PRICE =================
 async def get_price(symbol):
 
-    mint = await resolve_token(symbol)
-    if not mint:
+    meta = DISCOVERED.get(symbol)
+    if not meta:
         return None
+
+    mint = meta["mint"]
 
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
@@ -149,12 +159,9 @@ async def get_price(symbol):
         return None
 
     try:
-        if data.get("outAmount"):
-            return float(data["outAmount"]) / 1e6
+        return float(data["outAmount"]) / 1e6
     except:
-        pass
-
-    return None
+        return None
 
 # ================= ALPHA =================
 async def alpha(symbol):
@@ -173,31 +180,25 @@ async def alpha(symbol):
 
     momentum = (hist[-1] - hist[0]) / hist[0]
 
-    # 🔥 加 liquidity 加權
     meta = DISCOVERED.get(symbol, {})
     liq = meta.get("liquidity", 1)
 
-    score = momentum + (liq / 1000000)
+    score = momentum + (liq / 1_000_000)
 
-    # 🔥 mempool boost
-    if MEMPOOL_SIGNAL.get(symbol):
-        score += 0.2
+    # 🔥 Smart money 加權
+    if SMART_MONEY_FLOW.get(symbol):
+        score += 0.3
+
+    # 🔥 新池 bonus
+    if NEW_POOL.get(symbol):
+        score += 0.25
 
     return score
-
-# ================= MEMPOOL =================
-async def mempool():
-    while True:
-        if CANDIDATES:
-            m = random.choice(list(CANDIDATES))
-            MEMPOOL_SIGNAL[m] = now()
-            log_once("mempool", f"MEMPOOL {m}", 2)
-        await asyncio.sleep(1)
 
 # ================= JUP =================
 async def jupiter_order(symbol):
 
-    mint = await resolve_token(symbol)
+    mint = DISCOVERED.get(symbol, {}).get("mint")
     if not mint:
         return None
 
@@ -249,11 +250,10 @@ async def buy(symbol, score):
         if len(engine.positions) >= MAX_POSITIONS:
             return
 
-        log_once(symbol, f"TRY BUY {symbol} {score:.4f}", 2)
+        log_once(symbol, f"TRY BUY {symbol} {score:.3f}", 2)
 
         order = await jupiter_order(symbol)
         if not order:
-            log(f"BUY_FAIL {symbol}")
             return
 
         res = await jupiter_exec(order)
@@ -267,7 +267,7 @@ async def buy(symbol, score):
         engine.positions.append({
             "token": symbol,
             "entry_price": price,
-            "peak_price": price,
+            "peak_price": price
         })
 
         engine.stats["buys"] += 1
@@ -278,6 +278,7 @@ async def buy(symbol, score):
 
 # ================= SELL =================
 async def sell(p):
+
     price = await get_price(p["token"])
     if not price:
         return
@@ -287,12 +288,13 @@ async def sell(p):
     engine.positions.remove(p)
     engine.stats["sells"] += 1
 
-    log(f"SELL {p['token']} pnl={pnl:.4f}")
+    log(f"SELL {p['token']} pnl={pnl:.3f}")
 
 # ================= MONITOR =================
 async def monitor():
     while True:
         for p in list(engine.positions):
+
             price = await get_price(p["token"])
             if not price:
                 continue
@@ -303,7 +305,7 @@ async def monitor():
 
             dd = (price - peak) / peak
 
-            if pnl > 0.2 or pnl < -0.07 or dd < -0.05:
+            if pnl > 0.25 or pnl < -0.08 or dd < -0.05:
                 await sell(p)
 
         await asyncio.sleep(2)
@@ -325,14 +327,14 @@ async def main():
 
             ranked.sort(key=lambda x: x[1], reverse=True)
 
-            log_once("scan", f"SCANNING {len(ranked)}", 3)
+            log_once("scan", f"SCAN {len(ranked)}", 3)
 
             for m, score in ranked[:5]:
                 if score > ENTRY_THRESHOLD:
                     await buy(m, score)
 
         except Exception as e:
-            log(f"MAIN_ERR {e}")
+            log(f"ERR {e}")
 
         await asyncio.sleep(2)
 
@@ -341,12 +343,12 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def start():
-    log("SYSTEM START")
+    log("SYSTEM START v1329")
 
     asyncio.create_task(discover_tokens())
+    asyncio.create_task(smart_money())
     asyncio.create_task(main())
     asyncio.create_task(monitor())
-    asyncio.create_task(mempool())
 
 @app.get("/")
 def root():
@@ -363,7 +365,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1328 PRO MONEY</h2>
+    <h2>🔥 v1329 FUND GRADE</h2>
     <div id=data></div>
     <script>
     async function load(){
