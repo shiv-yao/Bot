@@ -1,4 +1,4 @@
-# ================= v1339 ALL FEATURES FIRST =================
+# ================= v1339 ALL FEATURES FIRST (FULLY INTEGRATED FIXED) =================
 # 🔥 全功能先補齊，不先做策略刪減
 # - 保留 discovery / real-data / jupiter / dry-run / monitor / ui
 # - 所有 alpha 同時存在：momentum / volume / early / boost / volatility / liquidity / smart / flow / insider
@@ -9,7 +9,6 @@
 
 import os
 import time
-import json
 import base64
 import random
 import asyncio
@@ -187,8 +186,9 @@ def get_keypair():
 def symbol_to_mint(symbol: str) -> str:
     if symbol in DISCOVERED_TOKENS and DISCOVERED_TOKENS[symbol].get("mint"):
         return DISCOVERED_TOKENS[symbol]["mint"]
-    if TOKEN_MINTS.get(symbol):
-        return TOKEN_MINTS[symbol]
+    mapped = TOKEN_MINTS.get(symbol)
+    if mapped:
+        return mapped
     return symbol
 
 def mint_to_symbol(mint: str) -> str:
@@ -223,6 +223,18 @@ def current_exposure_sol() -> float:
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
 
+def has_position(symbol: str) -> bool:
+    return any(p.get("token") == symbol for p in engine.positions if isinstance(p, dict))
+
+def clamp_flow():
+    for m in list(set(list(SMART_MONEY.keys()) + list(FLOW.keys()) + list(INSIDER.keys()))):
+        SMART_MONEY[m] = clamp(SMART_MONEY[m], 0.0, 2.0)
+        FLOW[m] = clamp(FLOW[m], 0.0, 2.0)
+        INSIDER[m] = clamp(INSIDER[m], 0.0, 2.0)
+
+def apply_fee(pnl: float) -> float:
+    return pnl - 0.003  # 估算成本 0.3%
+
 # ================= REAL DATA: DEXSCREENER =================
 async def ds_get_json(url: str) -> Any:
     r = await HTTP.get(url, headers={"Accept": "application/json"})
@@ -255,7 +267,7 @@ async def fetch_tokens_bulk(mints: List[str]) -> List[Dict[str, Any]]:
     mints = [m for m in mints if m]
     if not mints:
         return []
-    chunks = [mints[i:i+30] for i in range(0, len(mints), 30)]
+    chunks = [mints[i:i + 30] for i in range(0, len(mints), 30)]
     out: List[Dict[str, Any]] = []
     for chunk in chunks:
         joined = ",".join(chunk)
@@ -267,12 +279,14 @@ async def fetch_tokens_bulk(mints: List[str]) -> List[Dict[str, Any]]:
 def pick_best_pair(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not pairs:
         return None
+
     def score(p: Dict[str, Any]) -> float:
         liq = safe_float((p.get("liquidity") or {}).get("usd"), 0)
         vol5 = safe_float((p.get("volume") or {}).get("m5"), 0)
         buys5 = safe_float((((p.get("txns") or {}).get("m5") or {}).get("buys")), 0)
         sells5 = safe_float((((p.get("txns") or {}).get("m5") or {}).get("sells")), 0)
         return liq + vol5 * 2 + (buys5 - sells5) * 20
+
     return sorted(pairs, key=score, reverse=True)[0]
 
 async def refresh_discovery():
@@ -284,7 +298,9 @@ async def refresh_discovery():
         top_boosts_task = fetch_top_token_boosts()
 
         profiles, boosts, top_boosts = await asyncio.gather(
-            profiles_task, boosts_task, top_boosts_task
+            profiles_task,
+            boosts_task,
+            top_boosts_task,
         )
 
         raw_candidates: Dict[str, Dict[str, Any]] = {}
@@ -369,10 +385,12 @@ async def refresh_discovery():
             PRICE_CACHE[mint] = {"price_usd": price_usd, "updated_at": now()}
 
         DISCOVERED_TOKENS = fresh
+        ensure_engine()
         engine.stats["discovered"] = len(DISCOVERED_TOKENS)
         log_once("discover", f"DISCOVERED {len(DISCOVERED_TOKENS)} TOKENS", 5)
 
     except Exception as e:
+        ensure_engine()
         engine.stats["errors"] += 1
         log_once("discover_err", f"DISCOVERY_ERR {type(e).__name__}: {e}", 5)
 
@@ -384,8 +402,11 @@ async def discovery_loop():
 # ================= PRICE =================
 async def get_price(symbol_or_mint: str) -> float:
     mint = symbol_to_mint(symbol_or_mint)
+    if not mint:
+        return 0.0
+
     cache = PRICE_CACHE.get(mint)
-    if cache and now() - cache.get("updated_at", 0) < 10:
+    if cache and now() - cache.get("updated_at", 0) < 5:
         return safe_float(cache.get("price_usd"), 0)
 
     # main: dexscreener pairs
@@ -491,7 +512,7 @@ async def alpha_liquidity_bonus(symbol: str) -> float:
     return min(liq / 500000.0, 0.05)
 
 def alpha_wallet(symbol: str) -> float:
-    return 1.0 * 0.01
+    return 0.01
 
 async def alpha_volatility(symbol: str) -> float:
     mint = symbol_to_mint(symbol)
@@ -535,7 +556,7 @@ async def compute_feature_snapshot(symbol: str) -> Dict[str, float]:
     FEATURE_CACHE[symbol] = snapshot
     return snapshot
 
-# ================= FULL ALPHA (ALL FEATURES EXIST) =================
+# ================= FULL ALPHA =================
 async def compute_full_alpha(symbol: str) -> float:
     features = await compute_feature_snapshot(symbol)
     total = 0.0
@@ -552,7 +573,9 @@ def detect_regime():
     for m in list(DISCOVERED_TOKENS.keys())[:10]:
         vals.append(safe_float(DISCOVERED_TOKENS[m].get("price_change_5m"), 0))
     if not vals:
+        REGIME = "NEUTRAL"
         return
+
     avg = sum(vals) / len(vals)
     if avg > 5:
         REGIME = "BULL"
@@ -565,12 +588,12 @@ def detect_regime():
 def auto_adjust_weights(pnl: float):
     for k in AI_WEIGHTS:
         AI_WEIGHTS[k] += LEARN_RATE * pnl
-        AI_WEIGHTS[k] = clamp(AI_WEIGHTS[k], -1, 2)
+        AI_WEIGHTS[k] = clamp(AI_WEIGHTS[k], -2.0, 2.0)
 
 def learn_from_features(features: Dict[str, float], pnl: float):
     for k, v in features.items():
         AI_WEIGHTS[k] += LEARN_RATE * pnl * v
-        AI_WEIGHTS[k] = clamp(AI_WEIGHTS[k], -1, 2)
+        AI_WEIGHTS[k] = clamp(AI_WEIGHTS[k], -2.0, 2.0)
 
 # ================= EXECUTION =================
 async def jupiter_order(input_mint, output_mint, amount):
@@ -635,32 +658,43 @@ async def safe_jupiter_execute(order):
     if not JUP_API_KEY:
         raise ValueError("JUP_API_KEY missing")
 
-    tx_b64 = order["transaction"]
-    raw = base64.b64decode(tx_b64)
-    kp = get_keypair()
-    tx = VersionedTransaction.from_bytes(raw)
-    signed = VersionedTransaction(tx.message, [kp])
+    try:
+        tx_b64 = order["transaction"]
+        raw = base64.b64decode(tx_b64)
 
-    headers = {"x-api-key": JUP_API_KEY}
-    body = {
-        "signedTransaction": base64.b64encode(bytes(signed)).decode(),
-        "requestId": order.get("requestId"),
-    }
+        try:
+            tx = VersionedTransaction.from_bytes(raw)
+        except Exception:
+            log("TX_DECODE_FAIL")
+            return None
 
-    r = await HTTP.post(
-        "https://api.jup.ag/swap/v2/execute",
-        headers=headers,
-        json=body,
-    )
-    r.raise_for_status()
-    data = r.json()
+        kp = get_keypair()
+        signed = VersionedTransaction(tx.message, [kp])
 
-    sig = data.get("signature") or data.get("txid")
-    if not sig:
-        log_once("exec_fail", f"EXEC_FAIL {data}", 3)
+        headers = {"x-api-key": JUP_API_KEY}
+        body = {
+            "signedTransaction": base64.b64encode(bytes(signed)).decode(),
+            "requestId": order.get("requestId"),
+        }
+
+        r = await HTTP.post(
+            "https://api.jup.ag/swap/v2/execute",
+            headers=headers,
+            json=body,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        sig = data.get("signature") or data.get("txid")
+        if not sig:
+            log_once("exec_fail", f"EXEC_FAIL {data}", 3)
+            return None
+
+        return {"signature": sig, "raw": data}
+
+    except Exception as e:
+        log_once("exec_err", f"EXEC_ERR {type(e).__name__}: {e}", 3)
         return None
-
-    return {"signature": sig, "raw": data}
 
 async def execute_trade(symbol: str, amount: int):
     order = await safe_jupiter_order(SOL_MINT, symbol_to_mint(symbol), amount)
@@ -702,6 +736,8 @@ def risk_check(symbol: str) -> bool:
     if current_exposure_sol() > MAX_EXPOSURE_SOL:
         return False
     if now() - TOKEN_COOLDOWN[symbol] < 10:
+        return False
+    if has_position(symbol):
         return False
     if not rug_filter(symbol):
         return False
@@ -772,6 +808,7 @@ async def master_sell(p: Dict[str, Any]):
             return
 
         pnl = (pr - p["entry_price"]) / p["entry_price"] if p["entry_price"] else 0.0
+        pnl = apply_fee(pnl)
 
         if pnl > 0:
             WIN += 1
@@ -790,6 +827,9 @@ async def master_sell(p: Dict[str, Any]):
 
         if p in engine.positions:
             engine.positions.remove(p)
+
+        if not hasattr(engine, "trade_history"):
+            engine.trade_history = []
 
         engine.trade_history.append({
             "token": symbol,
@@ -830,8 +870,9 @@ async def monitor():
                     await master_sell(p)
 
         except Exception as e:
+            ensure_engine()
             engine.stats["errors"] += 1
-            log(f"MONITOR_ERR {e}")
+            log(f"MONITOR_ERR {type(e).__name__}: {e}")
 
         await asyncio.sleep(2)
 
@@ -849,13 +890,15 @@ async def flow_engine():
                 FLOW[m] += 0.3
             if random.random() < 0.2:
                 INSIDER[m] += 0.6
+
+        clamp_flow()
         await asyncio.sleep(2)
 
 # ================= STRATEGY LAYER =================
 async def strategy_engine() -> List[tuple]:
+    ensure_engine()
     ranked = []
 
-    # 固定候選
     for symbol in list(BASE_CANDIDATES):
         mint = symbol_to_mint(symbol)
         if not mint:
@@ -864,7 +907,6 @@ async def strategy_engine() -> List[tuple]:
         ranked.append((symbol, score))
         engine.stats["signals"] += 1
 
-    # 發現候選
     for symbol in list(DISCOVERED_TOKENS.keys())[:DISCOVERY_LIMIT]:
         score = await compute_full_alpha(symbol)
         ranked.append((symbol, score))
@@ -887,7 +929,6 @@ async def god_main():
     while True:
         try:
             ranked = await strategy_engine()
-
             log_once("rank", f"RANKED {len(ranked)}", 5)
 
             for m, s in ranked:
@@ -895,8 +936,9 @@ async def god_main():
                     await master_buy(m, s)
 
         except Exception as e:
+            ensure_engine()
             engine.stats["errors"] += 1
-            log(f"MAIN_ERR {e}")
+            log(f"MAIN_ERR {type(e).__name__}: {e}")
 
         await asyncio.sleep(2)
 
