@@ -197,3 +197,26 @@ async def root():
         "stats": engine.stats,
         "logs": engine.logs[-50:]
     })
+  from fastapi.responses import HTMLResponse
+
+@app.get("/ui")
+async def ui():
+    return HTMLResponse("""
+    <html>
+    <body style="background:black;color:lime;font-family:monospace">
+    <h2>🔥 SNIPER BOT</h2>
+    <div id="data"></div>
+
+    <script>
+    async function load(){
+        let res = await fetch('/');
+        let d = await res.json();
+        document.getElementById("data").innerHTML =
+            "<pre>"+JSON.stringify(d,null,2)+"</pre>";
+    }
+    setInterval(load,2000)
+    load()
+    </script>
+    </body>
+    </html>
+    """)  
