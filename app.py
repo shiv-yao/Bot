@@ -49,7 +49,16 @@ MAX_TOKEN_AGE_MIN = int(os.getenv("MAX_TOKEN_AGE_MIN", "720"))
 DISCOVERY_REFRESH_SEC = int(os.getenv("DISCOVERY_REFRESH_SEC", "30"))
 
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
-HTTP = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+HTTP_MAX_CONN = int(os.getenv("HTTP_MAX_CONN", "20"))
+HTTP_KEEPALIVE = int(os.getenv("HTTP_KEEPALIVE", "10"))
+
+HTTP = httpx.AsyncClient(
+    timeout=httpx.Timeout(HTTP_TIMEOUT),
+    limits=httpx.Limits(
+        max_connections=HTTP_MAX_CONN,
+        max_keepalive_connections=HTTP_KEEPALIVE,
+    ),
+)
 
 # ================= STATIC TOKENS =================
 TOKEN_MINTS = {
@@ -71,16 +80,13 @@ DISCOVERED_TOKENS: Dict[str, Dict[str, Any]] = {}
 PAIR_CACHE: Dict[str, Dict[str, Any]] = {}
 PRICE_CACHE: Dict[str, Dict[str, Any]] = {}
 
-# onchain-like factors
 SMART_MONEY = defaultdict(float)
 FLOW = defaultdict(float)
 INSIDER = defaultdict(float)
 
-# feature cache / stats
 FEATURE_CACHE: Dict[str, Dict[str, Any]] = {}
 ALPHA_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
 
-# PnL / regime
 EQUITY = 0.0
 PEAK_EQUITY = 0.0
 DRAWDOWN = 0.0
@@ -88,7 +94,6 @@ WIN = 0
 LOSS = 0
 REGIME = "NEUTRAL"
 
-# AI / weighting
 AI_WEIGHTS = {
     "momentum": 1.00,
     "volume": 0.80,
@@ -105,7 +110,6 @@ AI_WEIGHTS = {
 }
 LEARN_RATE = float(os.getenv("LEARN_RATE", "0.01"))
 
-# raw strategy switches (先全部開著，不刪)
 STRATEGY_FLAGS = {
     "momentum": True,
     "volume": True,
@@ -164,14 +168,14 @@ def ensure_engine():
         "losses": int(current_stats.get("losses", 0)),
     }
 
-def log(msg):
+def log(msg: str):
     ensure_engine()
     engine.logs.append(str(msg))
     if len(engine.logs) > 300:
         engine.logs = engine.logs[-300:]
     print(msg, flush=True)
 
-def log_once(key, msg, sec=5):
+def log_once(key: str, msg: str, sec: float = 5):
     if now() - LAST_LOG.get(key, 0) > sec:
         LAST_LOG[key] = now()
         log(msg)
@@ -226,14 +230,30 @@ def clamp(v: float, low: float, high: float) -> float:
 def has_position(symbol: str) -> bool:
     return any(p.get("token") == symbol for p in engine.positions if isinstance(p, dict))
 
+def valid_mint(symbol: str) -> bool:
+    mint = symbol_to_mint(symbol)
+    return isinstance(mint, str) and len(mint) >= 32 and " " not in mint and "/" not in mint
+
 def clamp_flow():
-    for m in list(set(list(SMART_MONEY.keys()) + list(FLOW.keys()) + list(INSIDER.keys()))):
+    keys = set(list(SMART_MONEY.keys()) + list(FLOW.keys()) + list(INSIDER.keys()))
+    for m in keys:
         SMART_MONEY[m] = clamp(SMART_MONEY[m], 0.0, 2.0)
         FLOW[m] = clamp(FLOW[m], 0.0, 2.0)
         INSIDER[m] = clamp(INSIDER[m], 0.0, 2.0)
 
 def apply_fee(pnl: float) -> float:
-    return pnl - 0.003  # 估算成本 0.3%
+    return pnl - 0.003
+
+def dynamic_threshold() -> float:
+    if REGIME == "BULL":
+        return ENTRY_THRESHOLD
+    if REGIME == "BEAR":
+        return ENTRY_THRESHOLD * 0.6
+    return ENTRY_THRESHOLD * 0.8
+
+def momentum_filter(symbol: str) -> bool:
+    meta = DISCOVERED_TOKENS.get(symbol, {})
+    return safe_float(meta.get("price_change_5m"), 0) > -3.0
 
 # ================= REAL DATA: DEXSCREENER =================
 async def ds_get_json(url: str) -> Any:
@@ -280,14 +300,14 @@ def pick_best_pair(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not pairs:
         return None
 
-    def score(p: Dict[str, Any]) -> float:
+    def score_pair(p: Dict[str, Any]) -> float:
         liq = safe_float((p.get("liquidity") or {}).get("usd"), 0)
         vol5 = safe_float((p.get("volume") or {}).get("m5"), 0)
         buys5 = safe_float((((p.get("txns") or {}).get("m5") or {}).get("buys")), 0)
         sells5 = safe_float((((p.get("txns") or {}).get("m5") or {}).get("sells")), 0)
         return liq + vol5 * 2 + (buys5 - sells5) * 20
 
-    return sorted(pairs, key=score, reverse=True)[0]
+    return sorted(pairs, key=score_pair, reverse=True)[0]
 
 async def refresh_discovery():
     global DISCOVERED_TOKENS
@@ -409,7 +429,6 @@ async def get_price(symbol_or_mint: str) -> float:
     if cache and now() - cache.get("updated_at", 0) < 5:
         return safe_float(cache.get("price_usd"), 0)
 
-    # main: dexscreener pairs
     try:
         pairs = await fetch_token_pairs(mint)
         best = pick_best_pair(pairs)
@@ -421,7 +440,6 @@ async def get_price(symbol_or_mint: str) -> float:
     except Exception:
         pass
 
-    # fallback: Jupiter quote
     try:
         headers = {"x-api-key": JUP_API_KEY} if JUP_API_KEY else None
         r = await HTTP.get(
@@ -444,7 +462,6 @@ async def get_price(symbol_or_mint: str) -> float:
     except Exception:
         pass
 
-    # fallback: public quote api
     try:
         r = await HTTP.get(
             "https://quote-api.jup.ag/v6/quote",
@@ -466,7 +483,7 @@ async def get_price(symbol_or_mint: str) -> float:
     except Exception:
         pass
 
-    return safe_float((DISCOVERED_TOKENS.get(symbol_or_mint) or {}).get("price_usd"), 0)
+    return safe_float((DISCOVERED_TOKENS.get(symbol_or_mint) or{}).get("price_usd"), 0)
 
 # ================= ALPHA COMPONENTS =================
 async def alpha_momentum(symbol: str) -> float:
@@ -717,7 +734,7 @@ def dynamic_size(score: float) -> int:
         mult = 0.5
     else:
         mult = 1.0
-    return int(base * mult * (1 + min(score, 1)))
+    return int(base * mult * (1 + min(max(score, 0.0), 1.0)))
 
 def rug_filter(symbol: str) -> bool:
     meta = DISCOVERED_TOKENS.get(symbol, {})
@@ -731,6 +748,8 @@ def rug_filter(symbol: str) -> bool:
     return True
 
 def risk_check(symbol: str) -> bool:
+    if not valid_mint(symbol):
+        return False
     if len(engine.positions) >= MAX_POSITIONS:
         return False
     if current_exposure_sol() > MAX_EXPOSURE_SOL:
@@ -740,6 +759,8 @@ def risk_check(symbol: str) -> bool:
     if has_position(symbol):
         return False
     if not rug_filter(symbol):
+        return False
+    if symbol in DISCOVERED_TOKENS and not momentum_filter(symbol):
         return False
     return True
 
@@ -901,13 +922,15 @@ async def strategy_engine() -> List[tuple]:
 
     for symbol in list(BASE_CANDIDATES):
         mint = symbol_to_mint(symbol)
-        if not mint:
+        if not mint or not valid_mint(symbol):
             continue
         score = await compute_full_alpha(symbol)
         ranked.append((symbol, score))
         engine.stats["signals"] += 1
 
     for symbol in list(DISCOVERED_TOKENS.keys())[:DISCOVERY_LIMIT]:
+        if not valid_mint(symbol):
+            continue
         score = await compute_full_alpha(symbol)
         ranked.append((symbol, score))
         engine.stats["signals"] += 1
@@ -932,8 +955,12 @@ async def god_main():
             log_once("rank", f"RANKED {len(ranked)}", 5)
 
             for m, s in ranked:
-                if s > ENTRY_THRESHOLD:
+                log_once(f"score_{m}", f"SCORE {m} = {s:.4f}", 2)
+                if s > dynamic_threshold():
+                    log(f"SIGNAL_PASS {m} {s:.4f}")
                     await master_buy(m, s)
+                else:
+                    log_once(f"skip_{m}", f"SKIP {m} {s:.4f}", 3)
 
         except Exception as e:
             ensure_engine()
@@ -945,7 +972,7 @@ async def god_main():
 # ================= WATCHDOG =================
 async def watchdog():
     while True:
-        log(f"SYS OK | POS {len(engine.positions)} | DD {DRAWDOWN:.3f} | EQ {EQUITY:.3f}")
+        log(f"SYS OK | POS {len(engine.positions)} | DD {DRAWDOWN:.3f} | EQ {EQUITY:.3f} | REGIME {REGIME}")
         await asyncio.sleep(10)
 
 # ================= APP =================
@@ -1040,9 +1067,7 @@ async def feature_view(symbol: str):
     return {
         "symbol": symbol,
         "features": features,
-        "weight_applied": {
-            k: AI_WEIGHTS.get(k, 1.0) for k in features.keys()
-        },
+        "weight_applied": {k: AI_WEIGHTS.get(k, 1.0) for k in features.keys()},
         "alpha": await compute_full_alpha(symbol),
     }
 
