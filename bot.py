@@ -13,7 +13,7 @@ import base58
 from state import engine
 from mempool import mempool_stream
 from wallet_tracker import extract_wallets_from_mints, track_wallet_behavior
-
+from execution.jupiter_client import JupiterClient
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
