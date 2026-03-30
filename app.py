@@ -1,5 +1,5 @@
-# ================= v1326 STABLE =================
-# 🔥 不刪功能 + 永不卡死版
+# ================= v1326.1 STABLE FIX =================
+# 🔥 不刪功能 + 永遠有輸出 + debug版
 
 import asyncio
 import time
@@ -14,7 +14,7 @@ import httpx
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
-# ================= HTTP（穩定版） =================
+# ================= HTTP =================
 HTTP = httpx.AsyncClient(
     timeout=httpx.Timeout(5.0),
     limits=httpx.Limits(max_connections=20, max_keepalive_connections=5)
@@ -72,12 +72,14 @@ async def safe_get(url, params=None):
             r = await HTTP.get(url, params=params)
             if r.status_code == 200:
                 return r.json()
-        except:
+        except Exception as e:
+            log_once("http_err", str(e), 5)
             await asyncio.sleep(0.2)
     return None
 
 # ================= PRICE =================
 async def get_price(m):
+
     data = await safe_get(
         "https://api.jup.ag/swap/v1/quote",
         {
@@ -88,6 +90,7 @@ async def get_price(m):
     )
 
     if not data:
+        log_once("price_none", f"NO PRICE {m}", 5)
         return None
 
     try:
@@ -96,8 +99,8 @@ async def get_price(m):
 
         if data.get("data"):
             return float(data["data"][0]["outAmount"]) / 1e6
-    except:
-        pass
+    except Exception as e:
+        log_once("price_parse", str(e), 5)
 
     return None
 
@@ -139,20 +142,17 @@ async def mempool():
 
 # ================= JUP =================
 async def jupiter_order(inp, out, amt):
-    try:
-        data = await safe_get(
-            "https://api.jup.ag/swap/v2/order",
-            {
-                "inputMint": inp,
-                "outputMint": out,
-                "amount": str(amt),
-                "taker": str(get_kp().pubkey())
-            }
-        )
-        if data and data.get("transaction"):
-            return data
-    except:
-        pass
+    data = await safe_get(
+        "https://api.jup.ag/swap/v2/order",
+        {
+            "inputMint": inp,
+            "outputMint": out,
+            "amount": str(amt),
+            "taker": str(get_kp().pubkey())
+        }
+    )
+    if data and data.get("transaction"):
+        return data
     return None
 
 async def jupiter_exec(order):
@@ -170,7 +170,8 @@ async def jupiter_exec(order):
             }
         )
         return r.json()
-    except:
+    except Exception as e:
+        log_once("exec_err", str(e), 5)
         return None
 
 # ================= BUY =================
@@ -194,7 +195,7 @@ async def buy(m, combo):
         if not can_buy(m):
             return
 
-        log_once(m, f"TRY BUY {m} {combo:.4f}", 2)
+        log_once(f"try_{m}", f"TRY BUY {m} {combo:.4f}", 2)
 
         order = await jupiter_order(SOL, m, 1000000)
 
@@ -266,26 +267,11 @@ async def monitor():
 
         await asyncio.sleep(2)
 
-# ================= MAIN =================
-async def main():
-    while True:
-        try:
-            log_once("alive", "RUNNING", 5)
-
-            ranked = await rank_candidates()
-
-            for m, score in ranked:
-                if score > ENTRY_THRESHOLD:
-                    await buy(m, score)
-
-        except Exception as e:
-            log(f"MAIN_ERR {e}")
-
-        await asyncio.sleep(2)
-
 # ================= RANK =================
 async def rank_candidates():
     ranked = []
+
+    log_once("rank_debug", f"SCANNING {len(CANDIDATES)}", 3)
 
     for m in list(CANDIDATES):
         try:
@@ -297,6 +283,24 @@ async def rank_candidates():
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked[:5]
+
+# ================= MAIN =================
+async def main():
+    while True:
+        try:
+            log_once("alive", "RUNNING", 5)
+            log_once("heartbeat", "SYSTEM RUNNING", 3)
+
+            ranked = await rank_candidates()
+
+            for m, score in ranked:
+                if score > ENTRY_THRESHOLD:
+                    await buy(m, score)
+
+        except Exception as e:
+            log(f"MAIN_ERR {e}")
+
+        await asyncio.sleep(2)
 
 # ================= WATCHDOG =================
 async def watchdog():
@@ -319,9 +323,19 @@ async def start():
 @app.get("/")
 def root():
     return {
+        "status": "running",
+        "time": now(),
         "positions": engine.positions,
         "stats": engine.stats,
         "logs": engine.logs[-20:]
+    }
+
+@app.get("/debug")
+def debug():
+    return {
+        "logs_len": len(engine.logs),
+        "positions": len(engine.positions),
+        "stats": engine.stats
     }
 
 @app.get("/ui")
@@ -329,7 +343,7 @@ def ui():
     return HTMLResponse("""
     <html>
     <body style="background:black;color:lime">
-    <h2>🔥 v1326 STABLE</h2>
+    <h2>🔥 v1326.1 STABLE FIX</h2>
     <div id=data></div>
     <script>
     async function load(){
