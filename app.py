@@ -36,39 +36,76 @@ last_log_time = {}
 
 app = FastAPI(title="Sniper Bot")
 
+
+def ensure_list(value):
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        return [value]
+    try:
+        return list(value)
+    except Exception:
+        return []
+
+
 def init_engine():
-    if not hasattr(engine, "positions"):
-        engine.positions = []
-    if not hasattr(engine, "logs"):
-        engine.logs = []
-    if not hasattr(engine, "stats"):
-        engine.stats = {
-            "signals": 0,
-            "buys": 0,
-            "sells": 0,
-            "errors": 0,
-        }
+    current_positions = getattr(engine, "positions", [])
+    engine.positions = ensure_list(current_positions)
+
+    current_logs = getattr(engine, "logs", [])
+    engine.logs = ensure_list(current_logs)
+
+    current_stats = getattr(engine, "stats", None)
+    if not isinstance(current_stats, dict):
+        current_stats = {}
+
+    engine.stats = {
+        "signals": int(current_stats.get("signals", 0)),
+        "buys": int(current_stats.get("buys", 0)),
+        "sells": int(current_stats.get("sells", 0)),
+        "errors": int(current_stats.get("errors", 0)),
+    }
+
     if not hasattr(engine, "running"):
         engine.running = True
-    if not hasattr(engine, "mode"):
-        engine.mode = "DRY_RUN" if DRY_RUN else "REAL"
+
+    engine.mode = "DRY_RUN" if DRY_RUN else "REAL"
+
 
 def log_once(key: str, msg: str, sec: float = 5.0):
     now = asyncio.get_event_loop().time()
     if now - last_log_time.get(key, 0) >= sec:
         print(msg, flush=True)
+
+        if not isinstance(getattr(engine, "logs", None), list):
+            engine.logs = ensure_list(getattr(engine, "logs", []))
+
         engine.logs.append(msg)
-        engine.logs = engine.logs[-200:]
+
+        if len(engine.logs) > 200:
+            engine.logs = engine.logs[-200:]
+
         last_log_time[key] = now
 
+
 def get_keypair() -> Keypair:
-    if not PRIVATE_KEY:
+    if not PRIVATE_KEY and not DRY_RUN:
         raise ValueError("PRIVATE_KEY is empty")
     return Keypair.from_base58_string(PRIVATE_KEY)
+
 
 def get_client() -> AsyncClient:
     global rpc_client
     return rpc_client
+
 
 async def rotate_client():
     global rpc_index, rpc_client
@@ -79,6 +116,7 @@ async def rotate_client():
     rpc_index = (rpc_index + 1) % len(RPCS)
     rpc_client = AsyncClient(RPCS[rpc_index], timeout=15)
     log_once("rpc_rotate", f"RPC ROTATE -> {RPCS[rpc_index]}", 1)
+
 
 async def jup_swap_tx(input_mint: str, output_mint: str, amount_sol: float) -> str | None:
     lamports = int(amount_sol * 1_000_000_000)
@@ -103,6 +141,9 @@ async def jup_swap_tx(input_mint: str, output_mint: str, amount_sol: float) -> s
 
         route = routes[0]
 
+        if DRY_RUN:
+            return "DRY_TX"
+
         swap_body = {
             "route": route,
             "userPublicKey": str(get_keypair().pubkey()),
@@ -123,6 +164,7 @@ async def jup_swap_tx(input_mint: str, output_mint: str, amount_sol: float) -> s
             return None
 
         return tx_b64
+
 
 async def send_tx(tx_base64: str) -> str | None:
     if DRY_RUN:
@@ -157,11 +199,13 @@ async def send_tx(tx_base64: str) -> str | None:
         await rotate_client()
         return None
 
+
 async def buy_token(token_mint: str, score: float):
     now = asyncio.get_event_loop().time()
 
     if len(engine.positions) >= MAX_POSITIONS:
         return
+
     if token_cooldown[token_mint] > now:
         return
 
@@ -199,6 +243,7 @@ async def buy_token(token_mint: str, score: float):
         engine.stats["errors"] += 1
         log_once(f"buy_err_{token_mint}", f"BUY ERR {token_mint} {type(e).__name__}: {e}", 1)
 
+
 async def sell_position(pos: dict):
     token_mint = pos["token"]
 
@@ -211,6 +256,7 @@ async def sell_position(pos: dict):
             if not tx_b64:
                 log_once(f"sell_fail_{token_mint}", f"SELL FAIL {token_mint}", 1)
                 return
+
             sig = await send_tx(tx_b64)
             if not sig:
                 log_once(f"sell_send_fail_{token_mint}", f"SELL SEND FAIL {token_mint}", 1)
@@ -218,14 +264,17 @@ async def sell_position(pos: dict):
 
         if pos in engine.positions:
             engine.positions.remove(pos)
+
         engine.stats["sells"] += 1
 
     except Exception as e:
         engine.stats["errors"] += 1
         log_once(f"sell_err_{token_mint}", f"SELL ERR {token_mint} {type(e).__name__}: {e}", 1)
 
+
 def mock_score() -> float:
     return random.random()
+
 
 async def bot_loop():
     while True:
@@ -234,10 +283,9 @@ async def bot_loop():
                 await asyncio.sleep(2)
                 continue
 
-            # 先用這幾個示意 mint；要實盤請換成你自己的真 mint 列表
             watchlist = [
-                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB2633PBnd",  # BONK
-                "EKpQGSJtjMFqKZqQanSqYXRcF6j6G4Vd8s4eJc5qQyQ",   # 範例，占位
+                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6YaB1pPB2633PBnd",
+                "7xKXtg2CWmCzM39jN6iYH2sQPL6V2wRk5vK4wJ8pump",
             ]
 
             ranked = []
@@ -258,6 +306,7 @@ async def bot_loop():
             engine.stats["errors"] += 1
             log_once("bot_loop_err", f"BOT LOOP ERR {type(e).__name__}: {e}", 1)
             await asyncio.sleep(3)
+
 
 async def risk_loop():
     while True:
@@ -281,12 +330,14 @@ async def risk_loop():
             log_once("risk_loop_err", f"RISK LOOP ERR {type(e).__name__}: {e}", 1)
             await asyncio.sleep(5)
 
+
 @app.on_event("startup")
 async def startup():
     init_engine()
     asyncio.create_task(bot_loop())
     asyncio.create_task(risk_loop())
     log_once("startup", f"STARTUP mode={engine.mode}", 1)
+
 
 @app.get("/")
 async def root():
@@ -295,13 +346,15 @@ async def root():
             "mode": engine.mode,
             "positions": engine.positions,
             "stats": engine.stats,
-            "logs": engine.logs[-50:],
+            "logs": engine.logs[-50:] if isinstance(engine.logs, list) else [],
         }
     )
+
 
 @app.get("/health")
 async def health():
     return {"ok": True, "mode": engine.mode}
+
 
 @app.get("/ui")
 async def ui():
