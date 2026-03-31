@@ -7,7 +7,7 @@ EXEC = "https://api.jup.ag/swap/v2/execute"
 
 
 def _headers():
-    return {"x-api-key": os.getenv("JUP_API_KEY", "")}
+    return {"x-api-key": os.getenv("JUP_API_KEY", "").strip()}
 
 
 async def order(input_mint, output_mint, amount):
@@ -54,13 +54,10 @@ async def safe_jupiter_call(tx, retries=3, delay=1):
     for i in range(retries):
         try:
             res = await execute(tx)
-
             if res:
                 return res
-
             print(f"JUP RETRY {i+1}/{retries}: empty response")
             await asyncio.sleep(delay)
-
         except Exception as e:
             print(f"JUP ERROR {i+1}/{retries}:", e)
             await asyncio.sleep(delay)
