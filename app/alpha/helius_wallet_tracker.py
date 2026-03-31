@@ -11,9 +11,6 @@ token_wallets = defaultdict(set)
 
 
 async def fetch_token_trades(mint: str) -> list[str]:
-    """
-    用 Helius token transfers 抓最近收過該 token 的 wallet。
-    """
     if not HELIUS_KEY or not mint:
         return []
 
@@ -36,7 +33,6 @@ async def fetch_token_trades(mint: str) -> list[str]:
         return []
 
     wallets = []
-
     for tx in data:
         try:
             to_wallet = tx.get("toUserAccount")
@@ -45,7 +41,6 @@ async def fetch_token_trades(mint: str) -> list[str]:
         except Exception:
             continue
 
-    # 去重保序
     seen = set()
     unique_wallets = []
     for w in wallets:
@@ -57,9 +52,6 @@ async def fetch_token_trades(mint: str) -> list[str]:
 
 
 async def update_token_wallets(mint: str):
-    """
-    更新某 token 的 wallet 持有人，並同步更新 wallet graph + insider engine。
-    """
     wallets = await fetch_token_trades(mint)
     if not wallets:
         return
@@ -67,10 +59,7 @@ async def update_token_wallets(mint: str):
     for w in wallets:
         token_wallets[mint].add(w)
 
-    # 同步更新資金網
     update_graph(mint, wallets)
-
-    # 記錄最早 wallet
     record_early_wallets(mint, wallets)
 
 
