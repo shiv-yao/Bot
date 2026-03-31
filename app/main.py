@@ -10,7 +10,7 @@ async def startup():
     try:
         from app.core.engine import main_loop
         asyncio.create_task(main_loop())
-        print("✅ ENGINE TASK CREATED")
+        print("✅ ENGINE STARTED")
     except Exception as e:
         print("❌ STARTUP IMPORT ERROR:", repr(e))
 
@@ -26,7 +26,9 @@ def debug():
     return {
         "running": engine.running,
         "capital": engine.capital,
+        "peak_capital": engine.peak_capital,
         "positions": engine.positions,
         "stats": engine.stats,
-        "logs": engine.logs[-50:],
+        "regime": engine.regime,
+        "logs": engine.logs[-80:],
     }
