@@ -1,43 +1,82 @@
 import asyncio
-
+from config.settings import SETTINGS
 from app.execution.quote import get_quote
 from app.execution.jupiter import order
 from app.alpha.alpha import alpha
-from app.regime.regime import regime
-from app.ai.tuner import tuner
-from app.core.state import engine
 from app.sources.pump import fetch_pump_candidates
-from config.settings import SETTINGS
+from app.core.state import engine
 
 SOL = "So11111111111111111111111111111111111111112"
 
 LAST_TRADE = {}
 COOLDOWN = SETTINGS["TOKEN_COOLDOWN"]
-MAX_TRADES = SETTINGS["MAX_TRADES"]
-TOP_N = SETTINGS["TOP_N"]
-
 
 def log(msg):
-    msg = str(msg)
     print(msg)
-    engine.logs.append(msg)
+    engine.logs.append(str(msg))
     engine.logs = engine.logs[-500:]
 
 
-def dynamic_threshold(base_score: float) -> float:
-    # 市場越強，門檻越低一點；市場越弱，門檻越高一點
-    if engine.regime == "bull":
-        return max(SETTINGS["TUNER_MIN"], tuner.threshold * 0.85)
-    if engine.regime == "bear":
-        return min(SETTINGS["TUNER_MAX"], tuner.threshold * 1.15)
-    return tuner.threshold
+# ================= POSITION SIZE =================
+def get_position_size(score):
+    base = SETTINGS["BASE_SIZE"]
+
+    if score > SETTINGS["SNIPER_THRESHOLD"]:
+        return SETTINGS["MAX_SIZE"]
+
+    if score > SETTINGS["FAST_ENTRY_THRESHOLD"]:
+        return int(base * 1.8)
+
+    return base
 
 
-def rank_score(item):
-    # 來源分數 + 動量權重
-    return item.get("_score", 0.0)
+# ================= SELL ENGINE =================
+async def manage_positions():
+    for pos in engine.positions[:]:
+        try:
+            m = pos["mint"]
+
+            q = await get_quote(m, SOL, pos["size"])
+            if not q:
+                continue
+
+            out_now = int(q.get("outAmount", 0) or 0)
+            entry = pos["entry_out"]
+
+            if out_now > pos["peak"]:
+                pos["peak"] = out_now
+
+            pnl = (out_now - entry) / max(entry, 1)
+
+            log(f"PNL {m[:6]} {pnl:.4f}")
+
+            # 💰 TAKE PROFIT
+            if pnl > SETTINGS["TAKE_PROFIT"]:
+                log(f"💰 TAKE PROFIT {m[:6]}")
+                engine.positions.remove(pos)
+                engine.capital *= (1 + pnl)
+                continue
+
+            # 🔵 TRAILING STOP
+            drawdown = (out_now - pos["peak"]) / max(pos["peak"], 1)
+            if pos["peak"] > entry and drawdown < SETTINGS["TRAILING_STOP"]:
+                log(f"🔵 TRAIL STOP {m[:6]}")
+                engine.positions.remove(pos)
+                engine.capital *= (1 + pnl)
+                continue
+
+            # 🔴 STOP LOSS
+            if pnl < SETTINGS["STOP_LOSS"]:
+                log(f"🔴 STOP LOSS {m[:6]}")
+                engine.positions.remove(pos)
+                engine.capital *= (1 + pnl)
+                continue
+
+        except Exception as e:
+            log(f"SELL_ERR {e}")
 
 
+# ================= BUY ENGINE =================
 async def try_trade(item):
     try:
         m = item.get("mint")
@@ -46,151 +85,79 @@ async def try_trade(item):
 
         now = asyncio.get_event_loop().time()
 
-        if engine.stats.get("executed", 0) >= MAX_TRADES:
-            log("MAX_TRADES_REACHED")
+        if len(engine.positions) >= SETTINGS["MAX_POSITIONS"]:
+            log("MAX_POSITIONS")
             return
 
-        last = LAST_TRADE.get(m, 0)
-        if now - last < COOLDOWN:
-            log(f"COOLDOWN {m[:6]}")
+        if now - LAST_TRADE.get(m, 0) < COOLDOWN:
             return
 
-        log(f"PROCESSING: {item}")
-        engine.stats["signals"] += 1
+        score = await alpha(m)
 
-        raw_score = await alpha(m)
+        log(f"SCORE {m[:6]} {score:.4f}")
 
-        regime.update(raw_score)
-        engine.regime = regime.mode
-
-        score = raw_score * regime.multiplier()
-        thr = dynamic_threshold(score)
-
-        log(f"SCORE {m[:6]} score={score:.4f} thr={thr:.4f} regime={engine.regime}")
-
-        # v4：高分直接快速通道
-        fast_lane = score >= SETTINGS["FAST_ENTRY_THRESHOLD"]
-
-        if score < thr and not fast_lane:
-            engine.stats["rejected"] += 1
-            log(f"REJECT {m[:6]} score={score:.4f} thr={thr:.4f}")
+        if score < SETTINGS["ENTRY_THRESHOLD"]:
             return
 
-        # 高分單給更大 size，普通單保守
-        lamports = 300000 if fast_lane else 200000
+        size = get_position_size(score)
 
-        q = await get_quote(SOL, m, lamports)
+        q = await get_quote(SOL, m, size)
         if not q:
-            engine.stats["rejected"] += 1
-            log(f"NO_QUOTE {m[:8]}")
+            log(f"NO_QUOTE {m[:6]}")
             return
 
-        out_amount = int(q.get("outAmount", 0) or 0)
+        out = int(q.get("outAmount", 0) or 0)
         impact = float(q.get("priceImpactPct", 0) or 0)
 
-        if out_amount <= 0:
-            engine.stats["rejected"] += 1
-            log(f"NO_LIQ_ROUTE {m[:8]}")
+        if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"]:
+            log(f"HIGH_IMPACT {m[:6]}")
             return
 
-        if out_amount < 50:
-            engine.stats["rejected"] += 1
-            log(f"TOO_SMALL {m[:6]} out={out_amount}")
-            return
+        log(f"BUY {m[:6]} size={size} out={out} impact={impact:.4f}")
 
-        if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"] and not fast_lane:
-            engine.stats["rejected"] += 1
-            log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
-            return
-
-        log(
-            f"QUOTE_OK {m[:8]} "
-            f"out={out_amount} "
-            f"impact={impact:.4f} "
-            f"fast={fast_lane}"
-        )
-
-        o = await order(SOL, m, lamports, quote=q)
+        o = await order(SOL, m, size, quote=q)
         if not o or not o.get("transaction"):
-            engine.stats["rejected"] += 1
-            log(f"ORDER_FAIL {m[:8]} data={o}")
+            log(f"ORDER_FAIL {m[:6]}")
             return
 
-        log(
-            f"PAPER_EXEC {m[:8]} "
-            f"score={score:.4f} "
-            f"regime={engine.regime} "
-            f"impact={impact:.4f} "
-            f"out={out_amount} "
-            f"fast={fast_lane}"
-        )
-
-        LAST_TRADE[m] = now
-
-        pnl = score - 0.01
-        tuner.update(pnl)
-        engine.threshold = tuner.threshold
-        engine.capital *= (1 + pnl)
-
-        engine.trade_history.append({
-            "token": m,
-            "score": score,
-            "raw_score": raw_score,
-            "pnl": pnl,
-            "regime": engine.regime,
-            "impact": impact,
-            "outAmount": out_amount,
-            "fast": fast_lane,
-            "mode": "paper_v4_dynamic",
+        # 🧠 建倉
+        engine.positions.append({
+            "mint": m,
+            "entry_out": out,
+            "size": size,
+            "peak": out,
+            "time": now,
         })
 
+        LAST_TRADE[m] = now
         engine.stats["executed"] += 1
 
-    except Exception as e:
-        engine.stats["errors"] += 1
-        log(f"PROCESS_ERR {e}")
-
-
-async def safe_cycle():
-    print("scanning...")
-
-    try:
-        items = await fetch_pump_candidates()
-        print("PUMP FILTERED:", items)
-
-        scored = []
-        for item in items:
-            mint = item.get("mint")
-            if not mint:
-                continue
-
-            # 先做輕量 ranking：讓同輪只打前幾名
-            base = item.get("momentum", 0) if isinstance(item, dict) else 0
-            scored.append({**item, "_score": base})
-
-        ranked = sorted(scored, key=rank_score, reverse=True)[:TOP_N]
-
-        for item in ranked:
-            await try_trade(item)
+        log(f"EXECUTED {m[:6]}")
 
     except Exception as e:
-        log(f"SAFE_CYCLE_ERR {e}")
-
-    await asyncio.sleep(5)
+        log(f"TRADE_ERR {e}")
 
 
+# ================= MAIN LOOP =================
 async def main_loop():
-    print("ENGINE LOOP START")
+    print("🚀 V6 ENGINE START")
 
-    if tuner.threshold < SETTINGS["TUNER_MIN"]:
-        tuner.threshold = SETTINGS["TUNER_MIN"]
-    if tuner.threshold > SETTINGS["TUNER_MAX"]:
-        tuner.threshold = SETTINGS["TUNER_MAX"]
+    if not hasattr(engine, "positions"):
+        engine.positions = []
+
+    if not hasattr(engine, "capital"):
+        engine.capital = 1.0
 
     while True:
         try:
-            await safe_cycle()
+            await manage_positions()
+
+            items = await fetch_pump_candidates()
+
+            for item in items[:SETTINGS["TOP_N"]]:
+                await try_trade(item)
+
         except Exception as e:
-            engine.stats["errors"] += 1
-            log(f"LOOP ERROR: {e}")
-            await asyncio.sleep(2)
+            log(f"LOOP_ERR {e}")
+
+        await asyncio.sleep(3)
