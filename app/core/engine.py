@@ -21,6 +21,7 @@ from app.alpha.insider_engine import get_token_insider_score
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
+from app.alpha.helius_wallet_tracker import token_wallets
 
 TP = 0.045
 SL = -0.008
@@ -338,6 +339,8 @@ async def evaluate_route(route: dict):
     s = smart_money_score(token)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
+    engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
+    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
 
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
