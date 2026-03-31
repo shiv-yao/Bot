@@ -5,7 +5,10 @@ SWAP = "https://api.jup.ag/swap/v1/swap"
 
 
 def _headers():
+    api_key = os.getenv("JUP_API_KEY", "").strip()
+    print("JUP KEY PRESENT:", bool(api_key))
     return {
+        "x-api-key": api_key,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -28,8 +31,6 @@ async def order(input_mint, output_mint, amount, quote=None):
             "wrapAndUnwrapSol": True,
         }
 
-        print("SWAP PAYLOAD:", payload)
-
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(SWAP, json=payload, headers=_headers())
 
@@ -39,7 +40,6 @@ async def order(input_mint, output_mint, amount, quote=None):
             return None
 
         data = r.json()
-
         print("SWAP RESPONSE:", data)
 
         swap_tx = data.get("swapTransaction")
@@ -55,8 +55,3 @@ async def order(input_mint, output_mint, amount, quote=None):
     except Exception as e:
         print("SWAP EXCEPTION:", e)
         return None
-
-
-async def execute(order_data):
-    print("EXECUTE SKIPPED (PAPER MODE)")
-    return {"status": "paper"}
