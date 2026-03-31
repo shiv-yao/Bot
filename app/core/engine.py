@@ -6,20 +6,21 @@ from app.core.scanner import scan
 from app.core.pricing import get_price
 from app.core.risk import allow, kill_switch
 
-TP = 0.035
+TP = 0.04
 SL = -0.008
-TRAIL = 0.005
+TRAIL = 0.004
 
 COOLDOWN = 25
-BASE_SIZE = 0.1
 
 cooldown = {}
 candidates = {}
-
 recent_changes = []
 last_trade_time = 0
 
 
+# =========================
+# 🔥 分級 scoring
+# =========================
 def score_token(token: dict) -> float:
     volume = float(token.get("volume", 0))
     change = float(token.get("change", 0))
@@ -30,23 +31,36 @@ def score_token(token: dict) -> float:
     return vol_score + change_score
 
 
-def buy(mint: str, price: float):
+def get_size(score: float) -> float:
+    if score >= 0.65:
+        return 0.12
+    elif score >= 0.55:
+        return 0.08
+    else:
+        return 0.05
+
+
+def buy(mint: str, price: float, score: float):
     global last_trade_time
 
-    engine.capital -= BASE_SIZE
+    size = get_size(score)
+
+    engine.capital -= size
 
     engine.positions.append({
         "mint": mint,
         "entry": price,
         "peak": price,
-        "size": BASE_SIZE,
+        "size": size,
         "time": time.time(),
     })
 
     engine.stats["executed"] += 1
     last_trade_time = time.time()
 
-    engine.log(f"BUY {mint[:6]} price={price:.4f} cap={engine.capital:.4f}")
+    engine.log(
+        f"BUY {mint[:6]} price={price:.4f} size={size:.3f} cap={engine.capital:.4f}"
+    )
 
 
 def sell(pos: dict, price: float, reason: str):
@@ -74,19 +88,24 @@ async def manage_positions():
 
             engine.log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
 
+            # TP
             if pnl >= TP:
                 sell(pos, price, "TP")
                 continue
 
+            # SL
             if pnl <= SL:
                 sell(pos, price, "SL")
                 continue
 
-            if pos["peak"] > pos["entry"] and dd <= -TRAIL:
-                sell(pos, price, "TRAIL")
-                continue
+            # 🔥 分段 trailing（關鍵）
+            if pnl >= 0.015:
+                if dd <= -TRAIL:
+                    sell(pos, price, "TRAIL")
+                    continue
 
-            if now - pos["time"] > 40:
+            # TIME EXIT
+            if now - pos["time"] > 45:
                 sell(pos, price, "TIME")
                 continue
 
@@ -113,21 +132,18 @@ async def main_loop():
             await manage_positions()
 
             # =========================
-            # 🔥 Drawdown
+            # Drawdown
             # =========================
             if engine.capital > engine.peak_capital:
                 engine.peak_capital = engine.capital
 
-            dd = (
-                (engine.capital - engine.peak_capital)
-                / engine.peak_capital
-            )
+            dd = (engine.capital - engine.peak_capital) / engine.peak_capital
             engine.log(f"DRAWDOWN {dd:.4f}")
 
             tokens = await scan()
 
             # =========================
-            # 🔥 市場狀態判斷
+            # 市場判斷
             # =========================
             for t in tokens:
                 recent_changes.append(float(t.get("change", 0)))
@@ -151,12 +167,10 @@ async def main_loop():
 
                 engine.stats["signals"] += 1
 
-                # cooldown
                 if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
                     engine.log(f"COOLDOWN {mint[:6]}")
                     continue
 
-                # 過濾震盪 token
                 if abs(change) < 2:
                     engine.log(f"FLAT_SKIP {mint[:6]}")
                     continue
@@ -164,6 +178,7 @@ async def main_loop():
                 score = score_token(token)
                 engine.log(f"SCORE {mint[:6]} {score:.4f}")
 
+                # 🔥 分級邏輯
                 if score < 0.5:
                     engine.log(f"REJECT {mint[:6]}")
                     engine.stats["rejected"] += 1
@@ -175,17 +190,24 @@ async def main_loop():
                 if not allow(engine):
                     continue
 
-                # =========================
-                # 🔥 控制交易頻率
-                # =========================
+                # 控制頻率
                 if time.time() - last_trade_time < 5:
                     continue
 
-                # =========================
-                # 🔥 延遲進場（V10）
-                # =========================
                 now = time.time()
 
+                # =========================
+                # 🔥 高分直接進
+                # =========================
+                if score >= 0.60:
+                    price = await get_price(token)
+                    buy(mint, price, score)
+                    cooldown[mint] = now
+                    continue
+
+                # =========================
+                # 中分 → candidate
+                # =========================
                 if mint not in candidates:
                     candidates[mint] = {
                         "time": now,
@@ -200,7 +222,6 @@ async def main_loop():
                 price_now = await get_price(token)
                 price_old = candidates[mint]["price"]
 
-                # 🔥 強 momentum
                 momentum = (price_now - price_old) / price_old
 
                 if momentum < 0.003:
@@ -208,7 +229,7 @@ async def main_loop():
                     del candidates[mint]
                     continue
 
-                buy(mint, price_now)
+                buy(mint, price_now, score)
                 cooldown[mint] = now
 
                 del candidates[mint]
