@@ -1,17 +1,26 @@
-# app/core/state.py
+class EngineState:
+    def __init__(self):
+        self.running = True
 
-positions = []
-cooldown = {}
+        self.capital = 1.0
+        self.sol_balance = 0.0
 
-capital = 1.0
+        self.positions = []
+        self.trade_history = []
 
-stats = {
-    "signals": 0,
-    "executed": 0,
-    "rejected": 0,
-    "errors": 0
-}
+        self.logs = []
 
-logs = []
+        self.stats = {
+            "signals": 0,
+            "executed": 0,
+            "rejected": 0,
+            "errors": 0,
+        }
 
-MODE = "PAPER"   # 🔥 PAPER / REAL
+    def log(self, msg):
+        print(msg)
+        self.logs.append(msg)
+        self.logs = self.logs[-200:]
+
+
+engine = EngineState()
