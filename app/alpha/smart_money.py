@@ -17,23 +17,22 @@ async def fetch_pairs(mint: str):
 
 def calc_flow_score(pair: dict) -> float:
     try:
-        buys = float(pair.get("txns", {}).get("m5", {}).get("buys", 0))
-        sells = float(pair.get("txns", {}).get("m5", {}).get("sells", 0))
+        buys = float(pair.get("txns", {}).get("m5", {}).get("buys", 0) or 0)
+        sells = float(pair.get("txns", {}).get("m5", {}).get("sells", 0) or 0)
 
         if buys + sells == 0:
             return 0.0
 
         flow = (buys - sells) / (buys + sells)
-        return max(min(flow, 1), -1)
-
+        return max(min(flow, 1.0), -1.0)
     except Exception:
         return 0.0
 
 
 def calc_volume_score(pair: dict) -> float:
     try:
-        vol = float(pair.get("volume", {}).get("m5", 0))
-        return min(vol / 50000, 1.0)
+        vol = float(pair.get("volume", {}).get("m5", 0) or 0)
+        return min(vol / 50000.0, 1.0)
     except Exception:
         return 0.0
 
@@ -50,8 +49,6 @@ async def smart_money_score(mint: str) -> float:
         vol = calc_volume_score(p)
 
         score = (flow * 0.7) + (vol * 0.3)
-
-        if score > best:
-            best = score
+        best = max(best, score)
 
     return round(max(best, 0.0), 4)
