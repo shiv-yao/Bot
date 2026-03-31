@@ -4,11 +4,11 @@ import time
 from app.core.state import engine
 from app.core.scanner import scan
 from app.core.pricing import get_price
-from app.core.risk import allow
+from app.core.risk import allow, kill_switch
 
 TP = 0.02
 SL = -0.01
-TRAIL = 0.008
+TRAIL = 0.004   # 🔥 收緊，避免賺了又吐回去
 COOLDOWN = 20
 BASE_SIZE = 0.1
 
@@ -73,7 +73,7 @@ async def manage_positions():
                 sell(pos, price, "TRAIL")
                 continue
 
-            # 保底時間出場，避免卡倉
+            # 最長持有 30 秒，避免卡倉
             if now - pos["time"] > 30:
                 sell(pos, price, "TIME")
                 continue
@@ -93,22 +93,45 @@ async def main_loop():
 
     while engine.running:
         try:
+            # 🔥 保命總開關
+            if kill_switch(engine):
+                break
+
             await manage_positions()
+
+            # 🔥 記錄 peak capital + drawdown
+            if engine.capital > engine.peak_capital:
+                engine.peak_capital = engine.capital
+
+            drawdown = (
+                (engine.capital - engine.peak_capital) / engine.peak_capital
+                if engine.peak_capital > 0
+                else 0.0
+            )
+            engine.log(f"DRAWDOWN {drawdown:.4f}")
 
             tokens = await scan()
 
             for token in tokens:
                 mint = token["mint"]
+                change = float(token.get("change", 0))
+
                 engine.stats["signals"] += 1
 
                 if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
                     engine.log(f"COOLDOWN {mint[:6]}")
                     continue
 
+                # 🔥 震盪盤直接跳過
+                if abs(change) < 2:
+                    engine.log(f"FLAT_SKIP {mint[:6]}")
+                    continue
+
                 s = score_token(token)
                 engine.log(f"SCORE {mint[:6]} {s:.4f}")
 
-                if s < 0.35:
+                # 🔥 門檻提高，減少亂買
+                if s < 0.45:
                     engine.stats["rejected"] += 1
                     engine.log(f"REJECT {mint[:6]}")
                     continue
