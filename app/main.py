@@ -305,26 +305,118 @@ def metrics():
     from app.alpha.combiner import get_dynamic_weights
 
     trade_history = engine.trade_history
+
     total_trades = len(trade_history)
     wins = engine.stats.get("wins", 0)
     losses = engine.stats.get("losses", 0)
+
     total_closed = wins + losses
     overall_win_rate = (wins / total_closed) if total_closed else 0.0
 
-    total_realized_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in trade_history)
-    avg_trade_pnl = (total_realized_pnl / total_trades) if total_trades else 0.0
+    total_realized_pnl = sum(
+        float(t.get("pnl", 0.0) or 0.0) for t in trade_history
+    )
 
-    source_stats = _source_stats(trade_history)
-    score_stats = _score_component_stats(trade_history)
-    best_source, worst_source = _best_worst_source(source_stats)
-    dynamic_weights = get_dynamic_weights(source_stats)
-    insider_perf = _insider_vs_non_insider_performance(trade_history)
+    avg_trade_pnl = (
+        total_realized_pnl / total_trades if total_trades else 0.0
+    )
 
+    # ===== source stats =====
+    source_stats = {}
+    for t in trade_history:
+        src = t.get("meta", {}).get("source", "unknown")
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+
+        if src not in source_stats:
+            source_stats[src] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+            }
+
+        source_stats[src]["count"] += 1
+        source_stats[src]["total_pnl"] += pnl
+
+        if pnl >= 0:
+            source_stats[src]["wins"] += 1
+        else:
+            source_stats[src]["losses"] += 1
+
+    for src, row in source_stats.items():
+        c = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / c
+        row["win_rate"] = row["wins"] / c
+
+    # ===== insider vs non insider =====
+    insider_perf = {
+        "high_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+        "low_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+    }
+
+    THRESHOLD = 0.30
+
+    for t in trade_history:
+        meta = t.get("meta", {}) or {}
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        insider = float(meta.get("insider", 0.0) or 0.0)
+
+        bucket_name = "high_insider" if insider >= THRESHOLD else "low_insider"
+        row = insider_perf[bucket_name]
+
+        row["count"] += 1
+        row["total_pnl"] += pnl
+
+        if pnl >= 0:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+
+    for row in insider_perf.values():
+        c = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / c
+        row["win_rate"] = row["wins"] / c
+
+    comparison = {
+        "avg_pnl_diff": (
+            insider_perf["high_insider"]["avg_pnl"]
+            - insider_perf["low_insider"]["avg_pnl"]
+        ),
+        "win_rate_diff": (
+            insider_perf["high_insider"]["win_rate"]
+            - insider_perf["low_insider"]["win_rate"]
+        ),
+        "threshold": THRESHOLD,
+    }
+
+    insider_perf["comparison"] = comparison
+
+    # ===== dynamic weights（🔥含 insider）=====
+    dynamic_weights = get_dynamic_weights(source_stats, insider_perf)
+
+    # ===== positions by source =====
     positions_by_source = {}
     for p in engine.positions:
-        source = (p.get("meta", {}) or {}).get("source", "unknown")
-        positions_by_source[source] = positions_by_source.get(source, 0) + 1
+        src = (p.get("meta", {}) or {}).get("source", "unknown")
+        positions_by_source[src] = positions_by_source.get(src, 0) + 1
 
+    # ===== 回傳 =====
     return {
         "summary": {
             "capital": engine.capital,
@@ -351,21 +443,20 @@ def metrics():
             "daily_trades": risk_engine.daily_trades,
         },
         "source_stats": source_stats,
-        "best_source": best_source,
-        "worst_source": worst_source,
-        "score_component_stats": score_stats,
+        "insider_vs_non_insider_performance": insider_perf,
         "dynamic_weights": dynamic_weights,
         "portfolio": {
-            "total_exposure_ratio": round(portfolio.total_exposure_ratio(engine), 4),
+            "total_exposure_ratio": round(
+                portfolio.total_exposure_ratio(engine), 4
+            ),
             "positions_by_source": positions_by_source,
             "source_exposure_ratio": {
-                src: round(portfolio.source_exposure_ratio(engine, src), 4)
+                src: round(
+                    portfolio.source_exposure_ratio(engine, src), 4
+                )
                 for src in positions_by_source.keys()
             },
         },
-        "smart_wallet": _wallet_metrics(),
-        "insider": _insider_metrics(),
-        "insider_vs_non_insider_performance": insider_perf,
         "risk": {
             "equity_peak": risk_engine.equity_peak,
             "drawdown": risk_engine.drawdown(engine.capital),
