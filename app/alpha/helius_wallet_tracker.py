@@ -6,14 +6,22 @@ from app.alpha.insider_engine import record_early_wallets
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
+# mint -> wallets
 token_wallets = defaultdict(set)
 
 
-async def fetch_token_trades_v1(mint: str):
-    """舊 API"""
-    url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_KEY}"
+async def fetch_token_trades_v1(mint: str) -> list[str]:
+    """
+    舊 token-transfers 查法
+    """
+    if not HELIUS_KEY or not mint:
+        return []
 
-    payload = {"mint": mint, "limit": 20}
+    url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_KEY}"
+    payload = {
+        "mint": mint,
+        "limit": 20,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -24,20 +32,28 @@ async def fetch_token_trades_v1(mint: str):
             data = r.json()
             if not isinstance(data, list):
                 return []
-    except:
+    except Exception:
         return []
 
     wallets = []
     for tx in data:
-        w = tx.get("toUserAccount")
-        if w:
-            wallets.append(w)
+        try:
+            w = tx.get("toUserAccount")
+            if w and isinstance(w, str):
+                wallets.append(w)
+        except Exception:
+            continue
 
-    return wallets
+    return list(dict.fromkeys(wallets))
 
 
-async def fetch_token_trades_v2(mint: str):
-    """新 API（較準）"""
+async def fetch_token_trades_v2(mint: str) -> list[str]:
+    """
+    備援查法：直接看 address transactions
+    """
+    if not HELIUS_KEY or not mint:
+        return []
+
     url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions?api-key={HELIUS_KEY}"
 
     try:
@@ -49,47 +65,53 @@ async def fetch_token_trades_v2(mint: str):
             data = r.json()
             if not isinstance(data, list):
                 return []
-    except:
+    except Exception:
         return []
 
     wallets = []
 
     for tx in data[:20]:
         try:
-            for acc in tx.get("accountData", []):
+            for acc in tx.get("accountData", []) or []:
                 addr = acc.get("account")
-                if addr:
+                if addr and isinstance(addr, str):
                     wallets.append(addr)
-        except:
+        except Exception:
             continue
 
-    return wallets
+    return list(dict.fromkeys(wallets))
 
 
-async def fetch_wallets(mint: str):
-    if not HELIUS_KEY:
-        return []
-
+async def fetch_wallets(mint: str) -> list[str]:
+    """
+    先用 v1，失敗再用 v2
+    """
     w1 = await fetch_token_trades_v1(mint)
     if w1:
-        return list(set(w1))
+        return w1
 
     w2 = await fetch_token_trades_v2(mint)
     if w2:
-        return list(set(w2))
+        return w2
 
     return []
 
 
-async def update_token_wallets(mint: str):
+async def update_token_wallets(mint: str) -> list[str]:
+    """
+    更新某個 mint 的 wallet，並回傳本次抓到的 wallets
+    """
     wallets = await fetch_wallets(mint)
 
-    # 🔥 fallback（超關鍵）
     if not wallets:
-        # 隨機假 wallet → 讓系統能學
-        wallets = [f"fake_{mint[:4]}_{i}" for i in range(3)]
+        return []
 
     for w in wallets:
         token_wallets[mint].add(w)
 
     record_early_wallets(mint, wallets)
+    return wallets
+
+
+def get_wallets_for_token(mint: str) -> list[str]:
+    return list(token_wallets.get(mint, set()))
