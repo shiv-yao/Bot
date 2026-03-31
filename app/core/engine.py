@@ -22,21 +22,16 @@ from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
 
-
-# ================= CONFIG =================
 TP = 0.045
 SL = -0.008
 TRAIL = 0.004
 
 TRADE_INTERVAL = 12
 
-
-# ================= STATE =================
 last_trade_time = 0
 recent_changes = []
 
 
-# ================= HELPERS =================
 def calc_drawdown():
     if engine.peak_capital <= 0:
         return 0.0
@@ -94,7 +89,6 @@ def record_trade(pos, price, reason):
     return pnl
 
 
-# ================= TRADING =================
 def buy(mint, price, score, size, meta):
     global last_trade_time
 
@@ -136,6 +130,7 @@ def buy(mint, price, score, size, meta):
         f"wb={weights.get('breakout', 0):.2f} "
         f"ws={weights.get('smart_money', 0):.2f} "
         f"wl={weights.get('liquidity', 0):.2f} "
+        f"wi={weights.get('insider', 0):.2f} "
         f"cap={engine.capital:.4f}"
     )
 
@@ -198,7 +193,6 @@ def add_winner(pos, price, ratio):
     )
 
 
-# ================= POSITION MANAGEMENT =================
 async def manage_positions():
     now = time.time()
     remaining = []
@@ -221,15 +215,12 @@ async def manage_positions():
             for act, ratio in actions:
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
-
                 elif act == "add":
                     add_winner(pos, price, ratio)
-
                 elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
                     sold = True
                     break
-
                 elif act == "breakeven":
                     engine.log(
                         f"BREAKEVEN {pos['mint'][:6]} "
@@ -264,7 +255,6 @@ async def manage_positions():
     engine.positions = remaining
 
 
-# ================= ROUTE =================
 async def evaluate_route(route):
     global last_trade_time
 
@@ -277,7 +267,6 @@ async def evaluate_route(route):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # 背景更新鏈上 wallet / insider 資料
     asyncio.create_task(update_token_wallets(mint))
 
     b = breakout_score(token)
@@ -288,7 +277,14 @@ async def evaluate_route(route):
     stats = build_source_stats(engine.trade_history)
     weights = get_dynamic_weights(stats)
 
-    score = combine_scores(b, s, l, engine.regime, stats)
+    score = combine_scores(
+        breakout=b,
+        smart_money=s,
+        liquidity=l,
+        insider=insider,
+        regime=engine.regime,
+        source_stats=stats,
+    )
 
     engine.log(
         f"ROUTE {mint[:6]} "
@@ -302,6 +298,7 @@ async def evaluate_route(route):
         f"wb={weights['breakout']:.2f} "
         f"ws={weights['smart_money']:.2f} "
         f"wl={weights['liquidity']:.2f} "
+        f"wi={weights['insider']:.2f} "
         f"regime={engine.regime}"
     )
 
@@ -319,13 +316,7 @@ async def evaluate_route(route):
     if not allow(engine, score, size):
         return
 
-    ok, _ = should_enter(
-        token,
-        {
-            "momentum": 0.01,
-            "smart_money": s,
-        }
-    )
+    ok, _ = should_enter(token, {"momentum": 0.01, "smart_money": s})
     if not ok:
         return
 
@@ -345,7 +336,6 @@ async def evaluate_route(route):
     )
 
 
-# ================= MAIN LOOP =================
 async def main_loop():
     engine.log("🚀 ENGINE START")
 
