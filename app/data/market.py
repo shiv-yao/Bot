@@ -1,10 +1,14 @@
+import os
 import httpx
 
-# 🔥 用免費 endpoint（不用 API KEY）
-QUOTE = "https://quote-api.jup.ag/v6/quote"
+QUOTE = "https://api.jup.ag/swap/v1/quote"
 
 
 async def get_quote(input_mint, output_mint, amount):
+    headers = {
+        "x-api-key": os.getenv("JUP_API_KEY", "").strip()
+    }
+
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
@@ -15,18 +19,18 @@ async def get_quote(input_mint, output_mint, amount):
                     "amount": str(amount),
                     "slippageBps": 80,
                 },
+                headers=headers,
             )
 
         if r.status_code != 200:
-            print("QUOTE ERR:", r.status_code, r.text[:200])
+            print("QUOTE ERR:", r.status_code, r.text[:300])
             return None
 
         data = r.json()
-
-        if not data or not data.get("data"):
+        if not data or not data.get("outAmount"):
             return None
 
-        return data["data"][0]
+        return data
 
     except Exception as e:
         print("QUOTE EXCEPTION:", e)
