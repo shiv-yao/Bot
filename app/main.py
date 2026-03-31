@@ -98,6 +98,35 @@ def _best_worst_source(source_stats: dict):
     )
 
 
+def _wallet_metrics():
+    from app.alpha.wallet_tracker import token_wallets, wallet_trades
+    from app.alpha.smart_wallet_ranker import wallet_score
+
+    wallet_count_by_token = {
+        mint[:8]: len(wallets)
+        for mint, wallets in list(token_wallets.items())[-30:]
+    }
+
+    top_wallet_strength = []
+    for wallet in list(wallet_trades.keys())[-50:]:
+        score = wallet_score(wallet)
+        top_wallet_strength.append({
+            "wallet": wallet,
+            "score": round(score, 4),
+            "trades": len(wallet_trades.get(wallet, [])),
+        })
+
+    top_wallet_strength.sort(key=lambda x: x["score"], reverse=True)
+    top_wallet_strength = top_wallet_strength[:10]
+
+    return {
+        "tracked_wallets": len(wallet_trades),
+        "tracked_tokens": len(token_wallets),
+        "wallet_count_by_token": wallet_count_by_token,
+        "top_wallet_strength": top_wallet_strength,
+    }
+
+
 @app.get("/debug")
 def debug():
     from app.core.state import engine
@@ -177,6 +206,7 @@ def debug():
             "cooldown_tail": cooldown_view,
             "candidate_tail": candidates_view,
         },
+        "smart_wallet": _wallet_metrics(),
         "logs": engine.logs[-120:],
     }
 
@@ -186,6 +216,7 @@ def metrics():
     from app.core.state import engine
     from app.core.risk_runtime import risk_engine
     from app.portfolio.portfolio_manager import portfolio
+    from app.alpha.combiner import get_dynamic_weights
 
     trade_history = engine.trade_history
     total_trades = len(trade_history)
@@ -200,6 +231,7 @@ def metrics():
     source_stats = _source_stats(trade_history)
     score_stats = _score_component_stats(trade_history)
     best_source, worst_source = _best_worst_source(source_stats)
+    dynamic_weights = get_dynamic_weights(source_stats)
 
     positions_by_source = {}
     for p in engine.positions:
@@ -235,6 +267,7 @@ def metrics():
         "best_source": best_source,
         "worst_source": worst_source,
         "score_component_stats": score_stats,
+        "dynamic_weights": dynamic_weights,
         "portfolio": {
             "total_exposure_ratio": round(portfolio.total_exposure_ratio(engine), 4),
             "positions_by_source": positions_by_source,
@@ -243,6 +276,7 @@ def metrics():
                 for src in positions_by_source.keys()
             },
         },
+        "smart_wallet": _wallet_metrics(),
         "risk": {
             "equity_peak": risk_engine.equity_peak,
             "drawdown": risk_engine.drawdown(engine.capital),
