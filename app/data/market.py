@@ -1,1 +1,32 @@
-headers = {}
+import httpx
+
+QUOTE = "https://api.jup.ag/swap/v1/quote"
+
+
+async def get_quote(input_mint, output_mint, amount):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                QUOTE,
+                params={
+                    "inputMint": input_mint,
+                    "outputMint": output_mint,
+                    "amount": str(amount),
+                    "slippageBps": 80,
+                },
+            )
+
+        if r.status_code != 200:
+            print("QUOTE ERR:", r.status_code, r.text[:300])
+            return None
+
+        data = r.json()
+
+        if not data or not data.get("outAmount"):
+            return None
+
+        return data
+
+    except Exception as e:
+        print("QUOTE EXCEPTION:", e)
+        return None
