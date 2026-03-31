@@ -99,7 +99,8 @@ def _best_worst_source(source_stats: dict):
 
 
 def _wallet_metrics():
-    from app.alpha.wallet_tracker import token_wallets, wallet_trades
+    from app.alpha.helius_wallet_tracker import token_wallets
+    from app.alpha.wallet_tracker import wallet_trades
     from app.alpha.smart_wallet_ranker import wallet_score
 
     wallet_count_by_token = {
@@ -124,6 +125,30 @@ def _wallet_metrics():
         "tracked_tokens": len(token_wallets),
         "wallet_count_by_token": wallet_count_by_token,
         "top_wallet_strength": top_wallet_strength,
+    }
+
+
+def _insider_metrics():
+    from app.alpha.insider_engine import (
+        token_early_wallets,
+        wallet_insider_hits,
+        get_insider_summary,
+    )
+
+    token_summary = {}
+    for mint in list(token_early_wallets.keys())[-20:]:
+        token_summary[mint[:8]] = get_insider_summary(mint)
+
+    top_wallets = sorted(
+        [{"wallet": w, "hits": h} for w, h in wallet_insider_hits.items()],
+        key=lambda x: x["hits"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "tracked_tokens": len(token_early_wallets),
+        "top_wallet_hits": top_wallets,
+        "token_insider_summary": token_summary,
     }
 
 
@@ -207,6 +232,7 @@ def debug():
             "candidate_tail": candidates_view,
         },
         "smart_wallet": _wallet_metrics(),
+        "insider": _insider_metrics(),
         "logs": engine.logs[-120:],
     }
 
@@ -277,6 +303,7 @@ def metrics():
             },
         },
         "smart_wallet": _wallet_metrics(),
+        "insider": _insider_metrics(),
         "risk": {
             "equity_peak": risk_engine.equity_peak,
             "drawdown": risk_engine.drawdown(engine.capital),
