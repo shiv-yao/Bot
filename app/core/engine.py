@@ -35,12 +35,16 @@ async def process(item):
         engine.regime = regime.mode
         score *= regime.multiplier()
 
+        # ===== debug 關鍵 =====
+        log(f"SCORE {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
+
+        # ===== 先固定門檻測試 =====
         if score < 0.012:
             engine.stats["rejected"] += 1
-            log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
+            log(f"REJECT {m[:6]} score={score:.4f} thr=0.012")
             return
 
-        # ===== 小額保守測試 =====
+        # ===== 保守版小額 =====
         lamports = 200000  # 0.0002 SOL
 
         # ===== quote =====
@@ -58,7 +62,6 @@ async def process(item):
             log(f"NO_LIQ_ROUTE {m[:8]}")
             return
 
-        # ===== 穩定版：高滑點不碰 =====
         if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"]:
             engine.stats["rejected"] += 1
             log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
@@ -70,7 +73,7 @@ async def process(item):
             f"impact={impact:.4f}"
         )
 
-        # ===== 產生 swap tx（先不真 execute）=====
+        # ===== swap tx =====
         o = await order(SOL, m, lamports, quote=q)
         if not o or not o.get("transaction"):
             engine.stats["rejected"] += 1
@@ -86,7 +89,6 @@ async def process(item):
             f"out={out_amount}"
         )
 
-        # ===== 簡化統計 =====
         pnl = score - 0.01
         tuner.update(pnl)
         engine.threshold = tuner.threshold
@@ -99,7 +101,7 @@ async def process(item):
             "regime": engine.regime,
             "impact": impact,
             "outAmount": out_amount,
-            "mode": "paper_stable",
+            "mode": "paper_stable_debug",
         })
 
         engine.stats["executed"] += 1
@@ -128,7 +130,6 @@ async def safe_cycle():
 async def main_loop():
     print("ENGINE LOOP START")
 
-    # 啟動時把 threshold 設回穩定值區間
     if tuner.threshold < SETTINGS["TUNER_MIN"]:
         tuner.threshold = SETTINGS["TUNER_MIN"]
     if tuner.threshold > SETTINGS["TUNER_MAX"]:
