@@ -6,15 +6,18 @@ from app.core.scanner import scan
 from app.core.pricing import get_price
 from app.core.risk import allow, kill_switch
 
-TP = 0.03
+TP = 0.035
 SL = -0.008
-TRAIL = 0.004
+TRAIL = 0.005
 
-COOLDOWN = 20
+COOLDOWN = 25
 BASE_SIZE = 0.1
 
 cooldown = {}
-candidates = {}  # 🔥 延遲進場池
+candidates = {}
+
+recent_changes = []
+last_trade_time = 0
 
 
 def score_token(token: dict) -> float:
@@ -28,6 +31,8 @@ def score_token(token: dict) -> float:
 
 
 def buy(mint: str, price: float):
+    global last_trade_time
+
     engine.capital -= BASE_SIZE
 
     engine.positions.append({
@@ -39,6 +44,8 @@ def buy(mint: str, price: float):
     })
 
     engine.stats["executed"] += 1
+    last_trade_time = time.time()
+
     engine.log(f"BUY {mint[:6]} price={price:.4f} cap={engine.capital:.4f}")
 
 
@@ -79,7 +86,7 @@ async def manage_positions():
                 sell(pos, price, "TRAIL")
                 continue
 
-            if now - pos["time"] > 30:
+            if now - pos["time"] > 40:
                 sell(pos, price, "TIME")
                 continue
 
@@ -94,6 +101,8 @@ async def manage_positions():
 
 
 async def main_loop():
+    global recent_changes
+
     engine.log("ENGINE STARTED")
 
     while engine.running:
@@ -103,7 +112,9 @@ async def main_loop():
 
             await manage_positions()
 
-            # 🔥 drawdown
+            # =========================
+            # 🔥 Drawdown
+            # =========================
             if engine.capital > engine.peak_capital:
                 engine.peak_capital = engine.capital
 
@@ -114,6 +125,25 @@ async def main_loop():
             engine.log(f"DRAWDOWN {dd:.4f}")
 
             tokens = await scan()
+
+            # =========================
+            # 🔥 市場狀態判斷
+            # =========================
+            for t in tokens:
+                recent_changes.append(float(t.get("change", 0)))
+
+            if len(recent_changes) > 30:
+                recent_changes = recent_changes[-30:]
+
+            if len(recent_changes) > 5:
+                market_vol = sum(abs(x) for x in recent_changes) / len(recent_changes)
+
+                if market_vol < 1.5:
+                    engine.log("MARKET_FLAT")
+                    await asyncio.sleep(2)
+                    continue
+
+            # =========================
 
             for token in tokens:
                 mint = token["mint"]
@@ -126,7 +156,7 @@ async def main_loop():
                     engine.log(f"COOLDOWN {mint[:6]}")
                     continue
 
-                # 🔥 震盪盤跳過
+                # 過濾震盪 token
                 if abs(change) < 2:
                     engine.log(f"FLAT_SKIP {mint[:6]}")
                     continue
@@ -134,7 +164,7 @@ async def main_loop():
                 score = score_token(token)
                 engine.log(f"SCORE {mint[:6]} {score:.4f}")
 
-                if score < 0.45:
+                if score < 0.5:
                     engine.log(f"REJECT {mint[:6]}")
                     engine.stats["rejected"] += 1
                     continue
@@ -146,9 +176,14 @@ async def main_loop():
                     continue
 
                 # =========================
-                # 🔥 V9 核心：延遲確認
+                # 🔥 控制交易頻率
                 # =========================
+                if time.time() - last_trade_time < 5:
+                    continue
 
+                # =========================
+                # 🔥 延遲進場（V10）
+                # =========================
                 now = time.time()
 
                 if mint not in candidates:
@@ -159,20 +194,20 @@ async def main_loop():
                     engine.log(f"CANDIDATE {mint[:6]}")
                     continue
 
-                # 等待確認時間
                 if now - candidates[mint]["time"] < 3:
                     continue
 
                 price_now = await get_price(token)
                 price_old = candidates[mint]["price"]
 
-                # 🔥 momentum 確認（關鍵）
-                if price_now <= price_old:
-                    engine.log(f"REJECT_WEAK {mint[:6]}")
+                # 🔥 強 momentum
+                momentum = (price_now - price_old) / price_old
+
+                if momentum < 0.003:
+                    engine.log(f"WEAK_MOMENTUM {mint[:6]}")
                     del candidates[mint]
                     continue
 
-                # 🔥 成功突破才買
                 buy(mint, price_now)
                 cooldown[mint] = now
 
