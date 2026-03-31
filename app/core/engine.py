@@ -332,7 +332,7 @@ async def evaluate_route(route: dict):
     try:
         await update_token_wallets(mint)
     except Exception as e:
-    engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
+        engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
     b = breakout_score(token)
     s = smart_money_score(token)
