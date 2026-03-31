@@ -1,23 +1,32 @@
-import httpx
+import asyncio
+import random
+import time
 
-URL = "https://quote-api.jup.ag/v6/quote"
 
-async def get_price(mint):
-    try:
-        params = {
-            "inputMint": "So11111111111111111111111111111111111111112",
-            "outputMint": mint,
-            "amount": 1000000
-        }
+def _base_price(mint: str) -> float:
+    seed = sum(ord(c) for c in mint[:8])
+    return 1.0 + (seed % 100) / 1000.0
 
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(URL, params=params)
-            j = r.json()
 
-            routes = j.get("data", [])
-            if not routes:
-                return None
+async def get_price(token: dict | str) -> float:
+    await asyncio.sleep(0)
 
-            return int(routes[0]["outAmount"]) / 1000000
-    except:
-        return None
+    mint = token["mint"] if isinstance(token, dict) else token
+    base = _base_price(mint)
+
+    # 模擬小幅波動，讓買賣循環能運作
+    phase = time.time() % 20
+    drift = 0.0
+
+    if phase < 5:
+        drift = 0.004 * phase
+    elif phase < 10:
+        drift = 0.02 - 0.003 * (phase - 5)
+    elif phase < 15:
+        drift = 0.005 - 0.004 * (phase - 10)
+    else:
+        drift = -0.015 + 0.003 * (phase - 15)
+
+    drift += random.uniform(-0.004, 0.006)
+
+    return max(0.0001, base * (1 + drift))
