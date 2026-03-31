@@ -335,7 +335,7 @@ async def evaluate_route(route: dict):
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
     b = breakout_score(token)
-    s = smart_money_score(token)
+    s = await smart_money_score(mint)
     l = liquidity_score(token)
 
     # 👉 真 insider
