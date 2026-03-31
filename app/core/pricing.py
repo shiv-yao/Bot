@@ -1,33 +1,23 @@
-# app/core/scanner.py
-
 import httpx
 
-DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/solana"
+URL = "https://quote-api.jup.ag/v6/quote"
 
-async def fetch_tokens():
-    async with httpx.AsyncClient(timeout=5) as client:
-        r = await client.get(DEX_URL)
-        data = r.json()
+async def get_price(mint):
+    try:
+        params = {
+            "inputMint": "So11111111111111111111111111111111111111112",
+            "outputMint": mint,
+            "amount": 1000000
+        }
 
-        tokens = []
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(URL, params=params)
+            j = r.json()
 
-        for p in data.get("pairs", []):
-            vol = p.get("volume", {}).get("h24", 0)
-            change = p.get("priceChange", {}).get("h1", 0)
+            routes = j.get("data", [])
+            if not routes:
+                return None
 
-            if vol < 50000:
-                continue
-
-            if abs(change) < 2:
-                continue
-
-            tokens.append({
-                "mint": p["baseToken"]["address"],
-                "volume": vol,
-                "change": change
-            })
-
-            if len(tokens) >= 15:
-                break
-
-        return tokens
+            return int(routes[0]["outAmount"]) / 1000000
+    except:
+        return None
