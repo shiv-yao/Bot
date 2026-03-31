@@ -12,8 +12,9 @@ from config.settings import SETTINGS
 SOL = "So11111111111111111111111111111111111111112"
 
 LAST_TRADE = {}
-COOLDOWN = 60
-MAX_TRADES = 20
+COOLDOWN = SETTINGS["TOKEN_COOLDOWN"]
+MAX_TRADES = SETTINGS["MAX_TRADES"]
+TOP_N = SETTINGS["TOP_N"]
 
 
 def log(msg):
@@ -23,7 +24,21 @@ def log(msg):
     engine.logs = engine.logs[-500:]
 
 
-async def process(item):
+def dynamic_threshold(base_score: float) -> float:
+    # 市場越強，門檻越低一點；市場越弱，門檻越高一點
+    if engine.regime == "bull":
+        return max(SETTINGS["TUNER_MIN"], tuner.threshold * 0.85)
+    if engine.regime == "bear":
+        return min(SETTINGS["TUNER_MAX"], tuner.threshold * 1.15)
+    return tuner.threshold
+
+
+def rank_score(item):
+    # 來源分數 + 動量權重
+    return item.get("_score", 0.0)
+
+
+async def try_trade(item):
     try:
         m = item.get("mint")
         if not m:
@@ -43,20 +58,26 @@ async def process(item):
         log(f"PROCESSING: {item}")
         engine.stats["signals"] += 1
 
-        score = await alpha(m)
+        raw_score = await alpha(m)
 
-        regime.update(score)
+        regime.update(raw_score)
         engine.regime = regime.mode
-        score *= regime.multiplier()
 
-        log(f"SCORE {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
+        score = raw_score * regime.multiplier()
+        thr = dynamic_threshold(score)
 
-        if score < 0.012:
+        log(f"SCORE {m[:6]} score={score:.4f} thr={thr:.4f} regime={engine.regime}")
+
+        # v4：高分直接快速通道
+        fast_lane = score >= SETTINGS["FAST_ENTRY_THRESHOLD"]
+
+        if score < thr and not fast_lane:
             engine.stats["rejected"] += 1
-            log(f"REJECT {m[:6]} score={score:.4f} thr=0.012")
+            log(f"REJECT {m[:6]} score={score:.4f} thr={thr:.4f}")
             return
 
-        lamports = 200000  # 0.0002 SOL
+        # 高分單給更大 size，普通單保守
+        lamports = 300000 if fast_lane else 200000
 
         q = await get_quote(SOL, m, lamports)
         if not q:
@@ -77,12 +98,17 @@ async def process(item):
             log(f"TOO_SMALL {m[:6]} out={out_amount}")
             return
 
-        if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"]:
+        if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"] and not fast_lane:
             engine.stats["rejected"] += 1
             log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
             return
 
-        log(f"QUOTE_OK {m[:8]} out={out_amount} impact={impact:.4f}")
+        log(
+            f"QUOTE_OK {m[:8]} "
+            f"out={out_amount} "
+            f"impact={impact:.4f} "
+            f"fast={fast_lane}"
+        )
 
         o = await order(SOL, m, lamports, quote=q)
         if not o or not o.get("transaction"):
@@ -95,7 +121,8 @@ async def process(item):
             f"score={score:.4f} "
             f"regime={engine.regime} "
             f"impact={impact:.4f} "
-            f"out={out_amount}"
+            f"out={out_amount} "
+            f"fast={fast_lane}"
         )
 
         LAST_TRADE[m] = now
@@ -108,11 +135,13 @@ async def process(item):
         engine.trade_history.append({
             "token": m,
             "score": score,
+            "raw_score": raw_score,
             "pnl": pnl,
             "regime": engine.regime,
             "impact": impact,
             "outAmount": out_amount,
-            "mode": "paper_v2_stable",
+            "fast": fast_lane,
+            "mode": "paper_v4_dynamic",
         })
 
         engine.stats["executed"] += 1
@@ -129,8 +158,20 @@ async def safe_cycle():
         items = await fetch_pump_candidates()
         print("PUMP FILTERED:", items)
 
+        scored = []
         for item in items:
-            await process(item)
+            mint = item.get("mint")
+            if not mint:
+                continue
+
+            # 先做輕量 ranking：讓同輪只打前幾名
+            base = item.get("momentum", 0) if isinstance(item, dict) else 0
+            scored.append({**item, "_score": base})
+
+        ranked = sorted(scored, key=rank_score, reverse=True)[:TOP_N]
+
+        for item in ranked:
+            await try_trade(item)
 
     except Exception as e:
         log(f"SAFE_CYCLE_ERR {e}")
