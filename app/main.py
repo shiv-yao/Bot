@@ -61,6 +61,7 @@ def _score_component_stats(trade_history: list[dict]) -> dict:
         "smart_money": {"count": 0, "avg_score": 0.0},
         "liquidity": {"count": 0, "avg_score": 0.0},
         "momentum": {"count": 0, "avg_score": 0.0},
+        "insider": {"count": 0, "avg_score": 0.0},
     }
 
     sums = {
@@ -68,6 +69,7 @@ def _score_component_stats(trade_history: list[dict]) -> dict:
         "smart_money": 0.0,
         "liquidity": 0.0,
         "momentum": 0.0,
+        "insider": 0.0,
     }
 
     for t in trade_history:
@@ -152,6 +154,61 @@ def _insider_metrics():
     }
 
 
+def _insider_vs_non_insider_performance(trade_history: list[dict], threshold: float = 0.30):
+    buckets = {
+        "high_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+        "low_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+    }
+
+    for t in trade_history:
+        meta = t.get("meta", {}) or {}
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        insider = float(meta.get("insider", 0.0) or 0.0)
+
+        bucket_name = "high_insider" if insider >= threshold else "low_insider"
+        bucket = buckets[bucket_name]
+
+        bucket["count"] += 1
+        bucket["total_pnl"] += pnl
+
+        if pnl >= 0:
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+
+    for bucket in buckets.values():
+        count = max(bucket["count"], 1)
+        bucket["avg_pnl"] = bucket["total_pnl"] / count
+        bucket["win_rate"] = bucket["wins"] / count
+
+    diff = {
+        "count_diff": buckets["high_insider"]["count"] - buckets["low_insider"]["count"],
+        "avg_pnl_diff": buckets["high_insider"]["avg_pnl"] - buckets["low_insider"]["avg_pnl"],
+        "win_rate_diff": buckets["high_insider"]["win_rate"] - buckets["low_insider"]["win_rate"],
+        "threshold": threshold,
+    }
+
+    return {
+        "high_insider": buckets["high_insider"],
+        "low_insider": buckets["low_insider"],
+        "comparison": diff,
+    }
+
+
 @app.get("/debug")
 def debug():
     from app.core.state import engine
@@ -175,12 +232,13 @@ def debug():
             "breakout": meta.get("breakout"),
             "smart_money": meta.get("smart_money"),
             "liquidity": meta.get("liquidity"),
+            "insider": meta.get("insider"),
         }
         for mint, meta in list(engine_module.candidates.items())[-20:]
     }
 
     source_exposure = {}
-    for src in ["breakout", "smart_money", "liquidity", "fusion", "unknown"]:
+    for src in ["breakout", "smart_money", "liquidity", "insider", "fusion", "unknown"]:
         ratio = portfolio.source_exposure_ratio(engine, src)
         if ratio > 0:
             source_exposure[src] = round(ratio, 4)
@@ -199,6 +257,7 @@ def debug():
             "smart_money": meta.get("smart_money"),
             "liquidity": meta.get("liquidity"),
             "momentum": meta.get("momentum"),
+            "insider": meta.get("insider"),
             "held_sec": round(now - p.get("time", now), 2),
         })
 
@@ -233,6 +292,7 @@ def debug():
         },
         "smart_wallet": _wallet_metrics(),
         "insider": _insider_metrics(),
+        "insider_vs_non_insider": _insider_vs_non_insider_performance(engine.trade_history),
         "logs": engine.logs[-120:],
     }
 
@@ -258,6 +318,7 @@ def metrics():
     score_stats = _score_component_stats(trade_history)
     best_source, worst_source = _best_worst_source(source_stats)
     dynamic_weights = get_dynamic_weights(source_stats)
+    insider_perf = _insider_vs_non_insider_performance(trade_history)
 
     positions_by_source = {}
     for p in engine.positions:
@@ -304,6 +365,7 @@ def metrics():
         },
         "smart_wallet": _wallet_metrics(),
         "insider": _insider_metrics(),
+        "insider_vs_non_insider_performance": insider_perf,
         "risk": {
             "equity_peak": risk_engine.equity_peak,
             "drawdown": risk_engine.drawdown(engine.capital),
