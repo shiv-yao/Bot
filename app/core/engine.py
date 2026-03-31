@@ -14,6 +14,7 @@ from app.alpha.regime import detect_regime
 from app.alpha.combiner import combine_scores, get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
+from app.alpha.wallet_tracker import record_wallet_trade
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -103,6 +104,14 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "score": score,
         "meta": meta,
     })
+
+    # 🔥 記錄 smart wallet 行為（先用模擬 wallet）
+    record_wallet_trade(
+        wallet="SIM_WALLET",
+        mint=mint,
+        side="buy",
+        amount=size,
+    )
 
     engine.stats["executed"] += 1
     last_trade_time = now
