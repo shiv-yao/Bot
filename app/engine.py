@@ -8,7 +8,6 @@ from app.state import engine
 # ===== CONFIG =====
 BASE_SIZE = 270000
 MAX_POSITIONS = 4
-ENTRY_THRESHOLD = 0.015
 
 TAKE_PROFIT = 0.02
 STOP_LOSS = -0.01
@@ -29,6 +28,18 @@ def log(msg: str):
     engine.logs = engine.logs[-200:]
 
 
+# ===== 動態門檻（V7.4核心🔥）=====
+def dynamic_threshold():
+    n = len(engine.positions)
+
+    if n < 2:
+        return 0.012
+    elif n < 4:
+        return 0.014
+    else:
+        return 0.018
+
+
 # ===== MOCK SCANNER =====
 async def fetch_candidates():
     base = [
@@ -41,18 +52,16 @@ async def fetch_candidates():
     return base[:TOP_N]
 
 
-def score_token(item: dict) -> float:
-    return float(item.get("momentum", 0.0))
+def score_token(item):
+    return float(item.get("momentum", 0))
 
 
-def fake_buy_out(score: float) -> int:
-    # 分數越高，模擬拿到的 token 稍多
+def fake_buy_out(score):
     return int(200 + score * 3000)
 
 
-def fake_mark_to_market(entry_out: int, age_sec: float) -> int:
-    # 讓 mock 市場有足夠波動，方便測試出場
-    phase = age_sec % 16
+def fake_price(entry, age):
+    phase = age % 16
 
     if phase < 4:
         drift = 0.012 * phase
@@ -64,22 +73,24 @@ def fake_mark_to_market(entry_out: int, age_sec: float) -> int:
         drift = -0.05 + 0.008 * (phase - 12)
 
     drift += random.uniform(-0.012, 0.015)
-    return max(1, int(entry_out * (1 + drift)))
+
+    return int(entry * (1 + drift))
 
 
-async def get_price(mint: str, entry_out: int, age_sec: float) -> int:
+async def get_price(mint, entry, age):
     await asyncio.sleep(0)
-    return fake_mark_to_market(entry_out, age_sec)
+    return fake_price(entry, age)
 
 
-async def check_exit(pos: dict, current_out: int):
+# ===== SELL LOGIC =====
+async def check_exit(pos, price):
     entry = pos["entry_out"]
     peak = pos["peak"]
 
-    pnl = (current_out - entry) / max(entry, 1)
-    drawdown = (current_out - peak) / max(peak, 1)
+    pnl = (price - entry) / entry
+    dd = (price - peak) / peak
 
-    log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={drawdown:.4f}")
+    log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
 
     if pnl >= TAKE_PROFIT:
         return "TP", pnl
@@ -87,31 +98,25 @@ async def check_exit(pos: dict, current_out: int):
     if pnl <= STOP_LOSS:
         return "SL", pnl
 
-    if peak > entry and drawdown <= TRAILING_STOP:
+    if peak > entry and dd <= TRAILING_STOP:
         return "TRAIL", pnl
 
-    if time.time() - pos["time"] >= MAX_HOLD_SEC:
-        return "TIME_EXIT", pnl
+    if time.time() - pos["time"] > MAX_HOLD_SEC:
+        return "TIME", pnl
 
     return None, pnl
 
 
-async def try_sell(pos: dict, current_out: int):
-    reason, pnl = await check_exit(pos, current_out)
+async def try_sell(pos, price):
+    reason, pnl = await check_exit(pos, price)
+
     if not reason:
         return False
 
-    try:
-        engine.positions.remove(pos)
-    except ValueError:
-        return False
-
+    engine.positions.remove(pos)
     engine.capital *= (1 + pnl)
 
-    log(
-        f"SELL {pos['mint'][:6]} "
-        f"{reason} out={current_out} pnl={pnl:.4f} capital={engine.capital:.4f}"
-    )
+    log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
 
     return True
 
@@ -120,27 +125,22 @@ async def manage_positions():
     now = time.time()
 
     for pos in list(engine.positions):
-        try:
-            mint = pos["mint"]
-            age_sec = now - pos["time"]
-            current_out = await get_price(mint, pos["entry_out"], age_sec)
+        age = now - pos["time"]
 
-            if current_out > pos["peak"]:
-                pos["peak"] = current_out
+        price = await get_price(pos["mint"], pos["entry_out"], age)
 
-            await try_sell(pos, current_out)
+        if price > pos["peak"]:
+            pos["peak"] = price
 
-        except Exception as e:
-            engine.stats["errors"] += 1
-            log(f"SELL_ERR {e}")
+        await try_sell(pos, price)
 
 
-async def try_trade(item: dict):
+# ===== BUY LOGIC =====
+async def try_trade(item):
     mint = item["mint"]
     now = time.time()
 
     if any(p["mint"] == mint for p in engine.positions):
-        log(f"ALREADY_HELD {mint[:6]}")
         return
 
     if len(engine.positions) >= MAX_POSITIONS:
@@ -153,49 +153,52 @@ async def try_trade(item: dict):
 
     score = score_token(item)
     engine.stats["signals"] += 1
-    engine.last_signal = f"{mint[:6]} score={score:.4f}"
 
     log(f"SCORE {mint[:6]} {score:.4f}")
 
     new_price = fake_buy_out(score)
     last_price = LAST_PRICE.get(mint)
 
-    # V7.3: 小波動不直接 skip，而是降分
-    if last_price is not None:
-        move = abs(new_price - last_price) / max(last_price, 1)
+    # ===== V7.4：柔性波動處理 =====
+    if last_price:
+        move = abs(new_price - last_price) / last_price
 
         if move < 0.003:
-            score *= 0.7
-            log(f"LOW_VOL {mint[:6]} adj_score={score:.4f}")
+            score *= 0.85
+            log(f"LOW_VOL {mint[:6]} adj={score:.4f}")
 
     LAST_PRICE[mint] = new_price
 
-    # V7.3: 少量強制進場，避免完全沒交易
-    if score < ENTRY_THRESHOLD:
-        if random.random() < 0.2:
+    # ===== V7.4：動態門檻 =====
+    thr = dynamic_threshold()
+
+    if score < thr:
+        if random.random() < 0.35:
             log(f"FORCE_ENTRY {mint[:6]}")
         else:
             engine.stats["rejected"] += 1
-            log(f"REJECT {mint[:6]}")
+            log(f"REJECT {mint[:6]} thr={thr:.4f}")
             return
 
-    out_amount = new_price
+    out = new_price
 
-    log(f"BUY {mint[:6]} size={BASE_SIZE} out={out_amount}")
+    log(f"BUY {mint[:6]} out={out}")
 
     engine.positions.append({
         "mint": mint,
-        "entry_out": out_amount,
+        "entry_out": out,
         "size": BASE_SIZE,
-        "peak": out_amount,
+        "peak": out,
         "time": now,
     })
 
     LAST_TRADE[mint] = now
     engine.stats["executed"] += 1
+
     log(f"EXECUTED {mint[:6]}")
 
 
+# ===== MAIN LOOP =====
 async def main_loop():
     log("ENGINE STARTED")
 
@@ -211,6 +214,6 @@ async def main_loop():
 
         except Exception as e:
             engine.stats["errors"] += 1
-            log(f"LOOP_ERR {e}")
+            log(f"ERR {e}")
 
         await asyncio.sleep(2)
