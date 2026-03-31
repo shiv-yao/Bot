@@ -15,23 +15,24 @@ from app.sources.pump import fetch_pump_candidates
 SOL = "So11111111111111111111111111111111111111112"
 
 
+# ================= LOG =================
 def log(msg: str):
-    engine.logs.append(str(msg))
-    engine.logs = engine.logs[-500:]
+    msg = str(msg)
     print(msg)
+    engine.logs.append(msg)
+    engine.logs = engine.logs[-500:]
 
 
-async def process(e, source="mempool"):
+# ================= PROCESS =================
+async def process(e, source="pump"):
     try:
         m = e.get("mint")
         if not m:
             return
 
-        if source == "mempool":
-            engine.stats["mempool_seen"] += 1
-
         engine.stats["signals"] += 1
 
+        # ===== 風控 =====
         if not await liquidity_ok(m):
             engine.stats["rejected"] += 1
             return
@@ -40,6 +41,7 @@ async def process(e, source="mempool"):
             engine.stats["rejected"] += 1
             return
 
+        # ===== alpha =====
         score = await alpha(m)
 
         regime.update(score)
@@ -50,26 +52,31 @@ async def process(e, source="mempool"):
             engine.stats["rejected"] += 1
             return
 
+        # ===== 多錢包 =====
         for wallet_name, weight in wallet_scale().items():
             size = 0.002 * regime.multiplier() * weight
             lamports = int(size * 1e9)
 
+            # ===== Jupiter order =====
             o = await order(SOL, m, lamports)
             if not o or not o.get("transaction"):
                 log(f"ORDER_FAIL {m[:8]} wallet={wallet_name}")
                 continue
 
+            # ===== 安全執行 =====
             res = await safe_jupiter_call(o)
             if not res:
                 log(f"EXEC_FAIL {m[:8]} wallet={wallet_name}")
                 continue
 
+            # ===== Jito =====
             try:
                 if await send_bundle(o):
                     engine.stats["jito_sent"] += 1
-            except Exception as jito_err:
-                log(f"JITO_ERR {jito_err}")
+            except Exception as e:
+                log(f"JITO_ERR {e}")
 
+            # ===== PnL =====
             pnl = score - 0.01
             tuner.update(pnl)
             engine.threshold = tuner.threshold
@@ -85,9 +92,10 @@ async def process(e, source="mempool"):
             })
 
             engine.stats["executed"] += 1
+
             log(
                 f"EXEC {m[:8]} wallet={wallet_name} "
-                f"pnl={pnl:.4f} regime={engine.regime} source={source}"
+                f"pnl={pnl:.4f} regime={engine.regime}"
             )
 
     except Exception as ex:
@@ -95,43 +103,27 @@ async def process(e, source="mempool"):
         log(f"PROCESS_ERR {ex}")
 
 
-async def pump_loop():
-    while True:
-        try:
-            items = await fetch_pump_candidates()
-            for item in items:
-                await process(item, source="pump")
-        except Exception as ex:
-            engine.stats["errors"] += 1
-            log(f"PUMP_ERR {ex}")
-
-        await asyncio.sleep(20)
-
-
-async def mempool_loop():
-    async def handler(e):
-        await process(e, source="mempool")
-
-    while True:
-        try:
-            await stream(handler)
-        except Exception as ex:
-            engine.stats["errors"] += 1
-            log(f"MEMPOOL_ERR {ex}")
-            await asyncio.sleep(3)
-
-
+# ================= SAFE CYCLE（核心🔥） =================
 async def safe_cycle():
-    log("ENGINE_HEARTBEAT")
-    await asyncio.sleep(10)
+    print("scanning...")
+
+    try:
+        items = await fetch_pump_candidates()
+
+        for item in items:
+            await process(item, source="pump")
+
+    except Exception as e:
+        log(f"SAFE_CYCLE_ERR {e}")
+
+    await asyncio.sleep(5)
 
 
+# ================= MAIN LOOP =================
 async def main_loop():
     log("ENGINE LOOP START")
-    load_wallets()
 
-    asyncio.create_task(pump_loop())
-    asyncio.create_task(mempool_loop())
+    load_wallets()
 
     while True:
         try:
