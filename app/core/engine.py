@@ -13,6 +13,7 @@ from app.alpha.liquidity import liquidity_score
 from app.alpha.regime import detect_regime
 from app.alpha.combiner import combine_scores
 from app.alpha.signal_router import router
+from app.alpha.entry_filter import should_enter
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -193,7 +194,6 @@ async def evaluate_route(route: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # 三策略重新計分，保留完整 meta
     b = breakout_score(token)
     s = smart_money_score(token)
     l = liquidity_score(token)
@@ -253,7 +253,19 @@ async def evaluate_route(route: dict):
         del candidates[mint]
         return
 
-    # 雙層 sizing：score allocator + portfolio manager
+    # 🔥 entry_filter 接進來
+    ok, reason = should_enter(
+        token,
+        {
+            "momentum": momentum,
+            "smart_money": s,
+        }
+    )
+    if not ok:
+        engine.log(f"FILTERED {mint[:6]} {reason}")
+        del candidates[mint]
+        return
+
     base_size = get_position_size(score, engine.capital, engine)
     portfolio_size = portfolio.weighted_position_size(
         engine=engine,
