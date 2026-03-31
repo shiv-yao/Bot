@@ -1,9 +1,7 @@
 import os
-import asyncio
 import httpx
 
 ORDER = "https://api.jup.ag/swap/v2/order"
-EXEC = "https://api.jup.ag/swap/v2/execute"
 
 
 def _headers():
@@ -18,9 +16,9 @@ def _taker():
     return os.getenv("WALLET_PUBLIC_KEY", "").strip()
 
 
-async def order(input_mint, output_mint, amount):
+async def order(input_mint, output_mint, amount, quote=None):
     try:
-        params = {
+        payload = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
@@ -30,20 +28,28 @@ async def order(input_mint, output_mint, amount):
 
         taker = _taker()
         if taker:
-            params["taker"] = taker
+            payload["taker"] = taker
+
+        if quote:
+            payload["quoteResponse"] = quote
+
+        print("ORDER PAYLOAD:", payload)
 
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.get(
                 ORDER,
-                params=params,
+                params=payload,
                 headers=_headers(),
             )
 
         if r.status_code != 200:
-            print("ORDER ERROR:", r.status_code, r.text[:500])
+            print("ORDER ERROR STATUS:", r.status_code)
+            print("ORDER ERROR BODY:", r.text)
             return None
 
         data = r.json()
+
+        print("ORDER RESPONSE:", data)
 
         if not data:
             print("ORDER EMPTY")
@@ -58,48 +64,3 @@ async def order(input_mint, output_mint, amount):
     except Exception as e:
         print("ORDER EXCEPTION:", e)
         return None
-
-
-async def execute(order_data):
-    try:
-        payload = {
-            "signedTransaction": order_data.get("signedTransaction"),
-            "requestId": order_data.get("requestId"),
-        }
-
-        # 如果你現在還沒做簽名，這裡一定會失敗
-        if not payload["signedTransaction"]:
-            print("EXECUTE ERROR: missing signedTransaction")
-            return None
-
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(
-                EXEC,
-                json=payload,
-                headers=_headers(),
-            )
-
-        if r.status_code != 200:
-            print("EXECUTE ERROR:", r.status_code, r.text[:500])
-            return None
-
-        return r.json()
-
-    except Exception as e:
-        print("EXECUTE EXCEPTION:", e)
-        return None
-
-
-async def safe_jupiter_call(order_data, retries=3, delay=1):
-    for i in range(retries):
-        try:
-            res = await execute(order_data)
-            if res:
-                return res
-            print(f"JUP RETRY {i+1}/{retries}: empty execute response")
-            await asyncio.sleep(delay)
-        except Exception as e:
-            print(f"JUP ERROR {i+1}/{retries}:", e)
-            await asyncio.sleep(delay)
-
-    return None
