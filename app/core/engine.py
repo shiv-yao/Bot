@@ -12,6 +12,7 @@ from app.alpha.smart_money import smart_money_score
 from app.alpha.liquidity import liquidity_score
 from app.alpha.regime import detect_regime
 from app.alpha.combiner import combine_scores
+from app.alpha.signal_router import router
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -39,18 +40,6 @@ def calc_drawdown() -> float:
 
 def portfolio_can_add_more() -> bool:
     return portfolio.can_add_more(engine, max_exposure=0.75)
-
-
-def choose_source_name(meta: dict) -> str:
-    b = float(meta.get("breakout", 0.0))
-    s = float(meta.get("smart_money", 0.0))
-    l = float(meta.get("liquidity", 0.0))
-
-    if s >= b and s >= l:
-        return "smart_money"
-    if l >= b and l >= s:
-        return "liquidity"
-    return "breakout"
 
 
 def buy(mint: str, price: float, score: float, size: float, meta: dict):
@@ -176,10 +165,14 @@ async def manage_positions():
     engine.positions = remaining
 
 
-async def evaluate_token(token: dict):
+async def evaluate_route(route: dict):
     global last_trade_time
 
-    mint = token["mint"]
+    token = route["token"]
+    mint = route["mint"]
+    source = route["source"]
+    route_score = float(route.get("score", 0.0) or 0.0)
+
     change = float(token.get("change", 0))
     now = time.time()
 
@@ -200,7 +193,7 @@ async def evaluate_token(token: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # ===== 三策略分數 =====
+    # 三策略重新計分，保留完整 meta
     b = breakout_score(token)
     s = smart_money_score(token)
     l = liquidity_score(token)
@@ -213,8 +206,10 @@ async def evaluate_token(token: dict):
     )
 
     engine.log(
-        f"SCORE {mint[:6]} "
-        f"final={score:.4f} "
+        f"ROUTE {mint[:6]} "
+        f"src={source} "
+        f"route={route_score:.3f} "
+        f"final={score:.3f} "
         f"b={b:.3f} s={s:.3f} l={l:.3f} "
         f"regime={engine.regime}"
     )
@@ -234,6 +229,7 @@ async def evaluate_token(token: dict):
             "time": now,
             "price": price_now,
             "score": score,
+            "source": source,
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
@@ -257,13 +253,7 @@ async def evaluate_token(token: dict):
         del candidates[mint]
         return
 
-    source = choose_source_name({
-        "breakout": b,
-        "smart_money": s,
-        "liquidity": l,
-    })
-
-    # ===== 兩層 sizing：allocator + portfolio =====
+    # 雙層 sizing：score allocator + portfolio manager
     base_size = get_position_size(score, engine.capital, engine)
     portfolio_size = portfolio.weighted_position_size(
         engine=engine,
@@ -295,6 +285,7 @@ async def evaluate_token(token: dict):
         size=size,
         meta={
             "source": source,
+            "route_score": route_score,
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
@@ -353,8 +344,10 @@ async def main_loop():
                 await asyncio.sleep(2)
                 continue
 
-            for token in tokens:
-                await evaluate_token(token)
+            routes = router.build_routes(tokens)
+
+            for route in routes:
+                await evaluate_route(route)
 
         except Exception as e:
             engine.stats["errors"] += 1
