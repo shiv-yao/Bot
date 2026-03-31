@@ -1,6 +1,7 @@
 import httpx
 
-QUOTE = "https://api.jup.ag/swap/v1/quote"
+# 🔥 用免費 endpoint（不用 API KEY）
+QUOTE = "https://quote-api.jup.ag/v6/quote"
 
 
 async def get_quote(input_mint, output_mint, amount):
@@ -17,15 +18,15 @@ async def get_quote(input_mint, output_mint, amount):
             )
 
         if r.status_code != 200:
-            print("QUOTE ERR:", r.status_code, r.text[:300])
+            print("QUOTE ERR:", r.status_code, r.text[:200])
             return None
 
         data = r.json()
 
-        if not data or not data.get("outAmount"):
+        if not data or not data.get("data"):
             return None
 
-        return data
+        return data["data"][0]
 
     except Exception as e:
         print("QUOTE EXCEPTION:", e)
