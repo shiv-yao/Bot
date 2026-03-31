@@ -9,30 +9,31 @@ SOL = "So11111111111111111111111111111111111111112"
 
 async def alpha(token):
     try:
-        # 🔥 一次就夠（不要再 sleep）
-        q = await get_quote(SOL, token, 1_000_000)
+        q = await get_quote(SOL, token, 1_000_000)  # 0.001 SOL
         if not q:
+            print(f"ALPHA_Q_FAIL {token[:8]}")
             return 0
 
-        out = float(q.get("outAmount", 0) or 0)
+        out_amount = float(q.get("outAmount", 0) or 0)
         impact = float(q.get("priceImpactPct", 0) or 0)
 
-        if out <= 0:
+        if out_amount <= 0:
+            print(f"ALPHA_ZERO_OUT {token[:8]}")
             return 0
 
-        # 🔥 用 liquidity + impact 當動能 proxy
+        # 用低 impact 當保守動能 proxy
         momentum = max(0, 0.02 - impact)
 
         flow = await wallet_graph_score(token)
         insider = await insider_score(flow)
-        bonus = 0.02 if new_pool(token) else 0.0
+        bonus = 0.01 if new_pool(token) else 0.0
 
-        # ❗ 關鍵：放寬條件
         if momentum < SETTINGS["MOMENTUM_MIN"]:
             print(f"ALPHA_REJECT_MOM {token[:8]} mom={momentum:.4f}")
             return 0
 
-        score = momentum + flow * 0.05 + insider * 0.03 + bonus
+        # 保守跑法：insider 先不硬卡，讓系統有機會進單
+        score = momentum + flow * 0.03 + insider * 0.02 + bonus
 
         print(
             f"ALPHA_OK {token[:8]} "
