@@ -35,7 +35,7 @@ async def process(item):
         engine.regime = regime.mode
         score *= regime.multiplier()
 
-        if score < tuner.threshold:
+        if score < 0.012:
             engine.stats["rejected"] += 1
             log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
             return
