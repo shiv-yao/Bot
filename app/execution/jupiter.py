@@ -15,10 +15,13 @@ def _headers():
 
 async def order(input_mint, output_mint, amount, quote=None):
     try:
+        if not quote:
+            print("ORDER ERROR: missing quote")
+            return None
+
         payload = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
+            # 關鍵：原封不動帶 quote
+            "quoteResponse": quote,
             "slippageBps": 80,
         }
 
@@ -26,11 +29,7 @@ async def order(input_mint, output_mint, amount, quote=None):
         if taker:
             payload["taker"] = taker
 
-        # 關鍵：把成功拿到的 quote 帶進 order
-        if quote:
-            payload["quoteResponse"] = quote
-
-        print("ORDER PAYLOAD:", payload)
+        print("ORDER PAYLOAD (FINAL):", payload)
 
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(
@@ -84,7 +83,9 @@ async def execute(order_data):
             print("EXECUTE ERROR:", r.status_code, r.text[:500])
             return None
 
-        return r.json()
+        data = r.json()
+        print("EXECUTE RESPONSE:", data)
+        return data
 
     except Exception as e:
         print("EXECUTE EXCEPTION:", e)
