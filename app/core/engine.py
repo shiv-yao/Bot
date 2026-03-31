@@ -1,12 +1,19 @@
 import asyncio
+
 from app.execution.quote import get_quote
 from app.execution.jupiter import order
+from app.alpha.alpha import alpha
+from app.regime.regime import regime
+from app.ai.tuner import tuner
 from app.core.state import engine
+from app.sources.pump import fetch_pump_candidates
+from config.settings import SETTINGS
 
 SOL = "So11111111111111111111111111111111111111112"
 
 
 def log(msg):
+    msg = str(msg)
     print(msg)
     engine.logs.append(msg)
     engine.logs = engine.logs[-500:]
@@ -19,42 +26,95 @@ async def process(item):
             return
 
         log(f"PROCESSING: {item}")
+        engine.stats["signals"] += 1
 
-        lamports = 200000  # 小額測試
+        # ===== alpha =====
+        score = await alpha(m)
 
-        # 🔥 取得 quote
-        quote = await get_quote(SOL, m, lamports)
+        regime.update(score)
+        engine.regime = regime.mode
+        score *= regime.multiplier()
 
-        if not quote:
+        if score < tuner.threshold:
+            engine.stats["rejected"] += 1
+            log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
+            return
+
+        # ===== 小額保守測試 =====
+        lamports = 200000  # 0.0002 SOL
+
+        # ===== quote =====
+        q = await get_quote(SOL, m, lamports)
+        if not q:
+            engine.stats["rejected"] += 1
             log(f"NO_QUOTE {m[:8]}")
             return
 
-        # 🔥 呼叫 Jupiter swap
-        o = await order(SOL, m, lamports, quote=quote)
+        out_amount = int(q.get("outAmount", 0) or 0)
+        impact = float(q.get("priceImpactPct", 0) or 0)
 
+        if out_amount <= 0:
+            engine.stats["rejected"] += 1
+            log(f"NO_LIQ_ROUTE {m[:8]}")
+            return
+
+        # ===== 穩定版：高滑點不碰 =====
+        if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"]:
+            engine.stats["rejected"] += 1
+            log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
+            return
+
+        log(
+            f"QUOTE_OK {m[:8]} "
+            f"out={out_amount} "
+            f"impact={impact:.4f}"
+        )
+
+        # ===== 產生 swap tx（先不真 execute）=====
+        o = await order(SOL, m, lamports, quote=q)
         if not o or not o.get("transaction"):
+            engine.stats["rejected"] += 1
             log(f"ORDER_FAIL {m[:8]} data={o}")
             return
 
-        log(f"PAPER_EXEC {m[:8]} SUCCESS")
+        # ===== Paper execution =====
+        log(
+            f"PAPER_EXEC {m[:8]} "
+            f"score={score:.4f} "
+            f"regime={engine.regime} "
+            f"impact={impact:.4f} "
+            f"out={out_amount}"
+        )
+
+        # ===== 簡化統計 =====
+        pnl = score - 0.01
+        tuner.update(pnl)
+        engine.threshold = tuner.threshold
+        engine.capital *= (1 + pnl)
+
+        engine.trade_history.append({
+            "token": m,
+            "score": score,
+            "pnl": pnl,
+            "regime": engine.regime,
+            "impact": impact,
+            "outAmount": out_amount,
+            "mode": "paper_stable",
+        })
 
         engine.stats["executed"] += 1
 
     except Exception as e:
+        engine.stats["errors"] += 1
         log(f"PROCESS_ERR {e}")
 
-
-# ================= LOOP =================
 
 async def safe_cycle():
     print("scanning...")
 
     try:
-        from app.sources.pump import fetch_pump_candidates
-
         items = await fetch_pump_candidates()
-
-        print("PUMP ITEMS:", items)
+        print("PUMP FILTERED:", items)
 
         for item in items:
             await process(item)
@@ -68,9 +128,16 @@ async def safe_cycle():
 async def main_loop():
     print("ENGINE LOOP START")
 
+    # 啟動時把 threshold 設回穩定值區間
+    if tuner.threshold < SETTINGS["TUNER_MIN"]:
+        tuner.threshold = SETTINGS["TUNER_MIN"]
+    if tuner.threshold > SETTINGS["TUNER_MAX"]:
+        tuner.threshold = SETTINGS["TUNER_MAX"]
+
     while True:
         try:
             await safe_cycle()
         except Exception as e:
-            print("LOOP ERROR:", e)
+            engine.stats["errors"] += 1
+            log(f"LOOP ERROR: {e}")
             await asyncio.sleep(2)
