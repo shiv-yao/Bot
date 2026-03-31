@@ -1,11 +1,13 @@
 import os
 import httpx
 
-SWAP = "https://quote-api.jup.ag/v6/swap"
+SWAP = "https://api.jup.ag/swap/v1/swap"
 
 
 def _headers():
     return {
+        "x-api-key": os.getenv("JUP_API_KEY", "").strip(),
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
@@ -13,23 +15,25 @@ def _headers():
 async def order(input_mint, output_mint, amount, quote=None):
     try:
         if not quote:
-            print("ORDER ERROR: no quote")
+            print("SWAP ERROR: missing quote")
+            return None
+
+        user_pk = os.getenv("WALLET_PUBLIC_KEY", "").strip()
+        if not user_pk:
+            print("SWAP ERROR: missing WALLET_PUBLIC_KEY")
             return None
 
         payload = {
             "quoteResponse": quote,
-            "userPublicKey": os.getenv("WALLET_PUBLIC_KEY"),
+            "userPublicKey": user_pk,
             "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
         }
 
         print("SWAP PAYLOAD:", payload)
 
         async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(
-                SWAP,
-                json=payload,
-                headers=_headers(),
-            )
+            r = await c.post(SWAP, json=payload, headers=_headers())
 
         if r.status_code != 200:
             print("SWAP ERROR STATUS:", r.status_code)
@@ -37,15 +41,17 @@ async def order(input_mint, output_mint, amount, quote=None):
             return None
 
         data = r.json()
-
         print("SWAP RESPONSE:", data)
 
-        if not data.get("swapTransaction"):
-            print("NO TX:", data)
+        swap_tx = data.get("swapTransaction")
+        if not swap_tx:
+            print("SWAP NO TX:", data)
             return None
 
+        # 統一成 engine 看得懂的格式
         return {
-            "transaction": data["swapTransaction"]
+            "transaction": swap_tx,
+            "raw": data,
         }
 
     except Exception as e:
