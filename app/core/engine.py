@@ -22,6 +22,8 @@ from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
+from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_trade
+from app.alpha.smart_wallets import get_best_wallet, get_top_wallets
 
 TP = 0.045
 SL = -0.008
@@ -346,7 +348,9 @@ async def evaluate_route(route: dict):
     except Exception as e:
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
-    from app.alpha.smart_wallets import get_best_wallet
+    wallet_list = list(token_wallets.get(mint, set()))
+    top_wallets = get_top_wallets(wallet_list, min_score=0.55)
+    lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
@@ -357,7 +361,8 @@ async def evaluate_route(route: dict):
         insider = round(((b + s + l) / 3.0) * 0.4, 4)
         engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
 
-    engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
+    engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
+    engine.log(f"TOP_WALLETS {mint[:6]} {len(top_wallets)}")
     engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
@@ -438,6 +443,7 @@ async def evaluate_route(route: dict):
             "liquidity": l,
             "insider": insider,
             "wallet": lead_wallet,
+            "top_wallet_count": len(top_wallets),
             "weights": weights,
         },
     )
