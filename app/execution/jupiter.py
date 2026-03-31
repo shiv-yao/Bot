@@ -1,31 +1,68 @@
+import os
 import httpx
-from app.state import engine
+
+SWAP = "https://api.jup.ag/swap/v1/swap"
 
 
-JUP_URL = "https://quote-api.jup.ag/v6/quote"
+def _headers():
+    api_key = os.getenv("JUP_API_KEY", "").strip()
+    return {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
 
-async def safe_jupiter_order(mint):
+async def order(input_mint, output_mint, amount, quote=None):
     try:
-        params = {
-            "inputMint": "So11111111111111111111111111111111111111112",
-            "outputMint": mint,
-            "amount": 1000000,
-            "slippageBps": 100,
+        if not quote:
+            print("SWAP ERROR: missing quote")
+            return None
+
+        user_pk = os.getenv("WALLET_PUBLIC_KEY", "").strip()
+        if not user_pk:
+            print("SWAP ERROR: missing WALLET_PUBLIC_KEY")
+            return None
+
+        payload = {
+            "quoteResponse": quote,
+            "userPublicKey": user_pk,
+            "wrapAndUnwrapSol": True,
         }
 
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(JUP_URL, params=params)
+        print("JUP KEY PRESENT:", bool(os.getenv("JUP_API_KEY", "").strip()))
+        print("SWAP PAYLOAD:", payload)
+
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(SWAP, json=payload, headers=_headers())
 
         if r.status_code != 200:
-            return False
+            print("SWAP ERROR STATUS:", r.status_code)
+            print("SWAP ERROR BODY:", r.text)
+            return None
 
         data = r.json()
+        print("SWAP RESPONSE:", data)
 
-        if not data.get("data"):
-            return False
+        swap_tx = data.get("swapTransaction")
+        if not swap_tx:
+            print("SWAP NO TX:", data)
+            return None
 
-        return True
+        return {
+            "transaction": swap_tx,
+            "raw": data,
+        }
 
-    except:
-        return False
+    except Exception as e:
+        print("SWAP EXCEPTION:", repr(e))
+        return None
+
+
+async def execute(order_data):
+    print("EXECUTE SKIPPED (PAPER MODE)")
+    return {"status": "paper"}
+
+
+async def safe_jupiter_call(order_data):
+    return await execute(order_data)
