@@ -112,8 +112,10 @@ async def safe_cycle():
 
     try:
         items = await fetch_pump_candidates()
+        print("PUMP ITEMS:", items)
 
         for item in items:
+            print("PROCESSING:", item)
             await process(item, source="pump")
 
     except Exception as e:
