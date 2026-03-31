@@ -18,7 +18,28 @@ def _source_perf(source_stats: dict, source: str) -> float:
     return clamp(perf, -0.20, 0.20)
 
 
-def get_dynamic_weights(source_stats: dict) -> dict:
+def _insider_perf_boost(insider_perf: dict | None) -> float:
+    """
+    根據 high_insider vs low_insider 績效差，調整 insider 權重。
+    """
+    if not insider_perf:
+        return 0.0
+
+    cmp_row = insider_perf.get("comparison", {}) or {}
+    high_row = insider_perf.get("high_insider", {}) or {}
+
+    high_count = float(high_row.get("count", 0) or 0)
+    if high_count < 3:
+        return 0.0
+
+    avg_pnl_diff = float(cmp_row.get("avg_pnl_diff", 0.0) or 0.0)
+    win_rate_diff = float(cmp_row.get("win_rate_diff", 0.0) or 0.0)
+
+    boost = avg_pnl_diff * 10.0 + win_rate_diff * 0.35
+    return clamp(boost, -0.15, 0.15)
+
+
+def get_dynamic_weights(source_stats: dict, insider_perf: dict | None = None) -> dict:
     """
     初始權重：
     breakout    0.35
@@ -29,12 +50,12 @@ def get_dynamic_weights(source_stats: dict) -> dict:
     wb = 0.35 + _source_perf(source_stats, "breakout")
     ws = 0.25 + _source_perf(source_stats, "smart_money")
     wl = 0.15 + _source_perf(source_stats, "liquidity")
-    wi = 0.25 + _source_perf(source_stats, "insider")
+    wi = 0.25 + _source_perf(source_stats, "insider") + _insider_perf_boost(insider_perf)
 
     wb = clamp(wb, 0.15, 0.55)
     ws = clamp(ws, 0.10, 0.45)
     wl = clamp(wl, 0.05, 0.30)
-    wi = clamp(wi, 0.10, 0.40)
+    wi = clamp(wi, 0.10, 0.45)
 
     total = wb + ws + wl + wi
     if total <= 0:
@@ -60,8 +81,9 @@ def combine_scores(
     insider: float,
     regime: str,
     source_stats: dict | None = None,
+    insider_perf: dict | None = None,
 ) -> float:
-    weights = get_dynamic_weights(source_stats or {})
+    weights = get_dynamic_weights(source_stats or {}, insider_perf)
 
     score = (
         breakout * weights["breakout"]
