@@ -4,7 +4,8 @@ import time
 from app.core.state import engine
 from app.core.scanner import scan
 from app.core.pricing import get_price
-from app.core.risk import allow, kill_switch, dynamic_risk_factor
+from app.core.risk import allow
+from app.core.risk_runtime import risk_engine
 
 from app.alpha.breakout import breakout_score
 from app.alpha.smart_money import smart_money_score
@@ -20,6 +21,7 @@ TRAIL = 0.004
 COOLDOWN = 30
 MIN_MOMENTUM = 0.004
 MIN_CANDIDATE_BUY = 0.55
+TRADE_INTERVAL = 12
 
 cooldown = {}
 candidates = {}
@@ -33,10 +35,21 @@ def calc_drawdown() -> float:
     return (engine.capital - engine.peak_capital) / engine.peak_capital
 
 
+def portfolio_can_add_more() -> bool:
+    return len(engine.positions) < 3
+
+
 def buy(mint: str, price: float, score: float, size: float, meta: dict):
     global last_trade_time
 
-    risk_adj = dynamic_risk_factor(engine)
+    risk_adj = 1.0
+    total = engine.stats.get("wins", 0) + engine.stats.get("losses", 0)
+    if total >= 5:
+        winrate = engine.stats.get("wins", 0) / max(total, 1)
+        if winrate > 0.65:
+            risk_adj = 1.2
+        elif winrate < 0.45:
+            risk_adj = 0.7
 
     engine.capital -= size
     now = time.time()
@@ -53,6 +66,7 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
 
     engine.stats["executed"] += 1
     last_trade_time = now
+    risk_engine.record_trade()
 
     engine.log(
         "BUY "
@@ -87,9 +101,14 @@ def sell(pos: dict, price: float, reason: str):
     engine.trade_history.append(trade)
 
     if pnl >= 0:
-        engine.stats["wins"] += 1
+        engine.stats["wins"] = engine.stats.get("wins", 0) + 1
     else:
-        engine.stats["losses"] += 1
+        engine.stats["losses"] = engine.stats.get("losses", 0) + 1
+
+    risk_engine.record_realized(pnl)
+
+    if pnl < 0 and risk_engine.drawdown(engine.capital) > 0.10:
+        risk_engine.trigger_cooldown(90)
 
     engine.log(
         f"SELL {pos['mint'][:6]} "
@@ -105,6 +124,9 @@ async def manage_positions():
     for pos in engine.positions:
         try:
             price = await get_price(pos["mint"])
+            if price is None:
+                remaining.append(pos)
+                continue
 
             if price > pos["peak"]:
                 pos["peak"] = price
@@ -161,7 +183,7 @@ async def evaluate_token(token: dict):
         engine.log(f"ALREADY_HELD {mint[:6]}")
         return
 
-    if now - last_trade_time < 12:
+    if now - last_trade_time < TRADE_INTERVAL:
         return
 
     b = breakout_score(token)
@@ -222,7 +244,19 @@ async def evaluate_token(token: dict):
 
     size = get_position_size(score, engine.capital, engine)
 
+    # 舊 per-trade risk gate
     if not allow(engine, score, size):
+        del candidates[mint]
+        return
+
+    # 新 RiskEngine 全局風控再擋一次
+    allow_trade, reason = risk_engine.allow_trade(
+        equity=engine.capital,
+        loss_streak=engine.stats.get("losses", 0),
+        portfolio_can_add_more=portfolio_can_add_more(),
+    )
+    if not allow_trade:
+        engine.log(f"BLOCKED {reason}")
         del candidates[mint]
         return
 
@@ -250,8 +284,7 @@ async def main_loop():
 
     while engine.running:
         try:
-            if kill_switch(engine):
-                break
+            risk_engine.update(engine.capital)
 
             await manage_positions()
 
@@ -261,9 +294,21 @@ async def main_loop():
             drawdown = calc_drawdown()
             engine.log(f"DRAWDOWN {drawdown:.4f}")
 
+            # 舊版硬冷卻保留
             if engine.capital < engine.peak_capital * 0.95:
                 engine.log("HARD_COOLDOWN")
                 await asyncio.sleep(10)
+                continue
+
+            # 新版全局風控檢查
+            allow_trade, reason = risk_engine.allow_trade(
+                equity=engine.capital,
+                loss_streak=engine.stats.get("losses", 0),
+                portfolio_can_add_more=portfolio_can_add_more(),
+            )
+            if not allow_trade:
+                engine.log(f"BLOCKED {reason}")
+                await asyncio.sleep(2)
                 continue
 
             tokens = await scan()
