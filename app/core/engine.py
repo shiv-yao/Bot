@@ -21,78 +21,81 @@ from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
 
+
+# ================= CONFIG =================
 TP = 0.045
 SL = -0.008
 TRAIL = 0.004
 
-COOLDOWN = 30
-MIN_MOMENTUM = 0.004
-MIN_CANDIDATE_BUY = 0.55
 TRADE_INTERVAL = 12
 
-cooldown = {}
-candidates = {}
-recent_changes = []
+
+# ================= STATE =================
 last_trade_time = 0
+recent_changes = []
 
 
-def calc_drawdown() -> float:
+# ================= HELPERS =================
+def calc_drawdown():
     if engine.peak_capital <= 0:
         return 0.0
     return (engine.capital - engine.peak_capital) / engine.peak_capital
 
 
-def portfolio_can_add_more() -> bool:
+def portfolio_can_add_more():
     return portfolio.can_add_more(engine, max_exposure=0.75)
 
 
-def _build_source_stats(trade_history: list[dict]) -> dict:
-    buckets = {}
+def build_source_stats(history):
+    stats = {}
 
-    for t in trade_history:
-        meta = t.get("meta", {}) or {}
-        source = meta.get("source", "unknown")
-        pnl = float(t.get("pnl", 0.0) or 0.0)
+    for t in history:
+        src = t.get("meta", {}).get("source", "unknown")
+        pnl = float(t.get("pnl", 0))
 
-        if source not in buckets:
-            buckets[source] = {
-                "count": 0,
-                "wins": 0,
-                "losses": 0,
-                "total_pnl": 0.0,
-                "avg_pnl": 0.0,
-                "win_rate": 0.0,
-            }
+        if src not in stats:
+            stats[src] = {"count": 0, "wins": 0, "pnl": 0}
 
-        buckets[source]["count"] += 1
-        buckets[source]["total_pnl"] += pnl
+        stats[src]["count"] += 1
+        stats[src]["pnl"] += pnl
 
         if pnl >= 0:
-            buckets[source]["wins"] += 1
-        else:
-            buckets[source]["losses"] += 1
+            stats[src]["wins"] += 1
 
-    for source, row in buckets.items():
-        count = max(int(row["count"]), 1)
-        row["avg_pnl"] = row["total_pnl"] / count
-        row["win_rate"] = row["wins"] / count
+    for s in stats:
+        c = stats[s]["count"]
+        stats[s]["win_rate"] = stats[s]["wins"] / max(c, 1)
+        stats[s]["avg_pnl"] = stats[s]["pnl"] / max(c, 1)
 
-    return buckets
+    return stats
 
 
-def buy(mint: str, price: float, score: float, size: float, meta: dict):
+def record_trade(pos, price, reason):
+    pnl = (price - pos["entry"]) / pos["entry"]
+
+    engine.trade_history.append({
+        "mint": pos["mint"],
+        "entry": pos["entry"],
+        "exit": price,
+        "pnl": pnl,
+        "size": pos["size"],
+        "reason": reason,
+        "meta": pos.get("meta", {}),
+    })
+
+    if pnl >= 0:
+        engine.stats["wins"] = engine.stats.get("wins", 0) + 1
+    else:
+        engine.stats["losses"] = engine.stats.get("losses", 0) + 1
+
+    risk_engine.record_realized(pnl)
+
+    return pnl
+
+
+# ================= TRADING =================
+def buy(mint, price, score, size, meta):
     global last_trade_time
-
-    risk_adj = 1.0
-    total = engine.stats.get("wins", 0) + engine.stats.get("losses", 0)
-    if total >= 5:
-        winrate = engine.stats.get("wins", 0) / max(total, 1)
-        if winrate > 0.65:
-            risk_adj = 1.2
-        elif winrate < 0.45:
-            risk_adj = 0.7
-
-    weights = meta.get("weights", {})
 
     engine.capital -= size
     now = time.time()
@@ -105,74 +108,58 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "time": now,
         "score": score,
         "meta": meta,
-        "breakeven": False,
+        "breakeven_armed": False,
+        "stop_price": None,
         "tp1_done": False,
         "add_done": False,
     })
 
-    record_wallet_trade(
-        wallet="SIM_WALLET",
-        mint=mint,
-        side="buy",
-        amount=size,
-    )
+    record_wallet_trade("SIM_WALLET", mint, "buy", size)
 
     engine.stats["executed"] += 1
     last_trade_time = now
     risk_engine.record_trade()
 
-    engine.log(
-        "BUY "
-        f"{mint[:6]} "
-        f"price={price:.4f} "
-        f"size={size:.4f} "
-        f"score={score:.4f} "
-        f"risk_adj={risk_adj:.2f} "
-        f"regime={engine.regime} "
-        f"src={meta['source']} "
-        f"b={meta['breakout']:.3f} "
-        f"s={meta['smart_money']:.3f} "
-        f"l={meta['liquidity']:.3f} "
-        f"mom={meta['momentum']:.4f} "
-        f"wb={weights.get('breakout', 0):.2f} "
-        f"ws={weights.get('smart_money', 0):.2f} "
-        f"wl={weights.get('liquidity', 0):.2f} "
-        f"cap={engine.capital:.4f}"
-    )
+    engine.log(f"BUY {mint[:6]} size={size:.4f} cap={engine.capital:.4f}")
 
 
-def sell(pos: dict, price: float, reason: str):
-    pnl = (price - pos["entry"]) / pos["entry"]
+def sell(pos, price, reason):
+    pnl = record_trade(pos, price, reason)
     engine.capital += pos["size"] * (1 + pnl)
-
-    trade = {
-        "mint": pos["mint"],
-        "entry": pos["entry"],
-        "exit": price,
-        "pnl": pnl,
-        "size": pos["size"],
-        "reason": reason,
-        "score": pos.get("score"),
-        "meta": pos.get("meta", {}),
-    }
-    engine.trade_history.append(trade)
-
-    if pnl >= 0:
-        engine.stats["wins"] = engine.stats.get("wins", 0) + 1
-    else:
-        engine.stats["losses"] = engine.stats.get("losses", 0) + 1
-
-    risk_engine.record_realized(pnl)
-
-    if pnl < 0 and risk_engine.drawdown(engine.capital) > 0.10:
-        risk_engine.trigger_cooldown(90)
-
-    engine.log(
-        f"SELL {pos['mint'][:6]} "
-        f"{reason} pnl={pnl:.4f} cap={engine.capital:.4f}"
-    )
+    engine.log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f}")
 
 
+def partial_sell(pos, price, ratio):
+    sell_size = pos["size"] * ratio
+    pnl = (price - pos["entry"]) / pos["entry"]
+
+    engine.capital += sell_size * (1 + pnl)
+    pos["size"] -= sell_size
+
+    record_trade(pos, price, "PARTIAL")
+    engine.log(f"PARTIAL {pos['mint'][:6]} ratio={ratio}")
+
+
+def add_winner(pos, price, ratio):
+    add_size = pos["size"] * ratio * 0.5
+
+    if engine.capital < add_size:
+        return
+
+    engine.capital -= add_size
+
+    old_size = pos["size"]
+    new_size = old_size + add_size
+
+    pos["entry"] = (pos["entry"] * old_size + price * add_size) / new_size
+    pos["size"] = new_size
+
+    record_wallet_trade("SIM_WALLET", pos["mint"], "buy", add_size)
+
+    engine.log(f"ADD {pos['mint'][:6]} size={add_size:.4f}")
+
+
+# ================= POSITION MANAGEMENT =================
 async def manage_positions():
     now = time.time()
     remaining = []
@@ -180,48 +167,44 @@ async def manage_positions():
     for pos in engine.positions:
         try:
             price = await get_price(pos["mint"])
-            if price is None:
+            if not price:
                 remaining.append(pos)
                 continue
 
             if price > pos["peak"]:
                 pos["peak"] = price
 
-            pnl = (price - pos["entry"]) / pos["entry"]
-            dd = (price - pos["peak"]) / pos["peak"]
-            pos["time_age"] = now - pos.get("time", now)
+            pos["time_age"] = now - pos["time"]
 
-            # 🔥 Position Manager 接進來的位置
+            # 🔥 Position Manager
             actions = manage_position(pos, price)
 
-            sold_all = False
-            for action, ratio in actions:
-                if action == "partial_sell":
-                    sell_size = pos["size"] * ratio
-                    pos["size"] -= sell_size
-                    engine.capital += sell_size
-                    engine.log(f"PARTIAL {pos['mint'][:6]} ratio={ratio}")
+            sold = False
+            for act, ratio in actions:
 
-                elif action == "add":
-                    add_size = pos["size"] * ratio * 0.5
-                    if engine.capital >= add_size:
-                        engine.capital -= add_size
-                        pos["size"] += add_size
-                        engine.log(f"ADD {pos['mint'][:6]} size={add_size:.4f}")
+                if act == "partial_sell":
+                    partial_sell(pos, price, ratio)
 
-                elif action == "sell_all":
+                elif act == "add":
+                    add_winner(pos, price, ratio)
+
+                elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
-                    sold_all = True
+                    sold = True
                     break
 
-                elif action == "breakeven":
-                    engine.log(f"BREAKEVEN {pos['mint'][:6]}")
+                elif act == "breakeven":
+                    engine.log(
+                        f"BREAKEVEN {pos['mint'][:6]} stop={pos.get('stop_price', pos['entry']):.4f}"
+                    )
 
-            if sold_all:
+            if sold:
                 continue
 
-            engine.log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
+            pnl = (price - pos["entry"]) / pos["entry"]
+            dd = (price - pos["peak"]) / pos["peak"]
 
+            # fallback exits
             if pnl >= TP:
                 sell(pos, price, "TP")
                 continue
@@ -230,231 +213,103 @@ async def manage_positions():
                 sell(pos, price, "SL")
                 continue
 
-            if pnl >= 0.015 and dd <= -TRAIL:
+            if pnl > 0.015 and dd < -TRAIL:
                 sell(pos, price, "TRAIL")
-                continue
-
-            if now - pos["time"] > 50:
-                sell(pos, price, "TIME")
                 continue
 
             remaining.append(pos)
 
         except Exception as e:
-            engine.stats["errors"] += 1
-            engine.log(f"MANAGE_ERR {e}")
+            engine.log(f"ERR {e}")
             remaining.append(pos)
 
     engine.positions = remaining
 
 
-async def evaluate_route(route: dict):
+# ================= ROUTE =================
+async def evaluate_route(route):
     global last_trade_time
 
     token = route["token"]
     mint = route["mint"]
     source = route["source"]
-    route_score = float(route.get("score", 0.0) or 0.0)
 
-    change = float(token.get("change", 0))
     now = time.time()
-
-    engine.stats["signals"] += 1
-
-    if mint in cooldown and now - cooldown[mint] < COOLDOWN:
-        engine.log(f"COOLDOWN {mint[:6]}")
-        return
-
-    if abs(change) < 2:
-        engine.log(f"FLAT_SKIP {mint[:6]}")
-        return
-
-    if any(p["mint"] == mint for p in engine.positions):
-        engine.log(f"ALREADY_HELD {mint[:6]}")
-        return
 
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    asyncio.create_task(update_token_wallets(token["mint"]))
+    # 🔥 更新鏈上 wallet
+    asyncio.create_task(update_token_wallets(mint))
 
     b = breakout_score(token)
     s = smart_money_score(token)
     l = liquidity_score(token)
 
-    source_stats = _build_source_stats(engine.trade_history)
-    weights = get_dynamic_weights(source_stats)
+    stats = build_source_stats(engine.trade_history)
+    weights = get_dynamic_weights(stats)
 
-    score = combine_scores(
-        breakout=b,
-        smart_money=s,
-        liquidity=l,
-        regime=engine.regime,
-        source_stats=source_stats,
-    )
+    score = combine_scores(b, s, l, engine.regime, stats)
 
-    engine.log(
-        f"ROUTE {mint[:6]} "
-        f"src={source} "
-        f"route={route_score:.3f} "
-        f"final={score:.3f} "
-        f"b={b:.3f} s={s:.3f} l={l:.3f} "
-        f"wb={weights['breakout']:.2f} "
-        f"ws={weights['smart_money']:.2f} "
-        f"wl={weights['liquidity']:.2f} "
-        f"regime={engine.regime}"
-    )
-
-    if score < MIN_CANDIDATE_BUY:
-        engine.stats["rejected"] += 1
-        engine.log(f"REJECT {mint[:6]}")
+    if score < 0.55:
         return
 
-    price_now = await get_price(token)
-    if price_now is None:
-        engine.log(f"NO_PRICE {mint[:6]}")
+    price = await get_price(token)
+    if not price:
         return
 
-    if mint not in candidates:
-        candidates[mint] = {
-            "time": now,
-            "price": price_now,
-            "score": score,
-            "source": source,
-            "breakout": b,
-            "smart_money": s,
-            "liquidity": l,
-            "weights": weights,
-        }
-        engine.log(f"CANDIDATE {mint[:6]}")
-        return
+    base = get_position_size(score, engine.capital, engine)
+    cap = portfolio.weighted_position_size(engine, source)
 
-    if now - candidates[mint]["time"] > 10:
-        del candidates[mint]
-        engine.log(f"CANDIDATE_EXPIRE {mint[:6]}")
-        return
-
-    if now - candidates[mint]["time"] < 2:
-        return
-
-    old_price = candidates[mint]["price"]
-    momentum = (price_now - old_price) / old_price
-
-    if momentum < MIN_MOMENTUM:
-        engine.log(f"STRONG_REJECT {mint[:6]}")
-        del candidates[mint]
-        return
-
-    ok, reason = should_enter(
-        token,
-        {
-            "momentum": momentum,
-            "smart_money": s,
-        }
-    )
-    if not ok:
-        engine.log(f"FILTERED {mint[:6]} {reason}")
-        del candidates[mint]
-        return
-
-    base_size = get_position_size(score, engine.capital, engine)
-    portfolio_size = portfolio.weighted_position_size(
-        engine=engine,
-        source=source,
-        base_risk_pct=0.08,
-        max_position_size=0.12,
-        min_position_size=0.02,
-    )
-    size = min(base_size, portfolio_size)
+    size = min(base, cap)
 
     if not allow(engine, score, size):
-        del candidates[mint]
         return
 
-    allow_trade, reason = risk_engine.allow_trade(
-        equity=engine.capital,
-        loss_streak=engine.stats.get("losses", 0),
-        portfolio_can_add_more=portfolio_can_add_more(),
-    )
-    if not allow_trade:
-        engine.log(f"BLOCKED {reason}")
-        del candidates[mint]
+    ok, _ = should_enter(token, {"momentum": 0.01, "smart_money": s})
+    if not ok:
         return
 
     buy(
-        mint=mint,
-        price=price_now,
-        score=score,
-        size=size,
-        meta={
+        mint,
+        price,
+        score,
+        size,
+        {
             "source": source,
-            "route_score": route_score,
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
-            "momentum": momentum,
             "weights": weights,
         },
     )
 
-    cooldown[mint] = now
-    del candidates[mint]
 
-
+# ================= MAIN LOOP =================
 async def main_loop():
-    global recent_changes
-
-    engine.log("ENGINE STARTED")
+    engine.log("🚀 ENGINE START")
 
     while engine.running:
         try:
-            risk_engine.update(engine.capital)
-
             await manage_positions()
-
-            if engine.capital > engine.peak_capital:
-                engine.peak_capital = engine.capital
-
-            drawdown = calc_drawdown()
-            engine.log(f"DRAWDOWN {drawdown:.4f}")
-
-            if engine.capital < engine.peak_capital * 0.95:
-                engine.log("HARD_COOLDOWN")
-                await asyncio.sleep(10)
-                continue
-
-            allow_trade, reason = risk_engine.allow_trade(
-                equity=engine.capital,
-                loss_streak=engine.stats.get("losses", 0),
-                portfolio_can_add_more=portfolio_can_add_more(),
-            )
-            if not allow_trade:
-                engine.log(f"BLOCKED {reason}")
-                await asyncio.sleep(2)
-                continue
 
             tokens = await scan()
 
             for t in tokens:
                 recent_changes.append(float(t.get("change", 0)))
 
-            if len(recent_changes) > 40:
-                recent_changes = recent_changes[-40:]
+            engine.regime = detect_regime(recent_changes[-40:])
 
-            engine.regime = detect_regime(recent_changes)
-            engine.log(f"REGIME {engine.regime}")
-
-            if engine.regime in {"flat", "trend_down"}:
+            if engine.regime in ["flat", "trend_down"]:
                 await asyncio.sleep(2)
                 continue
 
             routes = router.build_routes(tokens)
 
-            for route in routes:
-                await evaluate_route(route)
+            for r in routes:
+                await evaluate_route(r)
 
         except Exception as e:
-            engine.stats["errors"] += 1
-            engine.log(f"LOOP_ERR {e}")
+            engine.log(f"LOOP ERR {e}")
 
         await asyncio.sleep(2)
