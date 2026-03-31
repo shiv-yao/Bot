@@ -339,6 +339,9 @@ async def evaluate_route(route: dict):
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
+    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
+    engine.log(f"TOKEN {mint[:6]}")
+
     source_stats = build_source_stats(engine.trade_history)
     insider_perf = build_insider_perf(engine.trade_history)
     weights = get_dynamic_weights(source_stats, insider_perf)
