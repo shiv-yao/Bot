@@ -1,19 +1,16 @@
-class Engine:
+class EngineState:
     def __init__(self):
         self.running = True
-        self.mode = "PAPER"
-
-        self.positions = []
         self.logs = []
-
+        self.positions = []
         self.stats = {
-            "rejected": 0
+            "signals": 0,
+            "executed": 0,
+            "rejected": 0,
+            "errors": 0,
         }
-
-        self.last_trade = {}
         self.last_signal = ""
+        self.capital = 1.0
 
-        self.threshold = 0.02
 
-
-engine = Engine()
+engine = EngineState()
