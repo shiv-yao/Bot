@@ -16,6 +16,7 @@ from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.helius_wallet_tracker import update_token_wallets
+from app.alpha.insider_engine import get_token_insider_score
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -80,6 +81,7 @@ def record_trade(pos, price, reason):
         "pnl": pnl,
         "size": pos["size"],
         "reason": reason,
+        "score": pos.get("score"),
         "meta": pos.get("meta", {}),
     })
 
@@ -89,7 +91,6 @@ def record_trade(pos, price, reason):
         engine.stats["losses"] = engine.stats.get("losses", 0) + 1
 
     risk_engine.record_realized(pnl)
-
     return pnl
 
 
@@ -120,13 +121,33 @@ def buy(mint, price, score, size, meta):
     last_trade_time = now
     risk_engine.record_trade()
 
-    engine.log(f"BUY {mint[:6]} size={size:.4f} cap={engine.capital:.4f}")
+    weights = meta.get("weights", {})
+
+    engine.log(
+        "BUY "
+        f"{mint[:6]} "
+        f"size={size:.4f} "
+        f"score={score:.4f} "
+        f"src={meta.get('source', 'unknown')} "
+        f"b={meta.get('breakout', 0):.3f} "
+        f"s={meta.get('smart_money', 0):.3f} "
+        f"l={meta.get('liquidity', 0):.3f} "
+        f"ins={meta.get('insider', 0):.3f} "
+        f"wb={weights.get('breakout', 0):.2f} "
+        f"ws={weights.get('smart_money', 0):.2f} "
+        f"wl={weights.get('liquidity', 0):.2f} "
+        f"cap={engine.capital:.4f}"
+    )
 
 
 def sell(pos, price, reason):
     pnl = record_trade(pos, price, reason)
     engine.capital += pos["size"] * (1 + pnl)
-    engine.log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f}")
+    engine.log(
+        f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} "
+        f"src={pos.get('meta', {}).get('source', 'unknown')} "
+        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
+    )
 
 
 def partial_sell(pos, price, ratio):
@@ -136,8 +157,22 @@ def partial_sell(pos, price, ratio):
     engine.capital += sell_size * (1 + pnl)
     pos["size"] -= sell_size
 
-    record_trade(pos, price, "PARTIAL")
-    engine.log(f"PARTIAL {pos['mint'][:6]} ratio={ratio}")
+    engine.trade_history.append({
+        "mint": pos["mint"],
+        "entry": pos["entry"],
+        "exit": price,
+        "pnl": pnl,
+        "size": sell_size,
+        "reason": "PARTIAL",
+        "score": pos.get("score"),
+        "meta": pos.get("meta", {}),
+    })
+
+    risk_engine.record_realized(pnl)
+    engine.log(
+        f"PARTIAL {pos['mint'][:6]} ratio={ratio} pnl={pnl:.4f} "
+        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
+    )
 
 
 def add_winner(pos, price, ratio):
@@ -156,7 +191,11 @@ def add_winner(pos, price, ratio):
 
     record_wallet_trade("SIM_WALLET", pos["mint"], "buy", add_size)
 
-    engine.log(f"ADD {pos['mint'][:6]} size={add_size:.4f}")
+    engine.log(
+        f"ADD {pos['mint'][:6]} size={add_size:.4f} "
+        f"new_entry={pos['entry']:.4f} "
+        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
+    )
 
 
 # ================= POSITION MANAGEMENT =================
@@ -176,12 +215,10 @@ async def manage_positions():
 
             pos["time_age"] = now - pos["time"]
 
-            # 🔥 Position Manager
             actions = manage_position(pos, price)
 
             sold = False
             for act, ratio in actions:
-
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
 
@@ -195,7 +232,9 @@ async def manage_positions():
 
                 elif act == "breakeven":
                     engine.log(
-                        f"BREAKEVEN {pos['mint'][:6]} stop={pos.get('stop_price', pos['entry']):.4f}"
+                        f"BREAKEVEN {pos['mint'][:6]} "
+                        f"stop={pos.get('stop_price', pos['entry']):.4f} "
+                        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
                     )
 
             if sold:
@@ -204,7 +243,6 @@ async def manage_positions():
             pnl = (price - pos["entry"]) / pos["entry"]
             dd = (price - pos["peak"]) / pos["peak"]
 
-            # fallback exits
             if pnl >= TP:
                 sell(pos, price, "TP")
                 continue
@@ -239,17 +277,33 @@ async def evaluate_route(route):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # 🔥 更新鏈上 wallet
+    # 背景更新鏈上 wallet / insider 資料
     asyncio.create_task(update_token_wallets(mint))
 
     b = breakout_score(token)
     s = smart_money_score(token)
     l = liquidity_score(token)
+    insider = get_token_insider_score(mint)
 
     stats = build_source_stats(engine.trade_history)
     weights = get_dynamic_weights(stats)
 
     score = combine_scores(b, s, l, engine.regime, stats)
+
+    engine.log(
+        f"ROUTE {mint[:6]} "
+        f"src={source} "
+        f"route={float(route.get('score', 0.0) or 0.0):.3f} "
+        f"final={score:.3f} "
+        f"b={b:.3f} "
+        f"s={s:.3f} "
+        f"l={l:.3f} "
+        f"ins={insider:.3f} "
+        f"wb={weights['breakout']:.2f} "
+        f"ws={weights['smart_money']:.2f} "
+        f"wl={weights['liquidity']:.2f} "
+        f"regime={engine.regime}"
+    )
 
     if score < 0.55:
         return
@@ -260,13 +314,18 @@ async def evaluate_route(route):
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
-
     size = min(base, cap)
 
     if not allow(engine, score, size):
         return
 
-    ok, _ = should_enter(token, {"momentum": 0.01, "smart_money": s})
+    ok, _ = should_enter(
+        token,
+        {
+            "momentum": 0.01,
+            "smart_money": s,
+        }
+    )
     if not ok:
         return
 
@@ -280,6 +339,7 @@ async def evaluate_route(route):
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
+            "insider": insider,
             "weights": weights,
         },
     )
