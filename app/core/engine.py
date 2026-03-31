@@ -15,9 +15,11 @@ from app.alpha.combiner import combine_scores, get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
+from app.alpha.helius_wallet_tracker import update_token_wallets
+
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
-from app.alpha.helius_wallet_tracker import update_token_wallets
+from app.core.position_manager import manage_position
 
 TP = 0.045
 SL = -0.008
@@ -103,9 +105,11 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "time": now,
         "score": score,
         "meta": meta,
+        "breakeven": False,
+        "tp1_done": False,
+        "add_done": False,
     })
 
-    # 🔥 記錄 smart wallet 行為（先用模擬 wallet）
     record_wallet_trade(
         wallet="SIM_WALLET",
         mint=mint,
@@ -185,6 +189,36 @@ async def manage_positions():
 
             pnl = (price - pos["entry"]) / pos["entry"]
             dd = (price - pos["peak"]) / pos["peak"]
+            pos["time_age"] = now - pos.get("time", now)
+
+            # 🔥 Position Manager 接進來的位置
+            actions = manage_position(pos, price)
+
+            sold_all = False
+            for action, ratio in actions:
+                if action == "partial_sell":
+                    sell_size = pos["size"] * ratio
+                    pos["size"] -= sell_size
+                    engine.capital += sell_size
+                    engine.log(f"PARTIAL {pos['mint'][:6]} ratio={ratio}")
+
+                elif action == "add":
+                    add_size = pos["size"] * ratio * 0.5
+                    if engine.capital >= add_size:
+                        engine.capital -= add_size
+                        pos["size"] += add_size
+                        engine.log(f"ADD {pos['mint'][:6]} size={add_size:.4f}")
+
+                elif action == "sell_all":
+                    sell(pos, price, "PM_EXIT")
+                    sold_all = True
+                    break
+
+                elif action == "breakeven":
+                    engine.log(f"BREAKEVEN {pos['mint'][:6]}")
+
+            if sold_all:
+                continue
 
             engine.log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
 
@@ -242,12 +276,7 @@ async def evaluate_route(route: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # 先背景更新這個 token 的真 wallet 資料
-asyncio.create_task(update_token_wallets(token["mint"]))
-
-b = breakout_score(token)
-s = smart_money_score(token)
-l = liquidity_score(token)
+    asyncio.create_task(update_token_wallets(token["mint"]))
 
     b = breakout_score(token)
     s = smart_money_score(token)
