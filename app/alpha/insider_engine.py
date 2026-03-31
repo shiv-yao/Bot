@@ -49,15 +49,18 @@ def get_wallet_insider_score(wallet: str) -> float:
 
 
 def get_token_insider_score(mint: str) -> float:
-    wallets = get_early_wallets(mint)
+    from app.alpha.helius_wallet_tracker import token_wallets
 
+    wallets = token_wallets.get(mint, [])
+
+    # 👉 最簡版本：只要有 wallet 就給分
     if not wallets:
         return 0.0
 
-    scores = [get_wallet_insider_score(w) for w in wallets]
+    # wallet 數量 → 分數
+    score = min(len(wallets) / 5, 1.0)
 
-    if not scores:
-        return 0.0
+    return round(score, 4)
 
     # 越早期且命中越多越高
     avg = sum(scores) / len(scores)
