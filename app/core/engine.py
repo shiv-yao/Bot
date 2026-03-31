@@ -30,13 +30,12 @@ async def process(e, source="pump"):
         log(f"PROCESSING: {e}")
         engine.stats["signals"] += 1
 
-        # ===== 流動性 =====
+        # ===== 基礎風控 =====
         if not await liquidity_ok(m):
             engine.stats["rejected"] += 1
             log(f"REJECT_LIQ {m[:6]}")
             return
 
-        # ===== anti-rug =====
         if not await anti_rug(m):
             engine.stats["rejected"] += 1
             log(f"REJECT_RUG {m[:6]}")
@@ -56,7 +55,7 @@ async def process(e, source="pump"):
 
         # ===== 多錢包 =====
         for wallet_name, weight in wallet_scale().items():
-            # Debug 先縮很小，避免餘額問題
+            # 保守版，小倉位
             size = 0.00001 * regime.multiplier() * weight
             lamports = int(size * 1e9)
 
@@ -65,30 +64,42 @@ async def process(e, source="pump"):
                 f"size={size:.8f} lamports={lamports} score={score:.4f}"
             )
 
-            # ===== 先抓 quote =====
+            # ===== 先抓 quote，沒路徑直接跳過 =====
             q = await get_quote(SOL, m, lamports)
             if not q:
-                log(f"QUOTE_FAIL {m[:8]} wallet={wallet_name}")
+                log(f"NO_ROUTE {m[:8]}")
+                continue
+
+            out_amount = int(q.get("outAmount", 0) or 0)
+            impact = float(q.get("priceImpactPct", 0) or 0)
+
+            if out_amount <= 0:
+                log(f"NO_LIQ_ROUTE {m[:8]}")
+                continue
+
+            # 保守版本：impact 太高不碰
+            if impact > 0.30:
+                log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
                 continue
 
             log(
                 f"QUOTE_OK {m[:8]} wallet={wallet_name} "
-                f"out={q.get('outAmount')} impact={q.get('priceImpactPct')}"
+                f"out={out_amount} impact={impact:.4f}"
             )
 
-            # ===== 用 quote 建 order =====
+            # ===== order（先不 execute，保守 debug 版）=====
             o = await order(SOL, m, lamports, quote=q)
             if not o or not o.get("transaction"):
                 log(f"ORDER_FAIL {m[:8]} wallet={wallet_name} data={o}")
                 continue
 
-            # ===== Debug：先不 execute，先確認流程通到這 =====
+            # 先做 paper exec，確認 order 成功
             log(
                 f"PAPER_EXEC {m[:8]} wallet={wallet_name} "
                 f"score={score:.4f} regime={engine.regime}"
             )
 
-            # ===== PnL（debug 先保留簡化）=====
+            # ===== 簡化統計 =====
             pnl = score - 0.01
             tuner.update(pnl)
             engine.threshold = tuner.threshold
@@ -101,7 +112,7 @@ async def process(e, source="pump"):
                 "pnl": pnl,
                 "regime": engine.regime,
                 "source": source,
-                "mode": "paper_debug",
+                "mode": "paper_jupiter",
             })
 
             engine.stats["executed"] += 1
