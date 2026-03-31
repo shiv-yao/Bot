@@ -6,7 +6,6 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup():
     print("🚀 SYSTEM START")
-
     from app.core.engine import main_loop
     asyncio.create_task(main_loop())
 
