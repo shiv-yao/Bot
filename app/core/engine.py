@@ -17,20 +17,18 @@ def log(msg):
     engine.logs = engine.logs[-500:]
 
 
-# ================= POSITION SIZE =================
-def get_position_size(score):
-    base = SETTINGS["BASE_SIZE"]
-
-    if score > SETTINGS["SNIPER_THRESHOLD"]:
+# ================= SIZE =================
+def get_size(score):
+    if score >= SETTINGS["SNIPER_THRESHOLD"]:
         return SETTINGS["MAX_SIZE"]
 
-    if score > SETTINGS["FAST_ENTRY_THRESHOLD"]:
-        return int(base * 1.8)
+    if score >= SETTINGS["FAST_ENTRY_THRESHOLD"]:
+        return int(SETTINGS["BASE_SIZE"] * 1.8)
 
-    return base
+    return SETTINGS["BASE_SIZE"]
 
 
-# ================= SELL ENGINE =================
+# ================= SELL =================
 async def manage_positions():
     for pos in engine.positions[:]:
         try:
@@ -52,7 +50,7 @@ async def manage_positions():
 
             # 💰 TAKE PROFIT
             if pnl > SETTINGS["TAKE_PROFIT"]:
-                log(f"💰 TAKE PROFIT {m[:6]}")
+                log(f"💰 TP {m[:6]}")
                 engine.positions.remove(pos)
                 engine.capital *= (1 + pnl)
                 continue
@@ -60,14 +58,14 @@ async def manage_positions():
             # 🔵 TRAILING STOP
             drawdown = (out_now - pos["peak"]) / max(pos["peak"], 1)
             if pos["peak"] > entry and drawdown < SETTINGS["TRAILING_STOP"]:
-                log(f"🔵 TRAIL STOP {m[:6]}")
+                log(f"🔵 TRAIL {m[:6]}")
                 engine.positions.remove(pos)
                 engine.capital *= (1 + pnl)
                 continue
 
             # 🔴 STOP LOSS
             if pnl < SETTINGS["STOP_LOSS"]:
-                log(f"🔴 STOP LOSS {m[:6]}")
+                log(f"🔴 SL {m[:6]}")
                 engine.positions.remove(pos)
                 engine.capital *= (1 + pnl)
                 continue
@@ -76,7 +74,7 @@ async def manage_positions():
             log(f"SELL_ERR {e}")
 
 
-# ================= BUY ENGINE =================
+# ================= BUY =================
 async def try_trade(item):
     try:
         m = item.get("mint")
@@ -85,10 +83,17 @@ async def try_trade(item):
 
         now = asyncio.get_event_loop().time()
 
+        # ❗ 防重複持倉
+        if any(p["mint"] == m for p in engine.positions):
+            log(f"ALREADY_HELD {m[:6]}")
+            return
+
+        # ❗ 滿倉限制
         if len(engine.positions) >= SETTINGS["MAX_POSITIONS"]:
             log("MAX_POSITIONS")
             return
 
+        # ❗ cooldown
         if now - LAST_TRADE.get(m, 0) < COOLDOWN:
             return
 
@@ -99,7 +104,7 @@ async def try_trade(item):
         if score < SETTINGS["ENTRY_THRESHOLD"]:
             return
 
-        size = get_position_size(score)
+        size = get_size(score)
 
         q = await get_quote(SOL, m, size)
         if not q:
@@ -120,7 +125,6 @@ async def try_trade(item):
             log(f"ORDER_FAIL {m[:6]}")
             return
 
-        # 🧠 建倉
         engine.positions.append({
             "mint": m,
             "entry_out": out,
@@ -138,9 +142,9 @@ async def try_trade(item):
         log(f"TRADE_ERR {e}")
 
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 async def main_loop():
-    print("🚀 V6 ENGINE START")
+    print("🚀 V6.1 ENGINE START")
 
     if not hasattr(engine, "positions"):
         engine.positions = []
@@ -150,8 +154,10 @@ async def main_loop():
 
     while True:
         try:
+            # 🧠 先處理賣出
             await manage_positions()
 
+            # 🧠 再找新幣
             items = await fetch_pump_candidates()
 
             for item in items[:SETTINGS["TOP_N"]]:
