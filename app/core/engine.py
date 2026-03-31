@@ -6,11 +6,21 @@ from app.core.scanner import scan
 from app.core.pricing import get_price
 from app.core.risk import allow, kill_switch
 
+from app.alpha.breakout import breakout_score
+from app.alpha.smart_money import smart_money_score
+from app.alpha.liquidity import liquidity_score
+from app.alpha.regime import detect_regime
+from app.alpha.combiner import combine_scores
+from app.portfolio.allocator import get_position_size
+
 TP = 0.045
 SL = -0.008
 TRAIL = 0.004
 
 COOLDOWN = 30
+MIN_MOMENTUM = 0.004
+MIN_DIRECT_BUY = 0.70
+MIN_CANDIDATE_BUY = 0.55
 
 cooldown = {}
 candidates = {}
@@ -18,50 +28,71 @@ recent_changes = []
 last_trade_time = 0
 
 
-def score_token(token: dict) -> float:
-    volume = float(token.get("volume", 0))
-    change = float(token.get("change", 0))
-
-    vol_score = min(volume / 100000.0, 1.0) * 0.4
-    change_score = min(change / 10.0, 1.0) * 0.6
-
-    return vol_score + change_score
+def calc_drawdown():
+    if engine.peak_capital <= 0:
+        return 0.0
+    return (engine.capital - engine.peak_capital) / engine.peak_capital
 
 
-def get_size(score: float) -> float:
-    if score >= 0.65:
-        return 0.12
-    elif score >= 0.55:
-        return 0.08
-    return 0.05
-
-
-def buy(mint: str, price: float, score: float):
+def buy(mint: str, price: float, score: float, size: float, meta: dict):
     global last_trade_time
 
-    size = get_size(score)
-
     engine.capital -= size
+    now = time.time()
 
     engine.positions.append({
         "mint": mint,
         "entry": price,
         "peak": price,
         "size": size,
-        "time": time.time(),
+        "time": now,
+        "score": score,
+        "meta": meta,
     })
 
     engine.stats["executed"] += 1
-    last_trade_time = time.time()
+    last_trade_time = now
 
-    engine.log(f"BUY {mint[:6]} price={price:.4f} size={size:.3f} cap={engine.capital:.4f}")
+    engine.log(
+        "BUY "
+        f"{mint[:6]} "
+        f"price={price:.4f} "
+        f"size={size:.4f} "
+        f"score={score:.4f} "
+        f"regime={engine.regime} "
+        f"b={meta['breakout']:.3f} "
+        f"s={meta['smart_money']:.3f} "
+        f"l={meta['liquidity']:.3f} "
+        f"cap={engine.capital:.4f}"
+    )
 
 
 def sell(pos: dict, price: float, reason: str):
     pnl = (price - pos["entry"]) / pos["entry"]
     engine.capital += pos["size"] * (1 + pnl)
 
-    engine.log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
+    trade = {
+        "mint": pos["mint"],
+        "entry": pos["entry"],
+        "exit": price,
+        "pnl": pnl,
+        "size": pos["size"],
+        "reason": reason,
+        "score": pos.get("score"),
+        "meta": pos.get("meta", {}),
+    }
+    engine.trade_history.append(trade)
+
+    if pnl >= 0:
+        engine.stats["wins"] += 1
+    else:
+        engine.stats["losses"] += 1
+
+    engine.log(
+        f"SELL {pos['mint'][:6]} "
+        f"{reason} pnl={pnl:.4f} "
+        f"cap={engine.capital:.4f}"
+    )
 
 
 async def manage_positions():
@@ -88,7 +119,7 @@ async def manage_positions():
                 sell(pos, price, "SL")
                 continue
 
-            # 🔥 trailing only after profit
+            # 只有浮盈到一定程度才啟動 trailing
             if pnl >= 0.015 and dd <= -TRAIL:
                 sell(pos, price, "TRAIL")
                 continue
@@ -107,9 +138,107 @@ async def manage_positions():
     engine.positions = remaining
 
 
-async def main_loop():
-    global recent_changes
+async def evaluate_token(token: dict):
+    mint = token["mint"]
+    change = float(token.get("change", 0))
 
+    engine.stats["signals"] += 1
+
+    if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
+        engine.log(f"COOLDOWN {mint[:6]}")
+        return
+
+    if abs(change) < 2:
+        engine.log(f"FLAT_SKIP {mint[:6]}")
+        return
+
+    if any(p["mint"] == mint for p in engine.positions):
+        engine.log(f"ALREADY_HELD {mint[:6]}")
+        return
+
+    if time.time() - last_trade_time < 8:
+        return
+
+    # 三策略分數
+    b = breakout_score(token)
+    s = smart_money_score(token)
+    l = liquidity_score(token)
+
+    score = combine_scores(
+        breakout=b,
+        smart_money=s,
+        liquidity=l,
+        regime=engine.regime,
+    )
+
+    engine.log(
+        f"SCORE {mint[:6]} "
+        f"final={score:.4f} "
+        f"b={b:.3f} s={s:.3f} l={l:.3f} regime={engine.regime}"
+    )
+
+    if score < MIN_CANDIDATE_BUY:
+        engine.stats["rejected"] += 1
+        engine.log(f"REJECT {mint[:6]}")
+        return
+
+    if not allow(engine, score, 0.02):
+        return
+
+    price_now = await get_price(token)
+    now = time.time()
+
+    # 高分也要確認 momentum，不直接裸買
+    if mint not in candidates:
+        candidates[mint] = {
+            "time": now,
+            "price": price_now,
+            "score": score,
+            "breakout": b,
+            "smart_money": s,
+            "liquidity": l,
+        }
+        engine.log(f"CANDIDATE {mint[:6]}")
+        return
+
+    # 候選太久作廢
+    if now - candidates[mint]["time"] > 10:
+        del candidates[mint]
+        engine.log(f"CANDIDATE_EXPIRE {mint[:6]}")
+        return
+
+    # 等待 2 秒再確認
+    if now - candidates[mint]["time"] < 2:
+        return
+
+    old_price = candidates[mint]["price"]
+    momentum = (price_now - old_price) / old_price
+
+    if momentum < MIN_MOMENTUM:
+        engine.log(f"STRONG_REJECT {mint[:6]}")
+        del candidates[mint]
+        return
+
+    size = get_position_size(score, engine.capital, engine.regime)
+
+    buy(
+        mint=mint,
+        price=price_now,
+        score=score,
+        size=size,
+        meta={
+            "breakout": b,
+            "smart_money": s,
+            "liquidity": l,
+            "momentum": momentum,
+        },
+    )
+
+    cooldown[mint] = now
+    del candidates[mint]
+
+
+async def main_loop():
     engine.log("ENGINE STARTED")
 
     while engine.running:
@@ -119,16 +248,13 @@ async def main_loop():
 
             await manage_positions()
 
-            # =========================
-            # drawdown control
-            # =========================
             if engine.capital > engine.peak_capital:
                 engine.peak_capital = engine.capital
 
-            dd = (engine.capital - engine.peak_capital) / engine.peak_capital
-            engine.log(f"DRAWDOWN {dd:.4f}")
+            drawdown = calc_drawdown()
+            engine.log(f"DRAWDOWN {drawdown:.4f}")
 
-            # 🔥 連敗保護
+            # 回撤保護
             if engine.capital < engine.peak_capital * 0.97:
                 engine.log("LOSS_COOLDOWN")
                 await asyncio.sleep(5)
@@ -136,87 +262,22 @@ async def main_loop():
 
             tokens = await scan()
 
-            # =========================
-            # 🔥 市場判斷（更嚴格）
-            # =========================
             for t in tokens:
                 recent_changes.append(float(t.get("change", 0)))
 
             if len(recent_changes) > 40:
                 recent_changes = recent_changes[-40:]
 
-            if len(recent_changes) > 10:
-                market_vol = sum(abs(x) for x in recent_changes) / len(recent_changes)
+            engine.regime = detect_regime(recent_changes)
+            engine.log(f"REGIME {engine.regime}")
 
-                if market_vol < 2.2:
-                    engine.log("MARKET_BAD")
-                    await asyncio.sleep(2)
-                    continue
-
-            # =========================
+            # 平盤與空頭少打
+            if engine.regime in {"flat", "trend_down"}:
+                await asyncio.sleep(2)
+                continue
 
             for token in tokens:
-                mint = token["mint"]
-                change = float(token.get("change", 0))
-
-                engine.stats["signals"] += 1
-
-                if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
-                    engine.log(f"COOLDOWN {mint[:6]}")
-                    continue
-
-                if abs(change) < 2:
-                    engine.log(f"FLAT_SKIP {mint[:6]}")
-                    continue
-
-                score = score_token(token)
-                engine.log(f"SCORE {mint[:6]} {score:.4f}")
-
-                if score < 0.5:
-                    engine.log(f"REJECT {mint[:6]}")
-                    engine.stats["rejected"] += 1
-                    continue
-
-                if any(p["mint"] == mint for p in engine.positions):
-                    continue
-
-                if not allow(engine):
-                    continue
-
-                # 🔥 降低頻率
-                if time.time() - last_trade_time < 8:
-                    continue
-
-                now = time.time()
-
-                # =========================
-                # 🔥 全部都要 momentum（重點）
-                # =========================
-                price_now = await get_price(token)
-
-                if mint not in candidates:
-                    candidates[mint] = {
-                        "time": now,
-                        "price": price_now,
-                    }
-                    engine.log(f"CANDIDATE {mint[:6]}")
-                    continue
-
-                if now - candidates[mint]["time"] < 2:
-                    continue
-
-                old = candidates[mint]["price"]
-                momentum = (price_now - old) / old
-
-                if momentum < 0.004:
-                    engine.log(f"STRONG_REJECT {mint[:6]}")
-                    del candidates[mint]
-                    continue
-
-                buy(mint, price_now, score)
-                cooldown[mint] = now
-
-                del candidates[mint]
+                await evaluate_token(token)
 
         except Exception as e:
             engine.stats["errors"] += 1
