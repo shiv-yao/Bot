@@ -1,4 +1,4 @@
-from app.alpha.wallet_tracker import get_wallets_for_token
+from app.alpha.helius_wallet_tracker import get_wallets_for_token
 from app.alpha.smart_wallet_ranker import rank_wallets
 
 
