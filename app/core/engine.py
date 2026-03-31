@@ -1,6 +1,5 @@
 import asyncio
 
-from app.mempool.decode import stream
 from app.alpha.alpha import alpha
 from app.execution.jupiter import order, safe_jupiter_call
 from app.execution.jito import send_bundle
@@ -35,10 +34,12 @@ async def process(e, source="pump"):
         # ===== 風控 =====
         if not await liquidity_ok(m):
             engine.stats["rejected"] += 1
+            log(f"REJECT_LIQ {m[:6]}")
             return
 
         if not await anti_rug(m):
             engine.stats["rejected"] += 1
+            log(f"REJECT_RUG {m[:6]}")
             return
 
         # ===== alpha =====
@@ -48,8 +49,10 @@ async def process(e, source="pump"):
         engine.regime = regime.mode
         score *= regime.multiplier()
 
+        # 🔥 關鍵 log（你剛剛問的就在這）
         if score < tuner.threshold:
             engine.stats["rejected"] += 1
+            log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
             return
 
         # ===== 多錢包 =====
@@ -103,7 +106,7 @@ async def process(e, source="pump"):
         log(f"PROCESS_ERR {ex}")
 
 
-# ================= SAFE CYCLE（核心🔥） =================
+# ================= SAFE CYCLE =================
 async def safe_cycle():
     print("scanning...")
 
