@@ -1,137 +1,64 @@
 import asyncio
-
-from app.alpha.alpha import alpha
-from app.data.market import get_quote
 from app.execution.jupiter import order
-from app.regime.regime import regime
-from app.ai.tuner import tuner
-from app.risk.liquidity import liquidity_ok
-from app.risk.anti_rug import anti_rug
-from app.wallet.manager import wallet_scale, load_wallets
 from app.core.state import engine
-from app.sources.pump import fetch_pump_candidates
 
 SOL = "So11111111111111111111111111111111111111112"
 
 
-def log(msg: str):
-    msg = str(msg)
+def log(msg):
     print(msg)
     engine.logs.append(msg)
     engine.logs = engine.logs[-500:]
 
 
-async def process(e, source="pump"):
+async def process(item):
     try:
-        m = e.get("mint")
+        m = item.get("mint")
         if not m:
             return
 
-        log(f"PROCESSING: {e}")
-        engine.stats["signals"] += 1
+        log(f"PROCESSING: {item}")
 
-        # ===== 基礎風控 =====
-        if not await liquidity_ok(m):
-            engine.stats["rejected"] += 1
-            log(f"REJECT_LIQ {m[:6]}")
+        # 👉 假設你前面已有 quote
+        quote = item.get("quote")
+
+        if not quote:
+            log(f"NO_QUOTE {m[:8]}")
             return
 
-        if not await anti_rug(m):
-            engine.stats["rejected"] += 1
-            log(f"REJECT_RUG {m[:6]}")
+        lamports = 200000  # 固定小額
+
+        log(f"TRY_ORDER {m[:8]} size={lamports}")
+
+        o = await order(SOL, m, lamports, quote=quote)
+
+        if not o or not o.get("transaction"):
+            log(f"ORDER_FAIL {m[:8]} data={o}")
             return
 
-        # ===== alpha =====
-        score = await alpha(m)
+        log(f"PAPER_EXEC {m[:8]} SUCCESS")
 
-        regime.update(score)
-        engine.regime = regime.mode
-        score *= regime.multiplier()
+        engine.stats["executed"] += 1
 
-        if score < tuner.threshold:
-            engine.stats["rejected"] += 1
-            log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
-            return
+    except Exception as e:
+        log(f"PROCESS_ERR {e}")
 
-        # ===== 多錢包 =====
-        for wallet_name, weight in wallet_scale().items():
-            # 保守版，小倉位
-            size = 0.00001 * regime.multiplier() * weight
-            lamports = int(size * 1e9)
 
-            log(
-                f"TRY_ORDER {m[:8]} wallet={wallet_name} "
-                f"size={size:.8f} lamports={lamports} score={score:.4f}"
-            )
-
-            # ===== 先抓 quote，沒路徑直接跳過 =====
-            q = await get_quote(SOL, m, lamports)
-            if not q:
-                log(f"NO_ROUTE {m[:8]}")
-                continue
-
-            out_amount = int(q.get("outAmount", 0) or 0)
-            impact = float(q.get("priceImpactPct", 0) or 0)
-
-            if out_amount <= 0:
-                log(f"NO_LIQ_ROUTE {m[:8]}")
-                continue
-
-            # 保守版本：impact 太高不碰
-            if impact > 0.30:
-                log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
-                continue
-
-            log(
-                f"QUOTE_OK {m[:8]} wallet={wallet_name} "
-                f"out={out_amount} impact={impact:.4f}"
-            )
-
-            # ===== order（先不 execute，保守 debug 版）=====
-            o = await order(SOL, m, lamports, quote=q)
-            if not o or not o.get("transaction"):
-                log(f"ORDER_FAIL {m[:8]} wallet={wallet_name} data={o}")
-                continue
-
-            # 先做 paper exec，確認 order 成功
-            log(
-                f"PAPER_EXEC {m[:8]} wallet={wallet_name} "
-                f"score={score:.4f} regime={engine.regime}"
-            )
-
-            # ===== 簡化統計 =====
-            pnl = score - 0.01
-            tuner.update(pnl)
-            engine.threshold = tuner.threshold
-            engine.capital *= (1 + pnl)
-
-            engine.trade_history.append({
-                "token": m,
-                "wallet": wallet_name,
-                "score": score,
-                "pnl": pnl,
-                "regime": engine.regime,
-                "source": source,
-                "mode": "paper_jupiter",
-            })
-
-            engine.stats["executed"] += 1
-
-    except Exception as ex:
-        engine.stats["errors"] += 1
-        log(f"PROCESS_ERR {ex}")
-
+# ================= LOOP =================
 
 async def safe_cycle():
     print("scanning...")
 
     try:
+        # 👉 你自己的來源（pump / mempool）
+        from app.sources.pump import fetch_pump_candidates
+
         items = await fetch_pump_candidates()
+
         print("PUMP ITEMS:", items)
 
         for item in items:
-            print("PROCESSING ITEM:", item)
-            await process(item, source="pump")
+            await process(item)
 
     except Exception as e:
         log(f"SAFE_CYCLE_ERR {e}")
@@ -140,13 +67,11 @@ async def safe_cycle():
 
 
 async def main_loop():
-    log("ENGINE LOOP START")
-    load_wallets()
+    print("ENGINE LOOP START")
 
     while True:
         try:
             await safe_cycle()
         except Exception as e:
-            engine.stats["errors"] += 1
-            log(f"LOOP ERROR: {e}")
+            print("LOOP ERROR:", e)
             await asyncio.sleep(2)
