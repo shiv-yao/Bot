@@ -1,7 +1,6 @@
 import asyncio
 import time
 
-from app.alpha.smart_wallets import record_wallet_trade
 from app.core.state import engine
 from app.core.scanner import scan
 from app.core.pricing import get_price
@@ -18,6 +17,7 @@ from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
+from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_trade
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -199,11 +199,10 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
 def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
 
-    # 🔥 關鍵：讓系統學這筆交易
-    record_wallet_trade("SIM_WALLET", pos["mint"], pnl)
+    # 讓 smart wallet ranking 會學習
+    record_ranked_wallet_trade("SIM_WALLET", pos["mint"], pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
-
     engine.log(
         f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} "
         f"src={pos.get('meta', {}).get('source', 'unknown')} "
@@ -281,15 +280,12 @@ async def manage_positions():
             for act, ratio in actions:
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
-
                 elif act == "add":
                     add_winner(pos, price, ratio)
-
                 elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
                     sold = True
                     break
-
                 elif act == "breakeven":
                     engine.log(
                         f"BREAKEVEN {pos['mint'][:6]} "
@@ -323,6 +319,7 @@ async def manage_positions():
 
     engine.positions = remaining
 
+
 async def evaluate_route(route: dict):
     global last_trade_time
 
@@ -334,22 +331,23 @@ async def evaluate_route(route: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
+    wallets = []
     try:
-        await update_token_wallets(mint)
-        engine.log(f"WALLET_OK {mint[:6]}")
+        wallets = await update_token_wallets(mint)
+        if wallets:
+            engine.log(f"WALLET_OK {mint[:6]} {len(wallets)}")
+        else:
+            engine.log(f"WALLET_EMPTY {mint[:6]}")
     except Exception as e:
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
     l = liquidity_score(token)
-
-    # 👉 真 insider
     insider = get_token_insider_score(mint)
 
-    # 👉 fallback（正式版）
     if insider == 0:
-        insider = round((b + s + l) / 3 * 0.5, 4)
+        insider = round(((b + s + l) / 3.0) * 0.4, 4)
         engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
 
     engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
@@ -391,12 +389,12 @@ async def evaluate_route(route: dict):
 
     price = await get_price(token)
     if not price:
+        engine.log(f"NO_PRICE {mint[:6]}")
         return
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
-    # 👉 insider boost（正式版）
     insider_boost = 1.0
     if insider >= 0.50:
         insider_boost = 1.25
@@ -406,9 +404,10 @@ async def evaluate_route(route: dict):
     size = min(base * insider_boost, cap)
 
     if not allow(engine, score, size):
+        engine.log(f"BLOCKED_ALLOW {mint[:6]}")
         return
 
-    ok, _ = should_enter(
+    ok, reason = should_enter(
         token,
         {
             "momentum": 0.01,
@@ -416,6 +415,7 @@ async def evaluate_route(route: dict):
         }
     )
     if not ok:
+        engine.log(f"FILTERED {mint[:6]} {reason}")
         return
 
     buy(
