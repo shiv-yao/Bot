@@ -11,7 +11,7 @@ from app.alpha.breakout import breakout_score
 from app.alpha.smart_money import smart_money_score
 from app.alpha.liquidity import liquidity_score
 from app.alpha.regime import detect_regime
-from app.alpha.combiner import combine_scores
+from app.alpha.combiner import combine_scores, get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 
@@ -43,6 +43,40 @@ def portfolio_can_add_more() -> bool:
     return portfolio.can_add_more(engine, max_exposure=0.75)
 
 
+def _build_source_stats(trade_history: list[dict]) -> dict:
+    buckets = {}
+
+    for t in trade_history:
+        meta = t.get("meta", {}) or {}
+        source = meta.get("source", "unknown")
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+
+        if source not in buckets:
+            buckets[source] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+            }
+
+        buckets[source]["count"] += 1
+        buckets[source]["total_pnl"] += pnl
+
+        if pnl >= 0:
+            buckets[source]["wins"] += 1
+        else:
+            buckets[source]["losses"] += 1
+
+    for source, row in buckets.items():
+        count = max(int(row["count"]), 1)
+        row["avg_pnl"] = row["total_pnl"] / count
+        row["win_rate"] = row["wins"] / count
+
+    return buckets
+
+
 def buy(mint: str, price: float, score: float, size: float, meta: dict):
     global last_trade_time
 
@@ -54,6 +88,8 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
             risk_adj = 1.2
         elif winrate < 0.45:
             risk_adj = 0.7
+
+    weights = meta.get("weights", {})
 
     engine.capital -= size
     now = time.time()
@@ -85,6 +121,9 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         f"s={meta['smart_money']:.3f} "
         f"l={meta['liquidity']:.3f} "
         f"mom={meta['momentum']:.4f} "
+        f"wb={weights.get('breakout', 0):.2f} "
+        f"ws={weights.get('smart_money', 0):.2f} "
+        f"wl={weights.get('liquidity', 0):.2f} "
         f"cap={engine.capital:.4f}"
     )
 
@@ -198,11 +237,15 @@ async def evaluate_route(route: dict):
     s = smart_money_score(token)
     l = liquidity_score(token)
 
+    source_stats = _build_source_stats(engine.trade_history)
+    weights = get_dynamic_weights(source_stats)
+
     score = combine_scores(
         breakout=b,
         smart_money=s,
         liquidity=l,
         regime=engine.regime,
+        source_stats=source_stats,
     )
 
     engine.log(
@@ -211,6 +254,9 @@ async def evaluate_route(route: dict):
         f"route={route_score:.3f} "
         f"final={score:.3f} "
         f"b={b:.3f} s={s:.3f} l={l:.3f} "
+        f"wb={weights['breakout']:.2f} "
+        f"ws={weights['smart_money']:.2f} "
+        f"wl={weights['liquidity']:.2f} "
         f"regime={engine.regime}"
     )
 
@@ -233,6 +279,7 @@ async def evaluate_route(route: dict):
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
+            "weights": weights,
         }
         engine.log(f"CANDIDATE {mint[:6]}")
         return
@@ -253,7 +300,6 @@ async def evaluate_route(route: dict):
         del candidates[mint]
         return
 
-    # 🔥 entry_filter 接進來
     ok, reason = should_enter(
         token,
         {
@@ -302,6 +348,7 @@ async def evaluate_route(route: dict):
             "smart_money": s,
             "liquidity": l,
             "momentum": momentum,
+            "weights": weights,
         },
     )
 
