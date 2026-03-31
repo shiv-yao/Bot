@@ -49,7 +49,10 @@ def get_token_smart_score(mint: str) -> float:
     if not wallets:
         return 0.0
 
-    scores = [wallet_score(w) for w in wallets]
+    filtered = [w for w in wallets if wallet_score(w) >= 0.55]
+    base = filtered if filtered else list(wallets)
+
+    scores = [wallet_score(w) for w in base]
     if not scores:
         return 0.0
 
@@ -62,3 +65,11 @@ def get_best_wallet(wallets: list[str]) -> str | None:
 
     ranked = sorted(wallets, key=wallet_score, reverse=True)
     return ranked[0] if ranked else None
+
+
+def get_top_wallets(wallets: list[str], min_score: float = 0.55) -> list[str]:
+    if not wallets:
+        return []
+
+    ranked = sorted(wallets, key=wallet_score, reverse=True)
+    return [w for w in ranked if wallet_score(w) >= min_score]
