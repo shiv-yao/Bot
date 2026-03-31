@@ -10,11 +10,10 @@ BASE_SIZE = 270000
 MAX_POSITIONS = 4
 ENTRY_THRESHOLD = 0.015
 
-# V7.2: 開始讓它真的會出場
-TAKE_PROFIT = 0.02       # +2%
-STOP_LOSS = -0.01        # -1%
-TRAILING_STOP = -0.008   # 從 peak 回落 0.8%
-MAX_HOLD_SEC = 20        # 最長持有 20 秒
+TAKE_PROFIT = 0.02
+STOP_LOSS = -0.01
+TRAILING_STOP = -0.008
+MAX_HOLD_SEC = 20
 
 TOKEN_COOLDOWN = 10
 TOP_N = 4
@@ -32,7 +31,6 @@ def log(msg: str):
 
 # ===== MOCK SCANNER =====
 async def fetch_candidates():
-    # 先固定用 mock token，驗證系統買賣循環
     base = [
         {"mint": "8F8FLuwv7iL26ecsQ1yXmYKJ6us6Y55QEpJDMFk11Wau", "momentum": 0.020},
         {"mint": "sosd5Q3DutGxMEaukBDmkPgsapMQz59jNjGWmhYcdTQ", "momentum": 0.018},
@@ -48,11 +46,12 @@ def score_token(item: dict) -> float:
 
 
 def fake_buy_out(score: float) -> int:
+    # 分數越高，模擬拿到的 token 稍多
     return int(200 + score * 3000)
 
 
 def fake_mark_to_market(entry_out: int, age_sec: float) -> int:
-    # V7.2: 故意讓價格有波動，好觸發 TP / SL / TRAIL
+    # 讓 mock 市場有足夠波動，方便測試出場
     phase = age_sec % 16
 
     if phase < 4:
@@ -65,12 +64,10 @@ def fake_mark_to_market(entry_out: int, age_sec: float) -> int:
         drift = -0.05 + 0.008 * (phase - 12)
 
     drift += random.uniform(-0.012, 0.015)
-
     return max(1, int(entry_out * (1 + drift)))
 
 
 async def get_price(mint: str, entry_out: int, age_sec: float) -> int:
-    # 目前仍用 mock price，先讓買賣循環完整
     await asyncio.sleep(0)
     return fake_mark_to_market(entry_out, age_sec)
 
@@ -82,7 +79,6 @@ async def check_exit(pos: dict, current_out: int):
     pnl = (current_out - entry) / max(entry, 1)
     drawdown = (current_out - peak) / max(peak, 1)
 
-    # 先記 debug
     log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={drawdown:.4f}")
 
     if pnl >= TAKE_PROFIT:
@@ -143,7 +139,6 @@ async def try_trade(item: dict):
     mint = item["mint"]
     now = time.time()
 
-    # 不重複持有同一個 token
     if any(p["mint"] == mint for p in engine.positions):
         log(f"ALREADY_HELD {mint[:6]}")
         return
@@ -162,22 +157,27 @@ async def try_trade(item: dict):
 
     log(f"SCORE {mint[:6]} {score:.4f}")
 
-    if score < ENTRY_THRESHOLD:
-        engine.stats["rejected"] += 1
-        log(f"REJECT {mint[:6]}")
-        return
-
-    # 避免盤整太死的 token 一直進
-    last_price = LAST_PRICE.get(mint)
     new_price = fake_buy_out(score)
+    last_price = LAST_PRICE.get(mint)
 
+    # V7.3: 小波動不直接 skip，而是降分
     if last_price is not None:
         move = abs(new_price - last_price) / max(last_price, 1)
+
         if move < 0.003:
-            log(f"FLAT_SKIP {mint[:6]}")
-            return
+            score *= 0.7
+            log(f"LOW_VOL {mint[:6]} adj_score={score:.4f}")
 
     LAST_PRICE[mint] = new_price
+
+    # V7.3: 少量強制進場，避免完全沒交易
+    if score < ENTRY_THRESHOLD:
+        if random.random() < 0.2:
+            log(f"FORCE_ENTRY {mint[:6]}")
+        else:
+            engine.stats["rejected"] += 1
+            log(f"REJECT {mint[:6]}")
+            return
 
     out_amount = new_price
 
@@ -201,10 +201,8 @@ async def main_loop():
 
     while engine.running:
         try:
-            # 先處理賣出
             await manage_positions()
 
-            # 再找新標的
             items = await fetch_candidates()
             ranked = sorted(items, key=score_token, reverse=True)
 
