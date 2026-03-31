@@ -325,8 +325,6 @@ async def evaluate_route(route: dict):
     source = route["source"]
     now = time.time()
 
-    engine.log("DEBUG_EVALUATE_ROUTE_RUNNING")
-
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
@@ -340,12 +338,16 @@ async def evaluate_route(route: dict):
     s = smart_money_score(token)
     l = liquidity_score(token)
 
-    # 🔥 強制測試版：先確認部署真的有更新
-    insider = 0.3
+    # 👉 真 insider
+    insider = get_token_insider_score(mint)
+
+    # 👉 fallback（正式版）
+    if insider == 0:
+        insider = round(s * 0.5, 4)
+        engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
 
     engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
-    engine.log(f"DEBUG_SMART {mint[:6]} {s}")
-    engine.log(f"DEBUG_INSIDER_FORCED {mint[:6]} {insider}")
+    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
     source_stats = build_source_stats(engine.trade_history)
@@ -383,25 +385,24 @@ async def evaluate_route(route: dict):
 
     price = await get_price(token)
     if not price:
-        engine.log(f"NO_PRICE {mint[:6]}")
         return
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
+    # 👉 insider boost（正式版）
     insider_boost = 1.0
     if insider >= 0.50:
-        insider_boost = 1.20
+        insider_boost = 1.25
     elif insider >= 0.30:
-        insider_boost = 1.10
+        insider_boost = 1.15
 
     size = min(base * insider_boost, cap)
 
     if not allow(engine, score, size):
-        engine.log(f"BLOCKED_ALLOW {mint[:6]}")
         return
 
-    ok, reason = should_enter(
+    ok, _ = should_enter(
         token,
         {
             "momentum": 0.01,
@@ -409,7 +410,6 @@ async def evaluate_route(route: dict):
         }
     )
     if not ok:
-        engine.log(f"FILTERED {mint[:6]} {reason}")
         return
 
     buy(
