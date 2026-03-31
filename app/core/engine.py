@@ -343,8 +343,8 @@ async def evaluate_route(route: dict):
 
     # 👉 fallback（正式版）
     if insider == 0:
-        insider = round(s * 0.5, 4)
-        engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
+        insider = round((b + s + l) / 3 * 0.5, 4)
+        engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
 
     engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
