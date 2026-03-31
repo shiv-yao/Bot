@@ -12,7 +12,9 @@ from app.alpha.smart_money import smart_money_score
 from app.alpha.liquidity import liquidity_score
 from app.alpha.regime import detect_regime
 from app.alpha.combiner import combine_scores
+
 from app.portfolio.allocator import get_position_size
+from app.portfolio.portfolio_manager import portfolio
 
 TP = 0.045
 SL = -0.008
@@ -36,7 +38,19 @@ def calc_drawdown() -> float:
 
 
 def portfolio_can_add_more() -> bool:
-    return len(engine.positions) < 3
+    return portfolio.can_add_more(engine, max_exposure=0.75)
+
+
+def choose_source_name(meta: dict) -> str:
+    b = float(meta.get("breakout", 0.0))
+    s = float(meta.get("smart_money", 0.0))
+    l = float(meta.get("liquidity", 0.0))
+
+    if s >= b and s >= l:
+        return "smart_money"
+    if l >= b and l >= s:
+        return "liquidity"
+    return "breakout"
 
 
 def buy(mint: str, price: float, score: float, size: float, meta: dict):
@@ -76,6 +90,7 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         f"score={score:.4f} "
         f"risk_adj={risk_adj:.2f} "
         f"regime={engine.regime} "
+        f"src={meta['source']} "
         f"b={meta['breakout']:.3f} "
         f"s={meta['smart_money']:.3f} "
         f"l={meta['liquidity']:.3f} "
@@ -112,8 +127,7 @@ def sell(pos: dict, price: float, reason: str):
 
     engine.log(
         f"SELL {pos['mint'][:6]} "
-        f"{reason} pnl={pnl:.4f} "
-        f"cap={engine.capital:.4f}"
+        f"{reason} pnl={pnl:.4f} cap={engine.capital:.4f}"
     )
 
 
@@ -186,6 +200,7 @@ async def evaluate_token(token: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
+    # ===== 三策略分數 =====
     b = breakout_score(token)
     s = smart_money_score(token)
     l = liquidity_score(token)
@@ -242,14 +257,27 @@ async def evaluate_token(token: dict):
         del candidates[mint]
         return
 
-    size = get_position_size(score, engine.capital, engine)
+    source = choose_source_name({
+        "breakout": b,
+        "smart_money": s,
+        "liquidity": l,
+    })
 
-    # 舊 per-trade risk gate
+    # ===== 兩層 sizing：allocator + portfolio =====
+    base_size = get_position_size(score, engine.capital, engine)
+    portfolio_size = portfolio.weighted_position_size(
+        engine=engine,
+        source=source,
+        base_risk_pct=0.08,
+        max_position_size=0.12,
+        min_position_size=0.02,
+    )
+    size = min(base_size, portfolio_size)
+
     if not allow(engine, score, size):
         del candidates[mint]
         return
 
-    # 新 RiskEngine 全局風控再擋一次
     allow_trade, reason = risk_engine.allow_trade(
         equity=engine.capital,
         loss_streak=engine.stats.get("losses", 0),
@@ -266,6 +294,7 @@ async def evaluate_token(token: dict):
         score=score,
         size=size,
         meta={
+            "source": source,
             "breakout": b,
             "smart_money": s,
             "liquidity": l,
@@ -294,13 +323,11 @@ async def main_loop():
             drawdown = calc_drawdown()
             engine.log(f"DRAWDOWN {drawdown:.4f}")
 
-            # 舊版硬冷卻保留
             if engine.capital < engine.peak_capital * 0.95:
                 engine.log("HARD_COOLDOWN")
                 await asyncio.sleep(10)
                 continue
 
-            # 新版全局風控檢查
             allow_trade, reason = risk_engine.allow_trade(
                 equity=engine.capital,
                 loss_streak=engine.stats.get("losses", 0),
