@@ -11,6 +11,11 @@ from config.settings import SETTINGS
 
 SOL = "So11111111111111111111111111111111111111112"
 
+# ===== v2 控制 =====
+LAST_TRADE = {}
+COOLDOWN = 60  # 秒
+MAX_TRADES = 20
+
 
 def log(msg):
     msg = str(msg)
@@ -25,6 +30,19 @@ async def process(item):
         if not m:
             return
 
+        now = asyncio.get_event_loop().time()
+
+        # ===== 每日交易上限 =====
+        if engine.stats.get("executed", 0) >= MAX_TRADES:
+            log("MAX_TRADES_REACHED")
+            return
+
+        # ===== 冷卻機制 =====
+        last = LAST_TRADE.get(m, 0)
+        if now - last < COOLDOWN:
+            log(f"COOLDOWN {m[:6]}")
+            return
+
         log(f"PROCESSING: {item}")
         engine.stats["signals"] += 1
 
@@ -35,16 +53,16 @@ async def process(item):
         engine.regime = regime.mode
         score *= regime.multiplier()
 
-        # ===== debug 關鍵 =====
+        # ===== debug =====
         log(f"SCORE {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
 
-        # ===== 先固定門檻測試 =====
+        # ===== 放寬門檻（先讓系統動起來）=====
         if score < 0.012:
             engine.stats["rejected"] += 1
             log(f"REJECT {m[:6]} score={score:.4f} thr=0.012")
             return
 
-        # ===== 保守版小額 =====
+        # ===== 小額測試 =====
         lamports = 200000  # 0.0002 SOL
 
         # ===== quote =====
@@ -57,11 +75,19 @@ async def process(item):
         out_amount = int(q.get("outAmount", 0) or 0)
         impact = float(q.get("priceImpactPct", 0) or 0)
 
+        # ===== 無流動性 =====
         if out_amount <= 0:
             engine.stats["rejected"] += 1
             log(f"NO_LIQ_ROUTE {m[:8]}")
             return
 
+        # ===== 太小單（垃圾幣）=====
+        if out_amount < 50:
+            engine.stats["rejected"] += 1
+            log(f"TOO_SMALL {m[:6]} out={out_amount}")
+            return
+
+        # ===== 高滑點拒絕 =====
         if impact > SETTINGS["LIQUIDITY_IMPACT_MAX"]:
             engine.stats["rejected"] += 1
             log(f"HIGH_IMPACT {m[:8]} impact={impact:.4f}")
@@ -73,14 +99,14 @@ async def process(item):
             f"impact={impact:.4f}"
         )
 
-        # ===== swap tx =====
+        # ===== 產生交易 =====
         o = await order(SOL, m, lamports, quote=q)
         if not o or not o.get("transaction"):
             engine.stats["rejected"] += 1
             log(f"ORDER_FAIL {m[:8]} data={o}")
             return
 
-        # ===== Paper execution =====
+        # ===== PAPER EXEC =====
         log(
             f"PAPER_EXEC {m[:8]} "
             f"score={score:.4f} "
@@ -89,6 +115,10 @@ async def process(item):
             f"out={out_amount}"
         )
 
+        # ===== 記錄冷卻 =====
+        LAST_TRADE[m] = now
+
+        # ===== 模擬 pnl =====
         pnl = score - 0.01
         tuner.update(pnl)
         engine.threshold = tuner.threshold
@@ -101,7 +131,7 @@ async def process(item):
             "regime": engine.regime,
             "impact": impact,
             "outAmount": out_amount,
-            "mode": "paper_stable_debug",
+            "mode": "paper_v2_stable",
         })
 
         engine.stats["executed"] += 1
