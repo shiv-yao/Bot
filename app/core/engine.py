@@ -317,7 +317,6 @@ async def manage_positions():
 
     engine.positions = remaining
 
-
 async def evaluate_route(route: dict):
     global last_trade_time
 
@@ -338,6 +337,10 @@ async def evaluate_route(route: dict):
     s = smart_money_score(token)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
+
+    # fallback：鏈上 wallet 還抓不到時，先用 smart_money 補
+    if insider == 0:
+        insider = round(s * 0.5, 4)
 
     engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
