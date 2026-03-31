@@ -1,6 +1,14 @@
+import os
 import httpx
 
-QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+
+
+def _headers():
+    return {
+        "x-api-key": os.getenv("JUP_API_KEY", "").strip(),
+        "Accept": "application/json",
+    }
 
 
 async def get_quote(input_mint, output_mint, amount):
@@ -12,25 +20,27 @@ async def get_quote(input_mint, output_mint, amount):
             "slippageBps": "80",
         }
 
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(QUOTE_URL, params=params)
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                QUOTE_URL,
+                params=params,
+                headers=_headers(),
+            )
 
         if r.status_code != 200:
-            print("QUOTE ERROR:", r.status_code, r.text)
+            print("QUOTE ERROR STATUS:", r.status_code)
+            print("QUOTE ERROR BODY:", r.text[:500])
             return None
 
         data = r.json()
 
-        routes = data.get("data", [])
-        if not routes:
-            print("NO ROUTES")
+        # swap/v1/quote 不是 v6 的 data[0] 結構
+        if not data or not data.get("outAmount"):
+            print("NO ROUTE:", data)
             return None
 
-        best = routes[0]
-
-        print("QUOTE_OK", output_mint[:8], "out=", best.get("outAmount"))
-
-        return best
+        print("QUOTE_OK", output_mint[:8], "out=", data.get("outAmount"))
+        return data
 
     except Exception as e:
         print("QUOTE EXCEPTION:", e)
