@@ -2,99 +2,130 @@ import asyncio
 import time
 
 from app.core.state import engine
-from app.core.scanner import fetch_tokens
+from app.core.scanner import scan
 from app.core.pricing import get_price
-from app.core.execution import buy, sell
 from app.core.risk import allow
 
-from app.alpha.alpha_engine import compute_alpha
-from app.alpha.smart_wallet import flow_score, update_flow
-from app.portfolio.allocator import dynamic_size
-
-TP = 0.04
-SL = -0.02
-TRAIL = 0.02
-COOLDOWN = 60
+TP = 0.02
+SL = -0.01
+TRAIL = 0.008
+COOLDOWN = 20
+BASE_SIZE = 0.1
 
 cooldown = {}
 
-def manage(prices):
-    new = []
 
-    for p in engine.positions:
-        price = prices.get(p["mint"])
-        if not price:
-            new.append(p)
-            continue
+def score_token(token: dict) -> float:
+    volume = float(token.get("volume", 0))
+    change = float(token.get("change", 0))
 
-        pnl = (price - p["entry"]) / p["entry"]
+    vol_score = min(volume / 100000.0, 1.0) * 0.4
+    change_score = min(change / 10.0, 1.0) * 0.6
+    return vol_score + change_score
 
-        if price > p["peak"]:
-            p["peak"] = price
 
-        dd = (price - p["peak"]) / p["peak"]
+def buy(mint: str, price: float):
+    engine.capital -= BASE_SIZE
+    engine.positions.append({
+        "mint": mint,
+        "entry": price,
+        "peak": price,
+        "size": BASE_SIZE,
+        "time": time.time(),
+    })
+    engine.stats["executed"] += 1
+    engine.log(f"BUY {mint[:6]} price={price:.4f} cap={engine.capital:.4f}")
 
-        engine.log(f"CHECK {p['mint'][:6]} pnl={pnl:.4f}")
 
-        if pnl >= TP or pnl <= SL or dd <= -TRAIL:
-            sell(p, price)
-            continue
+def sell(pos: dict, price: float, reason: str):
+    pnl = (price - pos["entry"]) / pos["entry"]
+    engine.capital += pos["size"] * (1 + pnl)
+    engine.log(
+        f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}"
+    )
 
-        new.append(p)
 
-    engine.positions = new
+async def manage_positions():
+    now = time.time()
+    remaining = []
+
+    for pos in engine.positions:
+        try:
+            price = await get_price(pos["mint"])
+
+            if price > pos["peak"]:
+                pos["peak"] = price
+
+            pnl = (price - pos["entry"]) / pos["entry"]
+            dd = (price - pos["peak"]) / pos["peak"]
+
+            engine.log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
+
+            if pnl >= TP:
+                sell(pos, price, "TP")
+                continue
+
+            if pnl <= SL:
+                sell(pos, price, "SL")
+                continue
+
+            if pos["peak"] > pos["entry"] and dd <= -TRAIL:
+                sell(pos, price, "TRAIL")
+                continue
+
+            # 保底時間出場，避免卡倉
+            if now - pos["time"] > 30:
+                sell(pos, price, "TIME")
+                continue
+
+            remaining.append(pos)
+
+        except Exception as e:
+            engine.stats["errors"] += 1
+            engine.log(f"MANAGE_ERR {e}")
+            remaining.append(pos)
+
+    engine.positions = remaining
 
 
 async def main_loop():
-    while True:
+    engine.log("ENGINE STARTED")
+
+    while engine.running:
         try:
-            update_flow()
+            await manage_positions()
 
-            tokens = await fetch_tokens()
+            tokens = await scan()
 
-            prices = {}
-            for t in tokens:
-                p = await get_price(t["mint"])
-                if p:
-                    prices[t["mint"]] = p
-
-            manage(prices)
-
-            for t in tokens:
+            for token in tokens:
+                mint = token["mint"]
                 engine.stats["signals"] += 1
 
-                mint = t["mint"]
-
                 if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
+                    engine.log(f"COOLDOWN {mint[:6]}")
                     continue
 
-                price = prices.get(mint)
-                if not price:
-                    continue
+                s = score_token(token)
+                engine.log(f"SCORE {mint[:6]} {s:.4f}")
 
-                flow = flow_score()
-
-                s = compute_alpha(
-                    t["volume"],
-                    t["change"],
-                    flow
-                )
-
-                if s < 0.02:
+                if s < 0.35:
                     engine.stats["rejected"] += 1
+                    engine.log(f"REJECT {mint[:6]}")
+                    continue
+
+                if any(p["mint"] == mint for p in engine.positions):
+                    engine.log(f"ALREADY_HELD {mint[:6]}")
                     continue
 
                 if not allow(engine):
                     continue
 
-                size = dynamic_size(s, engine.capital)
-
-                buy(mint, price, size)
-
+                price = await get_price(token)
+                buy(mint, price)
                 cooldown[mint] = time.time()
 
         except Exception as e:
             engine.stats["errors"] += 1
-            engine.log(f"ERR {e}")
+            engine.log(f"LOOP_ERR {e}")
 
-        await asyncio.sleep(6)
+        await asyncio.sleep(3)
