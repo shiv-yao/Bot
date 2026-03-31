@@ -25,48 +25,108 @@ from app.core.position_manager import manage_position
 TP = 0.045
 SL = -0.008
 TRAIL = 0.004
-
 TRADE_INTERVAL = 12
 
 last_trade_time = 0
 recent_changes = []
 
 
-def calc_drawdown():
+def calc_drawdown() -> float:
     if engine.peak_capital <= 0:
         return 0.0
     return (engine.capital - engine.peak_capital) / engine.peak_capital
 
 
-def portfolio_can_add_more():
+def portfolio_can_add_more() -> bool:
     return portfolio.can_add_more(engine, max_exposure=0.75)
 
 
-def build_source_stats(history):
+def build_source_stats(history: list[dict]) -> dict:
     stats = {}
 
     for t in history:
         src = t.get("meta", {}).get("source", "unknown")
-        pnl = float(t.get("pnl", 0))
+        pnl = float(t.get("pnl", 0.0) or 0.0)
 
         if src not in stats:
-            stats[src] = {"count": 0, "wins": 0, "pnl": 0}
+            stats[src] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+            }
 
         stats[src]["count"] += 1
         stats[src]["pnl"] += pnl
 
         if pnl >= 0:
             stats[src]["wins"] += 1
+        else:
+            stats[src]["losses"] += 1
 
-    for s in stats:
-        c = stats[s]["count"]
-        stats[s]["win_rate"] = stats[s]["wins"] / max(c, 1)
-        stats[s]["avg_pnl"] = stats[s]["pnl"] / max(c, 1)
+    for src, row in stats.items():
+        count = max(int(row["count"]), 1)
+        row["win_rate"] = row["wins"] / count
+        row["avg_pnl"] = row["pnl"] / count
 
     return stats
 
 
-def record_trade(pos, price, reason):
+def build_insider_perf(history: list[dict], threshold: float = 0.30) -> dict:
+    buckets = {
+        "high_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+        "low_insider": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+    }
+
+    for t in history:
+        meta = t.get("meta", {}) or {}
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        insider = float(meta.get("insider", 0.0) or 0.0)
+
+        name = "high_insider" if insider >= threshold else "low_insider"
+        row = buckets[name]
+
+        row["count"] += 1
+        row["total_pnl"] += pnl
+
+        if pnl >= 0:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+
+    for row in buckets.values():
+        count = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / count
+        row["win_rate"] = row["wins"] / count
+
+    return {
+        "high_insider": buckets["high_insider"],
+        "low_insider": buckets["low_insider"],
+        "comparison": {
+            "avg_pnl_diff": buckets["high_insider"]["avg_pnl"] - buckets["low_insider"]["avg_pnl"],
+            "win_rate_diff": buckets["high_insider"]["win_rate"] - buckets["low_insider"]["win_rate"],
+            "threshold": threshold,
+        },
+    }
+
+
+def record_trade(pos: dict, price: float, reason: str) -> float:
     pnl = (price - pos["entry"]) / pos["entry"]
 
     engine.trade_history.append({
@@ -89,7 +149,7 @@ def record_trade(pos, price, reason):
     return pnl
 
 
-def buy(mint, price, score, size, meta):
+def buy(mint: str, price: float, score: float, size: float, meta: dict):
     global last_trade_time
 
     engine.capital -= size
@@ -111,7 +171,7 @@ def buy(mint, price, score, size, meta):
 
     record_wallet_trade("SIM_WALLET", mint, "buy", size)
 
-    engine.stats["executed"] += 1
+    engine.stats["executed"] = engine.stats.get("executed", 0) + 1
     last_trade_time = now
     risk_engine.record_trade()
 
@@ -135,7 +195,7 @@ def buy(mint, price, score, size, meta):
     )
 
 
-def sell(pos, price, reason):
+def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
@@ -145,7 +205,7 @@ def sell(pos, price, reason):
     )
 
 
-def partial_sell(pos, price, ratio):
+def partial_sell(pos: dict, price: float, ratio: float):
     sell_size = pos["size"] * ratio
     pnl = (price - pos["entry"]) / pos["entry"]
 
@@ -170,9 +230,8 @@ def partial_sell(pos, price, ratio):
     )
 
 
-def add_winner(pos, price, ratio):
+def add_winner(pos: dict, price: float, ratio: float):
     add_size = pos["size"] * ratio * 0.5
-
     if engine.capital < add_size:
         return
 
@@ -183,6 +242,7 @@ def add_winner(pos, price, ratio):
 
     pos["entry"] = (pos["entry"] * old_size + price * add_size) / new_size
     pos["size"] = new_size
+    pos["peak"] = max(pos.get("peak", price), price)
 
     record_wallet_trade("SIM_WALLET", pos["mint"], "buy", add_size)
 
@@ -215,12 +275,15 @@ async def manage_positions():
             for act, ratio in actions:
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
+
                 elif act == "add":
                     add_winner(pos, price, ratio)
+
                 elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
                     sold = True
                     break
+
                 elif act == "breakeven":
                     engine.log(
                         f"BREAKEVEN {pos['mint'][:6]} "
@@ -255,13 +318,12 @@ async def manage_positions():
     engine.positions = remaining
 
 
-async def evaluate_route(route):
+async def evaluate_route(route: dict):
     global last_trade_time
 
     token = route["token"]
     mint = route["mint"]
     source = route["source"]
-
     now = time.time()
 
     if now - last_trade_time < TRADE_INTERVAL:
@@ -274,8 +336,9 @@ async def evaluate_route(route):
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
-    stats = build_source_stats(engine.trade_history)
-    weights = get_dynamic_weights(stats)
+    source_stats = build_source_stats(engine.trade_history)
+    insider_perf = build_insider_perf(engine.trade_history)
+    weights = get_dynamic_weights(source_stats, insider_perf)
 
     score = combine_scores(
         breakout=b,
@@ -283,7 +346,8 @@ async def evaluate_route(route):
         liquidity=l,
         insider=insider,
         regime=engine.regime,
-        source_stats=stats,
+        source_stats=source_stats,
+        insider_perf=insider_perf,
     )
 
     engine.log(
@@ -311,12 +375,26 @@ async def evaluate_route(route):
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
-    size = min(base, cap)
+
+    # insider 高分可加一點倉，但仍受 portfolio cap 限制
+    insider_boost = 1.0
+    if insider >= 0.50:
+        insider_boost = 1.20
+    elif insider >= 0.30:
+        insider_boost = 1.10
+
+    size = min(base * insider_boost, cap)
 
     if not allow(engine, score, size):
         return
 
-    ok, _ = should_enter(token, {"momentum": 0.01, "smart_money": s})
+    ok, _ = should_enter(
+        token,
+        {
+            "momentum": 0.01,
+            "smart_money": s,
+        }
+    )
     if not ok:
         return
 
