@@ -1,4 +1,5 @@
 import asyncio
+from app.execution.quote import get_quote
 from app.execution.jupiter import order
 from app.core.state import engine
 
@@ -19,17 +20,16 @@ async def process(item):
 
         log(f"PROCESSING: {item}")
 
-        # 👉 假設你前面已有 quote
-        quote = item.get("quote")
+        lamports = 200000  # 小額測試
+
+        # 🔥 取得 quote
+        quote = await get_quote(SOL, m, lamports)
 
         if not quote:
             log(f"NO_QUOTE {m[:8]}")
             return
 
-        lamports = 200000  # 固定小額
-
-        log(f"TRY_ORDER {m[:8]} size={lamports}")
-
+        # 🔥 呼叫 Jupiter swap
         o = await order(SOL, m, lamports, quote=quote)
 
         if not o or not o.get("transaction"):
@@ -50,7 +50,6 @@ async def safe_cycle():
     print("scanning...")
 
     try:
-        # 👉 你自己的來源（pump / mempool）
         from app.sources.pump import fetch_pump_candidates
 
         items = await fetch_pump_candidates()
