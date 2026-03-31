@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+from app.alpha.smart_wallets import record_wallet_trade
 from app.core.state import engine
 from app.core.scanner import scan
 from app.core.pricing import get_price
@@ -197,7 +198,12 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
 
 def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
+
+    # 🔥 關鍵：讓系統學這筆交易
+    record_wallet_trade("SIM_WALLET", pos["mint"], pnl)
+
     engine.capital += pos["size"] * (1 + pnl)
+
     engine.log(
         f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} "
         f"src={pos.get('meta', {}).get('source', 'unknown')} "
