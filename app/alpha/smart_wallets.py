@@ -1,7 +1,6 @@
 from collections import defaultdict
 import time
 
-# wallet -> stats
 wallet_stats = defaultdict(lambda: {
     "wins": 0,
     "losses": 0,
@@ -9,14 +8,10 @@ wallet_stats = defaultdict(lambda: {
     "last_seen": 0,
 })
 
-# token -> wallets
 token_wallet_map = defaultdict(set)
 
 
 def record_wallet_trade(wallet: str, mint: str, pnl: float):
-    """
-    記錄某 wallet 在某 token 的表現
-    """
     if not wallet:
         return
 
@@ -45,14 +40,8 @@ def wallet_score(wallet: str) -> float:
     win_rate = s["wins"] / total
     avg_pnl = s["pnl"] / total
 
-    score = (win_rate * 0.6) + (avg_pnl * 0.4)
-
+    score = (win_rate * 0.7) + (avg_pnl * 0.3)
     return max(min(score, 1.0), 0.0)
-
-
-def get_top_wallets(limit=50):
-    ranked = sorted(wallet_stats.items(), key=lambda x: wallet_score(x[0]), reverse=True)
-    return [w for w, _ in ranked[:limit]]
 
 
 def get_token_smart_score(mint: str) -> float:
@@ -61,7 +50,6 @@ def get_token_smart_score(mint: str) -> float:
         return 0.0
 
     scores = [wallet_score(w) for w in wallets]
-
     if not scores:
         return 0.0
 
