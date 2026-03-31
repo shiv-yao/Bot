@@ -9,9 +9,11 @@ def home():
 # 🔥 延遲 import（關鍵）
 @app.on_event("startup")
 async def start():
-    try:
-        import asyncio
-        from app.core.engine import main_loop
-        asyncio.create_task(main_loop())
-    except Exception as e:
-        print("ENGINE FAIL:", e)
+    import asyncio
+
+    async def test_loop():
+        while True:
+            print("engine alive")
+            await asyncio.sleep(5)
+
+    asyncio.create_task(test_loop())
