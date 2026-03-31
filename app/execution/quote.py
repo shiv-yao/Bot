@@ -34,7 +34,6 @@ async def get_quote(input_mint, output_mint, amount):
 
         data = r.json()
 
-        # swap/v1/quote 不是 v6 的 data[0] 結構
         if not data or not data.get("outAmount"):
             print("NO ROUTE:", data)
             return None
