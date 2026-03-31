@@ -25,7 +25,6 @@ def early_wallet_score(mint: str) -> float:
     if not wallets:
         return 0.0
 
-    # 越少人越 insider
     count = len(wallets)
     if count <= 2:
         return 1.0
@@ -38,16 +37,8 @@ def early_wallet_score(mint: str) -> float:
 
 
 def get_token_insider_score(mint: str) -> float:
-    """
-    v2 insider:
-    - smart wallet（績效）
-    - early wallet（鏈上早期）
-    """
-
     smart = get_token_smart_score(mint)
     early = early_wallet_score(mint)
 
-    # 融合
     score = (smart * 0.7) + (early * 0.3)
-
     return round(score, 4)
