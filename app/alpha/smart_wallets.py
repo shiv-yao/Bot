@@ -54,3 +54,11 @@ def get_token_smart_score(mint: str) -> float:
         return 0.0
 
     return round(sum(scores) / len(scores), 4)
+
+
+def get_best_wallet(wallets: list[str]) -> str | None:
+    if not wallets:
+        return None
+
+    ranked = sorted(wallets, key=wallet_score, reverse=True)
+    return ranked[0] if ranked else None
