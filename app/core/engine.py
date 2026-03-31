@@ -53,13 +53,26 @@ async def pump_loop():
         except Exception as ex:
             engine.stats["errors"] += 1; log(f"PUMP_ERR {ex}")
         await asyncio.sleep(20)
+import asyncio
 
 async def main_loop():
-    load_wallets()
-    async def handler(e):
+    print("ENGINE LOOP START")
+
+    while True:
         try:
-            await process(e, source="mempool")
-        except Exception as ex:
-            engine.stats["errors"] += 1; log(f"ERR {ex}")
-    asyncio.create_task(pump_loop())
-    await stream(handler)
+            await safe_cycle()
+        except Exception as e:
+            print("LOOP ERROR:", e)
+            await asyncio.sleep(2)
+
+
+# 👉 你的原本邏輯丟進這裡
+async def safe_cycle():
+    print("scanning...")
+
+    # 🔥 這裡放：
+    # mempool
+    # alpha
+    # execution
+
+    await asyncio.sleep(2)
