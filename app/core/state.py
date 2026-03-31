@@ -2,6 +2,7 @@ class EngineState:
     def __init__(self):
         self.running = True
         self.capital = 1.0
+        self.peak_capital = 1.0
         self.positions = []
         self.logs = []
         self.stats = {
