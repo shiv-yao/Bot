@@ -15,9 +15,9 @@ from app.alpha.combiner import combine_scores, get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
-
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
+from app.alpha.helius_wallet_tracker import update_token_wallets
 
 TP = 0.045
 SL = -0.008
@@ -241,6 +241,13 @@ async def evaluate_route(route: dict):
 
     if now - last_trade_time < TRADE_INTERVAL:
         return
+
+    # 先背景更新這個 token 的真 wallet 資料
+asyncio.create_task(update_token_wallets(token["mint"]))
+
+b = breakout_score(token)
+s = smart_money_score(token)
+l = liquidity_score(token)
 
     b = breakout_score(token)
     s = smart_money_score(token)
