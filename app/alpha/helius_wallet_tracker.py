@@ -2,6 +2,7 @@ import os
 import httpx
 from collections import defaultdict
 from app.alpha.wallet_graph import update_graph
+from app.alpha.insider_engine import record_early_wallets
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
@@ -57,7 +58,7 @@ async def fetch_token_trades(mint: str) -> list[str]:
 
 async def update_token_wallets(mint: str):
     """
-    更新某 token 的 wallet 持有人，並同步更新 wallet graph。
+    更新某 token 的 wallet 持有人，並同步更新 wallet graph + insider engine。
     """
     wallets = await fetch_token_trades(mint)
     if not wallets:
@@ -68,6 +69,9 @@ async def update_token_wallets(mint: str):
 
     # 同步更新資金網
     update_graph(mint, wallets)
+
+    # 記錄最早 wallet
+    record_early_wallets(mint, wallets)
 
 
 def get_wallets_for_token(mint: str) -> list[str]:
