@@ -6,11 +6,11 @@ from app.core.scanner import scan
 from app.core.pricing import get_price
 from app.core.risk import allow, kill_switch
 
-TP = 0.04
+TP = 0.045
 SL = -0.008
 TRAIL = 0.004
 
-COOLDOWN = 25
+COOLDOWN = 30
 
 cooldown = {}
 candidates = {}
@@ -18,9 +18,6 @@ recent_changes = []
 last_trade_time = 0
 
 
-# =========================
-# 🔥 分級 scoring
-# =========================
 def score_token(token: dict) -> float:
     volume = float(token.get("volume", 0))
     change = float(token.get("change", 0))
@@ -36,8 +33,7 @@ def get_size(score: float) -> float:
         return 0.12
     elif score >= 0.55:
         return 0.08
-    else:
-        return 0.05
+    return 0.05
 
 
 def buy(mint: str, price: float, score: float):
@@ -58,18 +54,14 @@ def buy(mint: str, price: float, score: float):
     engine.stats["executed"] += 1
     last_trade_time = time.time()
 
-    engine.log(
-        f"BUY {mint[:6]} price={price:.4f} size={size:.3f} cap={engine.capital:.4f}"
-    )
+    engine.log(f"BUY {mint[:6]} price={price:.4f} size={size:.3f} cap={engine.capital:.4f}")
 
 
 def sell(pos: dict, price: float, reason: str):
     pnl = (price - pos["entry"]) / pos["entry"]
     engine.capital += pos["size"] * (1 + pnl)
 
-    engine.log(
-        f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}"
-    )
+    engine.log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
 
 
 async def manage_positions():
@@ -88,24 +80,20 @@ async def manage_positions():
 
             engine.log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
 
-            # TP
             if pnl >= TP:
                 sell(pos, price, "TP")
                 continue
 
-            # SL
             if pnl <= SL:
                 sell(pos, price, "SL")
                 continue
 
-            # 🔥 分段 trailing（關鍵）
-            if pnl >= 0.015:
-                if dd <= -TRAIL:
-                    sell(pos, price, "TRAIL")
-                    continue
+            # 🔥 trailing only after profit
+            if pnl >= 0.015 and dd <= -TRAIL:
+                sell(pos, price, "TRAIL")
+                continue
 
-            # TIME EXIT
-            if now - pos["time"] > 45:
+            if now - pos["time"] > 50:
                 sell(pos, price, "TIME")
                 continue
 
@@ -132,7 +120,7 @@ async def main_loop():
             await manage_positions()
 
             # =========================
-            # Drawdown
+            # drawdown control
             # =========================
             if engine.capital > engine.peak_capital:
                 engine.peak_capital = engine.capital
@@ -140,22 +128,28 @@ async def main_loop():
             dd = (engine.capital - engine.peak_capital) / engine.peak_capital
             engine.log(f"DRAWDOWN {dd:.4f}")
 
+            # 🔥 連敗保護
+            if engine.capital < engine.peak_capital * 0.97:
+                engine.log("LOSS_COOLDOWN")
+                await asyncio.sleep(5)
+                continue
+
             tokens = await scan()
 
             # =========================
-            # 市場判斷
+            # 🔥 市場判斷（更嚴格）
             # =========================
             for t in tokens:
                 recent_changes.append(float(t.get("change", 0)))
 
-            if len(recent_changes) > 30:
-                recent_changes = recent_changes[-30:]
+            if len(recent_changes) > 40:
+                recent_changes = recent_changes[-40:]
 
-            if len(recent_changes) > 5:
+            if len(recent_changes) > 10:
                 market_vol = sum(abs(x) for x in recent_changes) / len(recent_changes)
 
-                if market_vol < 1.5:
-                    engine.log("MARKET_FLAT")
+                if market_vol < 2.2:
+                    engine.log("MARKET_BAD")
                     await asyncio.sleep(2)
                     continue
 
@@ -178,7 +172,6 @@ async def main_loop():
                 score = score_token(token)
                 engine.log(f"SCORE {mint[:6]} {score:.4f}")
 
-                # 🔥 分級邏輯
                 if score < 0.5:
                     engine.log(f"REJECT {mint[:6]}")
                     engine.stats["rejected"] += 1
@@ -190,42 +183,33 @@ async def main_loop():
                 if not allow(engine):
                     continue
 
-                # 控制頻率
-                if time.time() - last_trade_time < 5:
+                # 🔥 降低頻率
+                if time.time() - last_trade_time < 8:
                     continue
 
                 now = time.time()
 
                 # =========================
-                # 🔥 高分直接進
+                # 🔥 全部都要 momentum（重點）
                 # =========================
-                if score >= 0.60:
-                    price = await get_price(token)
-                    buy(mint, price, score)
-                    cooldown[mint] = now
-                    continue
+                price_now = await get_price(token)
 
-                # =========================
-                # 中分 → candidate
-                # =========================
                 if mint not in candidates:
                     candidates[mint] = {
                         "time": now,
-                        "price": await get_price(token),
+                        "price": price_now,
                     }
                     engine.log(f"CANDIDATE {mint[:6]}")
                     continue
 
-                if now - candidates[mint]["time"] < 3:
+                if now - candidates[mint]["time"] < 2:
                     continue
 
-                price_now = await get_price(token)
-                price_old = candidates[mint]["price"]
+                old = candidates[mint]["price"]
+                momentum = (price_now - old) / old
 
-                momentum = (price_now - price_old) / price_old
-
-                if momentum < 0.003:
-                    engine.log(f"WEAK_MOMENTUM {mint[:6]}")
+                if momentum < 0.004:
+                    engine.log(f"STRONG_REJECT {mint[:6]}")
                     del candidates[mint]
                     continue
 
