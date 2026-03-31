@@ -1,8 +1,8 @@
 import asyncio
 
 from app.alpha.alpha import alpha
-from app.execution.jupiter import order, safe_jupiter_call
-from app.execution.jito import send_bundle
+from app.data.market import get_quote
+from app.execution.jupiter import order
 from app.regime.regime import regime
 from app.ai.tuner import tuner
 from app.risk.liquidity import liquidity_ok
@@ -14,7 +14,6 @@ from app.sources.pump import fetch_pump_candidates
 SOL = "So11111111111111111111111111111111111111112"
 
 
-# ================= LOG =================
 def log(msg: str):
     msg = str(msg)
     print(msg)
@@ -22,21 +21,22 @@ def log(msg: str):
     engine.logs = engine.logs[-500:]
 
 
-# ================= PROCESS =================
 async def process(e, source="pump"):
     try:
         m = e.get("mint")
         if not m:
             return
 
+        log(f"PROCESSING: {e}")
         engine.stats["signals"] += 1
 
-        # ===== 風控 =====
+        # ===== 流動性 =====
         if not await liquidity_ok(m):
             engine.stats["rejected"] += 1
             log(f"REJECT_LIQ {m[:6]}")
             return
 
+        # ===== anti-rug =====
         if not await anti_rug(m):
             engine.stats["rejected"] += 1
             log(f"REJECT_RUG {m[:6]}")
@@ -49,7 +49,6 @@ async def process(e, source="pump"):
         engine.regime = regime.mode
         score *= regime.multiplier()
 
-        # 🔥 關鍵 log（你剛剛問的就在這）
         if score < tuner.threshold:
             engine.stats["rejected"] += 1
             log(f"REJECT {m[:6]} score={score:.4f} thr={tuner.threshold:.4f}")
@@ -57,29 +56,39 @@ async def process(e, source="pump"):
 
         # ===== 多錢包 =====
         for wallet_name, weight in wallet_scale().items():
-            size = 0.002 * regime.multiplier() * weight
+            # Debug 先縮很小，避免餘額問題
+            size = 0.00001 * regime.multiplier() * weight
             lamports = int(size * 1e9)
 
-            # ===== Jupiter order =====
-            o = await order(SOL, m, lamports)
+            log(
+                f"TRY_ORDER {m[:8]} wallet={wallet_name} "
+                f"size={size:.8f} lamports={lamports} score={score:.4f}"
+            )
+
+            # ===== 先抓 quote =====
+            q = await get_quote(SOL, m, lamports)
+            if not q:
+                log(f"QUOTE_FAIL {m[:8]} wallet={wallet_name}")
+                continue
+
+            log(
+                f"QUOTE_OK {m[:8]} wallet={wallet_name} "
+                f"out={q.get('outAmount')} impact={q.get('priceImpactPct')}"
+            )
+
+            # ===== 用 quote 建 order =====
+            o = await order(SOL, m, lamports, quote=q)
             if not o or not o.get("transaction"):
-                log(f"ORDER_FAIL {m[:8]} wallet={wallet_name}")
+                log(f"ORDER_FAIL {m[:8]} wallet={wallet_name} data={o}")
                 continue
 
-            # ===== 安全執行 =====
-            res = await safe_jupiter_call(o)
-            if not res:
-                log(f"EXEC_FAIL {m[:8]} wallet={wallet_name}")
-                continue
+            # ===== Debug：先不 execute，先確認流程通到這 =====
+            log(
+                f"PAPER_EXEC {m[:8]} wallet={wallet_name} "
+                f"score={score:.4f} regime={engine.regime}"
+            )
 
-            # ===== Jito =====
-            try:
-                if await send_bundle(o):
-                    engine.stats["jito_sent"] += 1
-            except Exception as e:
-                log(f"JITO_ERR {e}")
-
-            # ===== PnL =====
+            # ===== PnL（debug 先保留簡化）=====
             pnl = score - 0.01
             tuner.update(pnl)
             engine.threshold = tuner.threshold
@@ -92,21 +101,16 @@ async def process(e, source="pump"):
                 "pnl": pnl,
                 "regime": engine.regime,
                 "source": source,
+                "mode": "paper_debug",
             })
 
             engine.stats["executed"] += 1
-
-            log(
-                f"EXEC {m[:8]} wallet={wallet_name} "
-                f"pnl={pnl:.4f} regime={engine.regime}"
-            )
 
     except Exception as ex:
         engine.stats["errors"] += 1
         log(f"PROCESS_ERR {ex}")
 
 
-# ================= SAFE CYCLE =================
 async def safe_cycle():
     print("scanning...")
 
@@ -115,7 +119,7 @@ async def safe_cycle():
         print("PUMP ITEMS:", items)
 
         for item in items:
-            print("PROCESSING:", item)
+            print("PROCESSING ITEM:", item)
             await process(item, source="pump")
 
     except Exception as e:
@@ -124,10 +128,8 @@ async def safe_cycle():
     await asyncio.sleep(5)
 
 
-# ================= MAIN LOOP =================
 async def main_loop():
     log("ENGINE LOOP START")
-
     load_wallets()
 
     while True:
