@@ -188,6 +188,7 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         f"s={meta.get('smart_money', 0):.3f} "
         f"l={meta.get('liquidity', 0):.3f} "
         f"ins={meta.get('insider', 0):.3f} "
+        f"wallet={meta.get('wallet')} "
         f"wb={weights.get('breakout', 0):.2f} "
         f"ws={weights.get('smart_money', 0):.2f} "
         f"wl={weights.get('liquidity', 0):.2f} "
@@ -199,14 +200,18 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
 def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
 
-    # 讓 smart wallet ranking 會學習
-    record_ranked_wallet_trade("SIM_WALLET", pos["mint"], pnl)
+    wallet = (pos.get("meta", {}) or {}).get("wallet")
+    if wallet:
+        record_ranked_wallet_trade(wallet, pos["mint"], pnl)
+    else:
+        record_ranked_wallet_trade("SIM_WALLET", pos["mint"], pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
         f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} "
         f"src={pos.get('meta', {}).get('source', 'unknown')} "
-        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
+        f"ins={pos.get('meta', {}).get('insider', 0):.3f} "
+        f"wallet={(pos.get('meta', {}) or {}).get('wallet')}"
     )
 
 
@@ -341,6 +346,9 @@ async def evaluate_route(route: dict):
     except Exception as e:
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
+    wallet_list = list(token_wallets.get(mint, set()))
+    lead_wallet = wallet_list[0] if wallet_list else None
+
     b = breakout_score(token)
     s = await smart_money_score(mint)
     l = liquidity_score(token)
@@ -351,6 +359,7 @@ async def evaluate_route(route: dict):
         engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
 
     engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
+    engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
@@ -429,6 +438,7 @@ async def evaluate_route(route: dict):
             "smart_money": s,
             "liquidity": l,
             "insider": insider,
+            "wallet": lead_wallet,
             "weights": weights,
         },
     )
