@@ -16,21 +16,16 @@ def record_early_wallets(mint: str, wallets: list[str]):
         return
 
     now = time.time()
-
     existing = {w for w, _ in token_early_wallets[mint]}
 
     for w in wallets[:5]:
         if w not in existing:
             token_early_wallets[mint].append((w, now))
 
-    # 只保留最早 10 個
     token_early_wallets[mint] = token_early_wallets[mint][:10]
 
 
 def mark_wallet_success(wallet: str):
-    """
-    當某早期 wallet 對應 token 後續表現不錯時，可累積 insider hit
-    """
     if wallet:
         wallet_insider_hits[wallet] += 1
 
@@ -41,43 +36,29 @@ def get_early_wallets(mint: str) -> list[str]:
 
 def get_wallet_insider_score(wallet: str) -> float:
     hits = wallet_insider_hits.get(wallet, 0)
-
     if hits <= 0:
         return 0.0
-
     return min(hits / 10.0, 1.0)
 
 
 def get_token_insider_score(mint: str) -> float:
+    """
+    先用最簡單、最穩定的版本：
+    只要 Helius 有抓到 wallet，就給 insider 分數。
+    """
     from app.alpha.helius_wallet_tracker import token_wallets
 
-    wallets = token_wallets.get(mint, [])
-
-    # 👉 最簡版本：只要有 wallet 就給分
+    wallets = list(token_wallets.get(mint, set()))
     if not wallets:
         return 0.0
 
-    # wallet 數量 → 分數
-    score = min(len(wallets) / 5, 1.0)
-
+    # 1~5 個 wallet -> 0.2 ~ 1.0
+    score = min(len(wallets) / 5.0, 1.0)
     return round(score, 4)
-
-    # 越早期且命中越多越高
-    avg = sum(scores) / len(scores)
-
-    # 早期 wallet 數越多不一定越好，小群先買更像 insider
-    crowd_penalty = 1.0
-    if len(wallets) >= 6:
-        crowd_penalty = 0.8
-    elif len(wallets) >= 9:
-        crowd_penalty = 0.6
-
-    return min(avg * crowd_penalty, 1.0)
 
 
 def get_insider_summary(mint: str) -> dict:
     wallets = token_early_wallets.get(mint, [])
-
     return {
         "count": len(wallets),
         "wallets": [w for w, _ in wallets[:10]],
