@@ -3,9 +3,7 @@ class EngineState:
         self.running = True
         self.capital = 1.0
         self.positions = []
-        self.trade_history = []
         self.logs = []
-
         self.stats = {
             "signals": 0,
             "executed": 0,
