@@ -1,13 +1,9 @@
 class EngineState:
     def __init__(self):
         self.running = True
-
         self.capital = 1.0
-        self.sol_balance = 0.0
-
         self.positions = []
         self.trade_history = []
-
         self.logs = []
 
         self.stats = {
@@ -18,6 +14,7 @@ class EngineState:
         }
 
     def log(self, msg):
+        msg = str(msg)
         print(msg)
         self.logs.append(msg)
         self.logs = self.logs[-200:]
