@@ -1,32 +1,30 @@
-# app/core/engine.py
-
 import asyncio
 import time
-import random
 
-from app.core import state
+from app.core.state import engine
 from app.core.scanner import fetch_tokens
 from app.core.pricing import get_price
-from app.core.execution import execute_buy, execute_sell
-from app.core.risk import allow_trade
+from app.core.execution import buy, sell
+from app.core.risk import allow
 
-ENTRY_THRESHOLD = 0.02
+from app.alpha.alpha_engine import compute_alpha
+from app.alpha.smart_wallet import flow_score, update_flow
+from app.portfolio.allocator import dynamic_size
+
 TP = 0.04
-SL = -0.025
+SL = -0.02
 TRAIL = 0.02
 COOLDOWN = 60
 
-def score(vol, change):
-    return (change/100)*0.6 + min(vol/1e6,1)*0.3 + random.random()*0.003
-
+cooldown = {}
 
 def manage(prices):
-    new_pos = []
+    new = []
 
-    for p in state.positions:
+    for p in engine.positions:
         price = prices.get(p["mint"])
         if not price:
-            new_pos.append(p)
+            new.append(p)
             continue
 
         pnl = (price - p["entry"]) / p["entry"]
@@ -36,20 +34,22 @@ def manage(prices):
 
         dd = (price - p["peak"]) / p["peak"]
 
-        state.logs.append(f"CHECK {p['mint'][:6]} pnl={pnl:.4f}")
+        engine.log(f"CHECK {p['mint'][:6]} pnl={pnl:.4f}")
 
         if pnl >= TP or pnl <= SL or dd <= -TRAIL:
-            execute_sell(p, price)
+            sell(p, price)
             continue
 
-        new_pos.append(p)
+        new.append(p)
 
-    state.positions = new_pos
+    engine.positions = new
 
 
 async def main_loop():
     while True:
         try:
+            update_flow()
+
             tokens = await fetch_tokens()
 
             prices = {}
@@ -61,33 +61,40 @@ async def main_loop():
             manage(prices)
 
             for t in tokens:
+                engine.stats["signals"] += 1
+
                 mint = t["mint"]
 
-                state.stats["signals"] += 1
-
-                if mint in state.cooldown and time.time() - state.cooldown[mint] < COOLDOWN:
+                if mint in cooldown and time.time() - cooldown[mint] < COOLDOWN:
                     continue
 
-                p = prices.get(mint)
-                if not p:
+                price = prices.get(mint)
+                if not price:
                     continue
 
-                s = score(t["volume"], t["change"])
+                flow = flow_score()
 
-                if s < ENTRY_THRESHOLD:
-                    state.stats["rejected"] += 1
+                s = compute_alpha(
+                    t["volume"],
+                    t["change"],
+                    flow
+                )
+
+                if s < 0.02:
+                    engine.stats["rejected"] += 1
                     continue
 
-                ok, reason = allow_trade(state)
-                if not ok:
-                    state.logs.append(reason)
+                if not allow(engine):
                     continue
 
-                execute_buy(mint, p, 0.01)
-                state.cooldown[mint] = time.time()
+                size = dynamic_size(s, engine.capital)
+
+                buy(mint, price, size)
+
+                cooldown[mint] = time.time()
 
         except Exception as e:
-            state.stats["errors"] += 1
-            state.logs.append(f"ERR {e}")
+            engine.stats["errors"] += 1
+            engine.log(f"ERR {e}")
 
         await asyncio.sleep(6)
