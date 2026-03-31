@@ -6,7 +6,6 @@ SWAP = "https://api.jup.ag/swap/v1/swap"
 
 def _headers():
     return {
-        "x-api-key": os.getenv("JUP_API_KEY", "").strip(),
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -27,7 +26,6 @@ async def order(input_mint, output_mint, amount, quote=None):
             "quoteResponse": quote,
             "userPublicKey": user_pk,
             "wrapAndUnwrapSol": True,
-            "dynamicComputeUnitLimit": True,
         }
 
         print("SWAP PAYLOAD:", payload)
@@ -41,6 +39,7 @@ async def order(input_mint, output_mint, amount, quote=None):
             return None
 
         data = r.json()
+
         print("SWAP RESPONSE:", data)
 
         swap_tx = data.get("swapTransaction")
@@ -48,7 +47,6 @@ async def order(input_mint, output_mint, amount, quote=None):
             print("SWAP NO TX:", data)
             return None
 
-        # 統一成 engine 看得懂的格式
         return {
             "transaction": swap_tx,
             "raw": data,
@@ -57,3 +55,8 @@ async def order(input_mint, output_mint, amount, quote=None):
     except Exception as e:
         print("SWAP EXCEPTION:", e)
         return None
+
+
+async def execute(order_data):
+    print("EXECUTE SKIPPED (PAPER MODE)")
+    return {"status": "paper"}
