@@ -346,8 +346,7 @@ async def evaluate_route(route: dict):
     except Exception as e:
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
-    wallet_list = list(token_wallets.get(mint, set()))
-    lead_wallet = wallet_list[0] if wallet_list else None
+    from app.alpha.smart_wallets import get_best_wallet
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
