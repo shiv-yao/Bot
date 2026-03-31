@@ -15,13 +15,12 @@ from app.alpha.combiner import combine_scores, get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
-from app.alpha.helius_wallet_tracker import update_token_wallets
+from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
-from app.alpha.helius_wallet_tracker import token_wallets
 
 TP = 0.045
 SL = -0.008
@@ -339,9 +338,8 @@ async def evaluate_route(route: dict):
     s = smart_money_score(token)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
-    engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
-    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
 
+    engine.log(f"WALLETS {mint[:6]} {len(token_wallets.get(mint, set()))}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
@@ -385,7 +383,6 @@ async def evaluate_route(route: dict):
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
-    # insider 高分可加一點倉，但仍受 portfolio cap 限制
     insider_boost = 1.0
     if insider >= 0.50:
         insider_boost = 1.20
