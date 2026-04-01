@@ -3,17 +3,14 @@ import httpx
 from collections import defaultdict
 
 from app.alpha.insider_engine import record_early_wallets
+from app.alpha.wallet_alpha import record_token_wallets
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
-# mint -> wallets
 token_wallets = defaultdict(set)
 
 
 async def fetch_token_trades_v1(mint: str) -> list[str]:
-    """
-    舊 token-transfers 查法
-    """
     if not HELIUS_KEY or not mint:
         return []
 
@@ -28,7 +25,6 @@ async def fetch_token_trades_v1(mint: str) -> list[str]:
             r = await client.post(url, json=payload)
             if r.status_code != 200:
                 return []
-
             data = r.json()
             if not isinstance(data, list):
                 return []
@@ -48,9 +44,6 @@ async def fetch_token_trades_v1(mint: str) -> list[str]:
 
 
 async def fetch_token_trades_v2(mint: str) -> list[str]:
-    """
-    備援查法：直接看 address transactions
-    """
     if not HELIUS_KEY or not mint:
         return []
 
@@ -61,7 +54,6 @@ async def fetch_token_trades_v2(mint: str) -> list[str]:
             r = await client.get(url)
             if r.status_code != 200:
                 return []
-
             data = r.json()
             if not isinstance(data, list):
                 return []
@@ -83,9 +75,6 @@ async def fetch_token_trades_v2(mint: str) -> list[str]:
 
 
 async def fetch_wallets(mint: str) -> list[str]:
-    """
-    先用 v1，失敗再用 v2
-    """
     w1 = await fetch_token_trades_v1(mint)
     if w1:
         return w1
@@ -98,9 +87,6 @@ async def fetch_wallets(mint: str) -> list[str]:
 
 
 async def update_token_wallets(mint: str) -> list[str]:
-    """
-    更新某個 mint 的 wallet，並回傳本次抓到的 wallets
-    """
     wallets = await fetch_wallets(mint)
 
     if not wallets:
@@ -110,6 +96,8 @@ async def update_token_wallets(mint: str) -> list[str]:
         token_wallets[mint].add(w)
 
     record_early_wallets(mint, wallets)
+    record_token_wallets(mint, wallets)
+
     return wallets
 
 
