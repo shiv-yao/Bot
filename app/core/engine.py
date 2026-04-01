@@ -17,10 +17,11 @@ from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
-from app.alpha.smart_wallets import (
-    record_wallet_trade as record_ranked_wallet_trade,
+from app.alpha.wallet_alpha import (
+    record_wallet_result as record_ranked_wallet_trade,
     get_best_wallet,
     get_top_wallets,
+    get_token_wallet_alpha,
 )
 
 from app.portfolio.allocator import get_position_size
