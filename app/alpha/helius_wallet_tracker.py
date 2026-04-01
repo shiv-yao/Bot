@@ -7,6 +7,7 @@ from app.alpha.wallet_alpha import record_token_wallets
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
+# mint -> wallets
 token_wallets = defaultdict(set)
 
 
@@ -25,6 +26,7 @@ async def fetch_token_trades_v1(mint: str) -> list[str]:
             r = await client.post(url, json=payload)
             if r.status_code != 200:
                 return []
+
             data = r.json()
             if not isinstance(data, list):
                 return []
@@ -54,6 +56,7 @@ async def fetch_token_trades_v2(mint: str) -> list[str]:
             r = await client.get(url)
             if r.status_code != 200:
                 return []
+
             data = r.json()
             if not isinstance(data, list):
                 return []
