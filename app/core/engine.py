@@ -369,22 +369,36 @@ async def evaluate_route(route: dict):
         insider = round(((b + s + l) / 3.0) * 0.3, 4)
         engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
 
+    top_wallet_count = len(top_wallets)
+
     engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
-    engine.log(f"TOP_WALLETS {mint[:6]} {len(top_wallets)}")
+    engine.log(f"TOP_WALLETS {mint[:6]} {top_wallet_count}")
     engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    # 沒 top wallet：只有冷啟動期放行
-    if len(top_wallets) == 0:
+    # 冷啟動：前 10 筆允許沒有 top wallet 的單進來學習
+    if top_wallet_count == 0:
         if bootstrap_mode:
             engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
         else:
-            engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+            # 沒 top wallet 時，只有 insider 很強才放行
+            if insider < 0.35:
+                engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+                return
+            else:
+                engine.log(f"ALLOW_INSIDER_OVERRIDE {mint[:6]}")
+
+    # 沒 lead wallet：冷啟動期可放行，之後嚴格
+    if lead_wallet is None:
+        if bootstrap_mode:
+            engine.log(f"BOOTSTRAP_NO_LEAD {mint[:6]}")
+        else:
+            engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
             return
 
-    # 沒 smart money：只有冷啟動期放行
-    if s <= 0.12:
+    # 沒 smart money：冷啟動期放行但大幅縮倉，之後嚴格
+    if s <= 0.18:
         if bootstrap_mode:
             engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
         else:
@@ -443,7 +457,7 @@ async def evaluate_route(route: dict):
 
     # 只有有 top wallet 時才允許放大
     insider_boost = 1.0
-    if len(top_wallets) > 0:
+    if top_wallet_count > 0:
         if insider >= 0.50:
             insider_boost = 1.25
         elif insider >= 0.30:
@@ -451,10 +465,15 @@ async def evaluate_route(route: dict):
 
     size = min(base * insider_boost, cap)
 
-    # 沒 smart money 的單，冷啟動期大幅縮倉
-    if s <= 0.10:
+    # smart money 偏弱就大幅縮倉
+    if s <= 0.18:
         size *= 0.35
         engine.log(f"SIZE_CUT_NO_SMART {mint[:6]} size={size:.4f}")
+
+    # 沒 top wallet 但靠 insider override 放行，也縮倉
+    if top_wallet_count == 0:
+        size *= 0.5
+        engine.log(f"SIZE_CUT_NO_TOP_WALLET {mint[:6]} size={size:.4f}")
 
     if size <= 0:
         engine.log(f"SIZE_ZERO {mint[:6]}")
@@ -487,7 +506,7 @@ async def evaluate_route(route: dict):
             "liquidity": l,
             "insider": insider,
             "wallet": lead_wallet,
-            "top_wallet_count": len(top_wallets),
+            "top_wallet_count": top_wallet_count,
             "weights": weights,
         },
     )
