@@ -10,41 +10,7 @@ HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 token_wallets = defaultdict(set)
 
 
-async def fetch_token_trades_v1(mint: str) -> list[str]:
-    if not HELIUS_KEY or not mint:
-        return []
-
-    url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_KEY}"
-    payload = {
-        "mint": mint,
-        "limit": 20,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json=payload)
-            if r.status_code != 200:
-                return []
-
-            data = r.json()
-            if not isinstance(data, list):
-                return []
-    except Exception:
-        return []
-
-    wallets = []
-    for tx in data:
-        try:
-            w = tx.get("toUserAccount")
-            if w and isinstance(w, str):
-                wallets.append(w)
-        except Exception:
-            continue
-
-    return list(dict.fromkeys(wallets))
-
-
-async def fetch_token_trades_v2(mint: str) -> list[str]:
+async def fetch_enhanced_transactions(mint: str):
     if not HELIUS_KEY or not mint:
         return []
 
@@ -59,40 +25,42 @@ async def fetch_token_trades_v2(mint: str) -> list[str]:
             data = r.json()
             if not isinstance(data, list):
                 return []
+
+            return data[:20]
     except Exception:
         return []
 
-    wallets = []
 
-    for tx in data[:20]:
+def extract_buyers_from_tx(tx_list, mint: str):
+    buyers = []
+
+    for tx in tx_list:
         try:
-            for acc in tx.get("accountData", []) or []:
-                addr = acc.get("account")
-                if addr and isinstance(addr, str):
-                    wallets.append(addr)
+            token_transfers = tx.get("tokenTransfers", []) or []
+
+            for t in token_transfers:
+                if t.get("mint") != mint:
+                    continue
+
+                to_wallet = t.get("toUserAccount")
+                if to_wallet and isinstance(to_wallet, str):
+                    buyers.append(to_wallet)
         except Exception:
             continue
 
-    return list(dict.fromkeys(wallets))
+    return list(dict.fromkeys(buyers))
 
 
-async def fetch_wallets(mint: str) -> list[str]:
-    w1 = await fetch_token_trades_v1(mint)
-    if w1:
-        return w1
-
-    w2 = await fetch_token_trades_v2(mint)
-    if w2:
-        return w2
-
-    return []
+def fallback_wallet(mint: str):
+    return f"mint_{mint[:6]}"
 
 
 async def update_token_wallets(mint: str) -> list[str]:
-    wallets = await fetch_wallets(mint)
+    txs = await fetch_enhanced_transactions(mint)
+    wallets = extract_buyers_from_tx(txs, mint)
 
     if not wallets:
-        return []
+        wallets = [fallback_wallet(mint)]
 
     for w in wallets:
         token_wallets[mint].add(w)
