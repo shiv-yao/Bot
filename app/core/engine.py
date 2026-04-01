@@ -17,17 +17,15 @@ from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
-from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_trade
+from app.alpha.smart_wallets import (
+    record_wallet_trade as record_ranked_wallet_trade,
+    get_best_wallet,
+    get_top_wallets,
+)
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
-from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_trade
-from app.alpha.smart_wallets import get_best_wallet, get_top_wallets
-from app.alpha.wallet_alpha import (
-    get_top_wallets,
-    get_best_wallet,
-)
 
 TP = 0.045
 SL = -0.008
@@ -195,6 +193,7 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         f"l={meta.get('liquidity', 0):.3f} "
         f"ins={meta.get('insider', 0):.3f} "
         f"wallet={meta.get('wallet')} "
+        f"top_wallet_count={meta.get('top_wallet_count', 0)} "
         f"wb={weights.get('breakout', 0):.2f} "
         f"ws={weights.get('smart_money', 0):.2f} "
         f"wl={weights.get('liquidity', 0):.2f} "
@@ -354,8 +353,8 @@ async def evaluate_route(route: dict):
 
     wallet_list = list(token_wallets.get(mint, set()))
 
-    # 冷啟動期先放寬，讓 wallet ranking 有資料可學
-    bootstrap_mode = len(engine.trade_history) < 20
+    # 冷啟動只保留前 10 筆
+    bootstrap_mode = len(engine.trade_history) < 10
     min_wallet_score = 0.2 if bootstrap_mode else 0.55
     top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
     lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
@@ -365,6 +364,7 @@ async def evaluate_route(route: dict):
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
+    # 沒有真 insider 時，用弱 fallback
     if insider == 0:
         insider = round(((b + s + l) / 3.0) * 0.3, 4)
         engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
@@ -375,7 +375,7 @@ async def evaluate_route(route: dict):
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    # 冷啟動：前 20 筆允許沒有 top wallet 的單進來學習
+    # 沒 top wallet：只有冷啟動期放行
     if len(top_wallets) == 0:
         if bootstrap_mode:
             engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
@@ -383,7 +383,7 @@ async def evaluate_route(route: dict):
             engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
             return
 
-    # 冷啟動期：沒有 smart money 不直接拒絕，只縮倉
+    # 沒 smart money：只有冷啟動期放行
     if s <= 0.05:
         if bootstrap_mode:
             engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
@@ -441,6 +441,7 @@ async def evaluate_route(route: dict):
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
+    # 只有有 top wallet 時才允許放大
     insider_boost = 1.0
     if len(top_wallets) > 0:
         if insider >= 0.50:
@@ -450,7 +451,7 @@ async def evaluate_route(route: dict):
 
     size = min(base * insider_boost, cap)
 
-    # 沒有 smart money 的單，冷啟動期大幅縮倉
+    # 沒 smart money 的單，冷啟動期大幅縮倉
     if s <= 0.10:
         size *= 0.35
         engine.log(f"SIZE_CUT_NO_SMART {mint[:6]} size={size:.4f}")
@@ -492,6 +493,7 @@ async def evaluate_route(route: dict):
     )
 
     engine.log(f"WALLET_TRACK {lead_wallet}")
+
 
 async def main_loop():
     engine.log("🚀 ENGINE START")
