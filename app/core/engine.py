@@ -397,7 +397,7 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    entry_threshold = 0.25
+    entry_threshold = 0.22
 
     if score < entry_threshold:
         engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
