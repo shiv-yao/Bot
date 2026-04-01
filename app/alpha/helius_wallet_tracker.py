@@ -7,7 +7,6 @@ from app.alpha.wallet_alpha import record_token_wallets
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
-# mint -> wallets
 token_wallets = defaultdict(set)
 
 
