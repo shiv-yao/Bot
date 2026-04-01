@@ -397,8 +397,13 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    if score < 0.55:
+    entry_threshold = 0.25
+
+    if score < entry_threshold:
+        engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
         return
+    
+    
 
     price = await get_price(token)
     if not price:
