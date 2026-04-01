@@ -37,27 +37,16 @@ def classify_alpha(score: float) -> str:
     else:
         return "C"
 
+def should_enter(token: str, features: dict):
+    momentum = features.get("momentum", 0)
+    smart_money = features.get("smart_money", 0)
 
-def should_enter(token: dict, meta: dict) -> tuple[bool, str]:
-    """
-    主入口
-    """
+    # 🔥 允許 smart_money = 0（初期必須）
+    if momentum < 0:
+        return False, "bad_momentum"
 
-    change = float(token.get("change", 0))
-    volume = float(token.get("volume", 0))
-    momentum = float(meta.get("momentum", 0))
-    smart = float(meta.get("smart_money", 0))
-
-    if not momentum_confirm(momentum):
-        return False, "momentum_fail"
-
-    if not fake_pump_filter(change, volume):
-        return False, "fake_pump"
-
-    if not liquidity_trap_filter(volume):
-        return False, "low_liquidity"
-
-    if not smart_money_confirm(smart):
-        return False, "no_smart_money"
+    # 🔥 改成加分條件，不是硬門檻
+    if smart_money <= 0:
+        return True, "weak_smart_money"
 
     return True, "ok"
