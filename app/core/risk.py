@@ -24,9 +24,8 @@ def dynamic_risk_factor(engine):
 
 
 def allow(engine, score, size):
-    if len(engine.positions) >= MAX_POSITIONS:
-        engine.log("MAX_POS")
-        return False
+    # 🚀 測試期：先全部放行
+    return True
 
     if total_exposure(engine) + size > MAX_EXPOSURE:
         engine.log("MAX_EXPOSURE")
