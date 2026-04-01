@@ -339,7 +339,6 @@ async def manage_positions():
 
     engine.positions = remaining
 
-
 async def evaluate_route(route: dict):
     global last_trade_time
 
@@ -365,7 +364,7 @@ async def evaluate_route(route: dict):
     wallet_alpha = get_token_wallet_alpha(mint)
 
     bootstrap_mode = len(engine.trade_history) < 10
-    min_wallet_score = 0.20 if bootstrap_mode else 0.55
+    min_wallet_score = 0.20 if bootstrap_mode else 0.35
     top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
     lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
 
@@ -387,40 +386,31 @@ async def evaluate_route(route: dict):
         f"WALLET_ALPHA {mint[:6]} "
         f"avg={wallet_alpha['avg_score']:.3f} "
         f"best={wallet_alpha['best_score']:.3f} "
-        f"cluster={wallet_alpha['cluster_score']:.3f}"
+        f"cluster={wallet_alpha['cluster_score']:.3f} "
+        f"copy={wallet_alpha.get('copy_signal', 0)}"
     )
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    # bootstrap：沒有 top wallet 但 smart/insider 有一定程度時，允許小倉進場學習
+    # ========= 基礎 gating =========
     if top_wallet_count == 0:
-        if bootstrap_mode and insider >= 0.05 and s >= 0.10:
-            engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
+        if bootstrap_mode or insider >= 0.10:
+            engine.log(f"BOOTSTRAP_NO_WALLET {mint[:6]}")
         else:
             engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
             return
 
-    # lead wallet 不存在時，bootstrap 可放行；正式模式拒絕
-    if lead_wallet is None:
-        if bootstrap_mode:
-            engine.log(f"BOOTSTRAP_NO_LEAD_WALLET {mint[:6]}")
-        else:
-            engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
-            return
+    if lead_wallet is None and not bootstrap_mode:
+        engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
+        return
 
-    if s <= 0.10:
-        if bootstrap_mode:
-            engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
-        else:
-            engine.log(f"REJECT_NO_SMART {mint[:6]}")
-            return
+    if s <= 0.10 and not bootstrap_mode:
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
+        return
 
-    if insider <= 0.05:
-        if bootstrap_mode:
-            engine.log(f"BOOTSTRAP_LOW_INSIDER {mint[:6]}")
-        else:
-            engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
-            return
+    if insider <= 0.05 and not bootstrap_mode:
+        engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
+        return
 
     source_stats = build_source_stats(engine.trade_history)
     insider_perf = build_insider_perf(engine.trade_history)
@@ -436,8 +426,23 @@ async def evaluate_route(route: dict):
         insider_perf=insider_perf,
     )
 
-    score += wallet_alpha["avg_score"] * 0.10
-    score += wallet_alpha["cluster_score"] * 0.05
+    # ========= Wallet Alpha v6 核心 =========
+    score += wallet_alpha["avg_score"] * 0.20
+    score += wallet_alpha["best_score"] * 0.20
+    score += wallet_alpha["cluster_score"] * 0.15
+
+    if wallet_alpha.get("copy_signal", 0) >= 2:
+        score += 0.20
+        engine.log(f"COPY_SIGNAL {mint[:6]}")
+
+    if wallet_alpha["best_score"] > 0.60:
+        score += 0.10
+        engine.log(f"BEST_WALLET_BOOST {mint[:6]}")
+
+    if wallet_alpha["count"] == 0:
+        score += 0.05
+        engine.log(f"BOOTSTRAP {mint[:6]}")
+
     score = round(min(score, 1.0), 4)
 
     engine.log(
@@ -475,16 +480,9 @@ async def evaluate_route(route: dict):
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
+    size = min(base, cap)
 
-    insider_boost = 1.0
-    if top_wallet_count > 0:
-        if insider >= 0.50:
-            insider_boost = 1.30
-        elif insider >= 0.30:
-            insider_boost = 1.15
-
-    size = min(base * insider_boost, cap)
-
+    # ========= 倉位調整 =========
     if s <= 0.15:
         size *= 0.50
         engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
@@ -496,6 +494,13 @@ async def evaluate_route(route: dict):
     if lead_wallet is None:
         size *= 0.70
         engine.log(f"SIZE_CUT_NO_LEAD_WALLET {mint[:6]} size={size:.4f}")
+
+    if wallet_alpha.get("copy_signal", 0) >= 2:
+        size *= 1.50
+        engine.log(f"SIZE_COPY_SIGNAL {mint[:6]} size={size:.4f}")
+    elif wallet_alpha["best_score"] > 0.60:
+        size *= 1.30
+        engine.log(f"SIZE_STRONG_WALLET {mint[:6]} size={size:.4f}")
 
     if size <= 0:
         engine.log(f"SIZE_ZERO {mint[:6]}")
@@ -532,11 +537,13 @@ async def evaluate_route(route: dict):
             "wallet_alpha_avg": wallet_alpha["avg_score"],
             "wallet_alpha_best": wallet_alpha["best_score"],
             "wallet_cluster": wallet_alpha["cluster_score"],
+            "wallet_copy_signal": wallet_alpha.get("copy_signal", 0),
             "weights": weights,
         },
     )
 
     engine.log(f"WALLET_TRACK {lead_wallet}")
+
 
 
 async def main_loop():
