@@ -353,20 +353,20 @@ async def evaluate_route(route: dict):
 
     wallet_list = list(token_wallets.get(mint, set()))
 
-    # 冷啟動只保留前 10 筆
     bootstrap_mode = len(engine.trade_history) < 10
-    min_wallet_score = 0.2 if bootstrap_mode else 0.55
+    min_wallet_score = 0.20 if bootstrap_mode else 0.55
     top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
     lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
+
+    wallet_alpha = get_token_wallet_alpha(mint)
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
-    # 沒有真 insider 時，用弱 fallback
     if insider == 0:
-        insider = round(((b + s + l) / 3.0) * 0.3, 4)
+        insider = round(((b + s + l) / 3.0) * 0.20, 4)
         engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
 
     top_wallet_count = len(top_wallets)
@@ -374,36 +374,33 @@ async def evaluate_route(route: dict):
     engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
     engine.log(f"TOP_WALLETS {mint[:6]} {top_wallet_count}")
     engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
+    engine.log(
+        f"WALLET_ALPHA {mint[:6]} "
+        f"avg={wallet_alpha['avg_score']:.3f} "
+        f"best={wallet_alpha['best_score']:.3f} "
+        f"cluster={wallet_alpha['cluster_score']:.3f}"
+    )
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    # 冷啟動：前 10 筆允許沒有 top wallet 的單進來學習
     if top_wallet_count == 0:
-        if bootstrap_mode:
+        if bootstrap_mode and insider >= 0.22 and s >= 0.10:
             engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
         else:
-            # 沒 top wallet 時，只有 insider 很強才放行
-            if insider < 0.35:
-                engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
-                return
-            else:
-                engine.log(f"ALLOW_INSIDER_OVERRIDE {mint[:6]}")
+            engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+            return
 
-    # 沒 lead wallet：冷啟動期可放行，之後嚴格
     if lead_wallet is None:
-        if bootstrap_mode:
-            engine.log(f"BOOTSTRAP_NO_LEAD {mint[:6]}")
-        else:
-            engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
-            return
+        engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
+        return
 
-    # 沒 smart money：冷啟動期放行但大幅縮倉，之後嚴格
-    if s <= 0.18:
-        if bootstrap_mode:
-            engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
-        else:
-            engine.log(f"REJECT_NO_SMART {mint[:6]}")
-            return
+    if s <= 0.12:
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
+        return
+
+    if insider <= 0.12:
+        engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
+        return
 
     source_stats = build_source_stats(engine.trade_history)
     insider_perf = build_insider_perf(engine.trade_history)
@@ -418,6 +415,10 @@ async def evaluate_route(route: dict):
         source_stats=source_stats,
         insider_perf=insider_perf,
     )
+
+    score += wallet_alpha["avg_score"] * 0.10
+    score += wallet_alpha["cluster_score"] * 0.05
+    score = round(min(score, 1.0), 4)
 
     engine.log(
         f"ROUTE {mint[:6]} "
@@ -435,11 +436,11 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    entry_threshold = 0.30
+    entry_threshold = 0.32
     if engine.regime == "trend_up":
-        entry_threshold = 0.27
+        entry_threshold = 0.28
     if bootstrap_mode and engine.regime == "trend_up":
-        entry_threshold = 0.24
+        entry_threshold = 0.25
 
     if score < entry_threshold:
         engine.log(
@@ -455,24 +456,21 @@ async def evaluate_route(route: dict):
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
-    # 只有有 top wallet 時才允許放大
     insider_boost = 1.0
     if top_wallet_count > 0:
         if insider >= 0.50:
-            insider_boost = 1.25
+            insider_boost = 1.30
         elif insider >= 0.30:
             insider_boost = 1.15
 
     size = min(base * insider_boost, cap)
 
-    # smart money 偏弱就大幅縮倉
-    if s <= 0.18:
-        size *= 0.35
-        engine.log(f"SIZE_CUT_NO_SMART {mint[:6]} size={size:.4f}")
+    if s <= 0.15:
+        size *= 0.50
+        engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
 
-    # 沒 top wallet 但靠 insider override 放行，也縮倉
     if top_wallet_count == 0:
-        size *= 0.5
+        size *= 0.50
         engine.log(f"SIZE_CUT_NO_TOP_WALLET {mint[:6]} size={size:.4f}")
 
     if size <= 0:
@@ -507,6 +505,9 @@ async def evaluate_route(route: dict):
             "insider": insider,
             "wallet": lead_wallet,
             "top_wallet_count": top_wallet_count,
+            "wallet_alpha_avg": wallet_alpha["avg_score"],
+            "wallet_alpha_best": wallet_alpha["best_score"],
+            "wallet_cluster": wallet_alpha["cluster_score"],
             "weights": weights,
         },
     )
