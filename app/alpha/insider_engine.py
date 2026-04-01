@@ -1,7 +1,7 @@
 from collections import defaultdict
 import time
 
-from app.alpha.smart_wallets import get_token_smart_score
+from app.alpha.wallet_alpha import get_token_wallet_alpha
 
 token_early_wallets = defaultdict(list)
 
@@ -37,8 +37,18 @@ def early_wallet_score(mint: str) -> float:
 
 
 def get_token_insider_score(mint: str) -> float:
-    smart = get_token_smart_score(mint)
+    alpha = get_token_wallet_alpha(mint)
+
+    avg_score = alpha["avg_score"]
+    best_score = alpha["best_score"]
+    cluster = alpha["cluster_score"]
     early = early_wallet_score(mint)
 
-    score = (smart * 0.7) + (early * 0.3)
-    return round(score, 4)
+    score = (
+        avg_score * 0.35
+        + best_score * 0.25
+        + cluster * 0.20
+        + early * 0.20
+    )
+
+    return round(max(min(score, 1.0), 0.0), 4)
