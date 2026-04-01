@@ -384,7 +384,7 @@ async def evaluate_route(route: dict):
             return
 
     # 沒 smart money：只有冷啟動期放行
-    if s <= 0.05:
+    if s <= 0.12:
         if bootstrap_mode:
             engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
         else:
