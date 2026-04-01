@@ -357,6 +357,7 @@ async def evaluate_route(route: dict):
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
+    # 沒有真 insider 時，用混合 fallback，但不要過強
     if insider == 0:
         insider = round(((b + s + l) / 3.0) * 0.4, 4)
         engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
@@ -397,13 +398,16 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    entry_threshold = 0.22
+    # 收斂版門檻：平常 0.26，趨勢盤放寬到 0.24
+    entry_threshold = 0.26
+    if engine.regime == "trend_up":
+        entry_threshold = 0.24
 
     if score < entry_threshold:
-        engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
+        engine.log(
+            f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}"
+        )
         return
-    
-    
 
     price = await get_price(token)
     if not price:
@@ -413,13 +417,24 @@ async def evaluate_route(route: dict):
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
+    # 只有 top wallet 存在時才允許 insider 放大
     insider_boost = 1.0
-    if insider >= 0.50:
-        insider_boost = 1.25
-    elif insider >= 0.30:
-        insider_boost = 1.15
+    if len(top_wallets) > 0:
+        if insider >= 0.50:
+            insider_boost = 1.25
+        elif insider >= 0.30:
+            insider_boost = 1.15
 
     size = min(base * insider_boost, cap)
+
+    # 沒有 smart money 的單，縮小倉位，避免亂打
+    if s <= 0.05:
+        size *= 0.5
+        engine.log(f"SIZE_CUT_NO_SMART {mint[:6]} size={size:.4f}")
+
+    if size <= 0:
+        engine.log(f"SIZE_ZERO {mint[:6]}")
+        return
 
     if not allow(engine, score, size):
         engine.log(f"BLOCKED_ALLOW {mint[:6]}")
