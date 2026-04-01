@@ -24,6 +24,10 @@ from app.portfolio.portfolio_manager import portfolio
 from app.core.position_manager import manage_position
 from app.alpha.smart_wallets import record_wallet_trade as record_ranked_wallet_trade
 from app.alpha.smart_wallets import get_best_wallet, get_top_wallets
+from app.alpha.wallet_alpha import (
+    get_top_wallets,
+    get_best_wallet,
+)
 
 TP = 0.045
 SL = -0.008
@@ -338,13 +342,8 @@ async def evaluate_route(route: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    wallets = []
     try:
-        wallets = await update_token_wallets(mint)
-        if wallets:
-            engine.log(f"WALLET_OK {mint[:6]} {len(wallets)}")
-        else:
-            engine.log(f"WALLET_EMPTY {mint[:6]}")
+        await update_token_wallets(mint)
     except Exception as e:
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
@@ -352,25 +351,29 @@ async def evaluate_route(route: dict):
     top_wallets = get_top_wallets(wallet_list, min_score=0.55)
     lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
 
+    # === ALPHA ===
     b = breakout_score(token)
     s = await smart_money_score(mint)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
-    # 沒有真 insider 時，用混合 fallback，但不要過強
+    # fallback insider（弱）
     if insider == 0:
-        insider = round(((b + s + l) / 3.0) * 0.4, 4)
-        engine.log(f"INS_FALLBACK_MIX {mint[:6]} {insider}")
+        insider = round(((b + s + l) / 3.0) * 0.3, 4)
+        engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
 
     engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
     engine.log(f"TOP_WALLETS {mint[:6]} {len(top_wallets)}")
     engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
-    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
-    engine.log(f"TOKEN {mint[:6]}")
 
-    source_stats = build_source_stats(engine.trade_history)
-    insider_perf = build_insider_perf(engine.trade_history)
-    weights = get_dynamic_weights(source_stats, insider_perf)
+    # 🚨 核心過濾（最關鍵）
+    if len(top_wallets) == 0:
+        engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+        return
+
+    if s <= 0.05:
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
+        return
 
     score = combine_scores(
         breakout=b,
@@ -378,69 +381,37 @@ async def evaluate_route(route: dict):
         liquidity=l,
         insider=insider,
         regime=engine.regime,
-        source_stats=source_stats,
-        insider_perf=insider_perf,
     )
 
-    engine.log(
-        f"ROUTE {mint[:6]} "
-        f"src={source} "
-        f"route={float(route.get('score', 0.0) or 0.0):.3f} "
-        f"final={score:.3f} "
-        f"b={b:.3f} "
-        f"s={s:.3f} "
-        f"l={l:.3f} "
-        f"ins={insider:.3f} "
-        f"wb={weights['breakout']:.2f} "
-        f"ws={weights['smart_money']:.2f} "
-        f"wl={weights['liquidity']:.2f} "
-        f"wi={weights['insider']:.2f} "
-        f"regime={engine.regime}"
-    )
-
-    # 收斂版門檻：平常 0.26，趨勢盤放寬到 0.24
-    entry_threshold = 0.26
+    # 收斂門檻
+    threshold = 0.30
     if engine.regime == "trend_up":
-        entry_threshold = 0.24
+        threshold = 0.27
 
-    if score < entry_threshold:
-        engine.log(
-            f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}"
-        )
+    if score < threshold:
+        engine.log(f"REJECT_SCORE {mint[:6]} {score:.3f}")
         return
 
     price = await get_price(token)
     if not price:
-        engine.log(f"NO_PRICE {mint[:6]}")
         return
 
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
 
-    # 只有 top wallet 存在時才允許 insider 放大
+    # wallet 強才放大
     insider_boost = 1.0
-    if len(top_wallets) > 0:
-        if insider >= 0.50:
-            insider_boost = 1.25
-        elif insider >= 0.30:
-            insider_boost = 1.15
+    if insider >= 0.5:
+        insider_boost = 1.3
+    elif insider >= 0.3:
+        insider_boost = 1.15
 
     size = min(base * insider_boost, cap)
 
-    # 沒有 smart money 的單，縮小倉位，避免亂打
-    if s <= 0.05:
-        size *= 0.5
-        engine.log(f"SIZE_CUT_NO_SMART {mint[:6]} size={size:.4f}")
-
-    if size <= 0:
-        engine.log(f"SIZE_ZERO {mint[:6]}")
-        return
-
     if not allow(engine, score, size):
-        engine.log(f"BLOCKED_ALLOW {mint[:6]}")
         return
 
-    ok, reason = should_enter(
+    ok, _ = should_enter(
         token,
         {
             "momentum": 0.01,
@@ -448,7 +419,6 @@ async def evaluate_route(route: dict):
         }
     )
     if not ok:
-        engine.log(f"FILTERED {mint[:6]} {reason}")
         return
 
     buy(
@@ -464,7 +434,6 @@ async def evaluate_route(route: dict):
             "insider": insider,
             "wallet": lead_wallet,
             "top_wallet_count": len(top_wallets),
-            "weights": weights,
         },
     )
 
