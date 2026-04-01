@@ -448,7 +448,6 @@ async def evaluate_route(route: dict):
         },
     )
 
-
 async def main_loop():
     engine.log("🚀 ENGINE START")
 
@@ -457,17 +456,20 @@ async def main_loop():
             await manage_positions()
 
             tokens = await scan()
+            engine.log(f"SCAN_COUNT {len(tokens)}")
 
             for t in tokens:
                 recent_changes.append(float(t.get("change", 0)))
 
             engine.regime = detect_regime(recent_changes[-40:])
+            engine.log(f"REGIME {engine.regime}")
 
             if engine.regime in ["flat", "trend_down"]:
                 await asyncio.sleep(2)
                 continue
 
             routes = router.build_routes(tokens)
+            engine.log(f"ROUTE_COUNT {len(routes)}")
 
             for r in routes:
                 await evaluate_route(r)
