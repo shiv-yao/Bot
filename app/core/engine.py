@@ -161,6 +161,16 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
     engine.capital -= size
     now = time.time()
 
+    wallet_for_trade = meta.get("wallet")
+    if wallet_for_trade is None:
+        wallets = list(token_wallets.get(mint, set()))
+        if wallets:
+            wallet_for_trade = wallets[0]
+        else:
+            wallet_for_trade = "BOOTSTRAP_WALLET"
+
+    meta = {**meta, "wallet": wallet_for_trade}
+
     engine.positions.append({
         "mint": mint,
         "entry": price,
@@ -169,14 +179,12 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "time": now,
         "score": score,
         "meta": meta,
-        "wallet": meta.get("wallet"),
+        "wallet": wallet_for_trade,
         "breakeven_armed": False,
         "stop_price": None,
         "tp1_done": False,
         "add_done": False,
     })
-
-    record_wallet_trade("SIM_WALLET", mint, "buy", size)
 
     engine.stats["executed"] = engine.stats.get("executed", 0) + 1
     last_trade_time = now
@@ -196,6 +204,10 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         f"ins={meta.get('insider', 0):.3f} "
         f"wallet={meta.get('wallet')} "
         f"top_wallet_count={meta.get('top_wallet_count', 0)} "
+        f"wallet_alpha_avg={meta.get('wallet_alpha_avg', 0):.3f} "
+        f"wallet_alpha_best={meta.get('wallet_alpha_best', 0):.3f} "
+        f"wallet_cluster={meta.get('wallet_cluster', 0):.3f} "
+        f"wallet_copy_signal={meta.get('wallet_copy_signal', 0)} "
         f"wb={weights.get('breakout', 0):.2f} "
         f"ws={weights.get('smart_money', 0):.2f} "
         f"wl={weights.get('liquidity', 0):.2f} "
@@ -208,10 +220,10 @@ def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
 
     wallet = pos.get("wallet") or (pos.get("meta", {}) or {}).get("wallet")
-    if wallet:
-        record_wallet_result(wallet, pnl)
-    else:
-        record_wallet_result("SIM_WALLET", pnl)
+    if not wallet:
+        wallet = "BOOTSTRAP_WALLET"
+
+    record_wallet_result(wallet, pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
@@ -392,7 +404,7 @@ async def evaluate_route(route: dict):
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    # ========= 基礎 gating =========
+    # 基礎 gating
     if top_wallet_count == 0:
         if bootstrap_mode or insider >= 0.10:
             engine.log(f"BOOTSTRAP_NO_WALLET {mint[:6]}")
@@ -426,7 +438,7 @@ async def evaluate_route(route: dict):
         insider_perf=insider_perf,
     )
 
-    # ========= Wallet Alpha v6 核心 =========
+    # Wallet Alpha v6 核心加分
     score += wallet_alpha["avg_score"] * 0.20
     score += wallet_alpha["best_score"] * 0.20
     score += wallet_alpha["cluster_score"] * 0.15
@@ -482,7 +494,7 @@ async def evaluate_route(route: dict):
     cap = portfolio.weighted_position_size(engine, source)
     size = min(base, cap)
 
-    # ========= 倉位調整 =========
+    # 倉位調整
     if s <= 0.15:
         size *= 0.50
         engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
