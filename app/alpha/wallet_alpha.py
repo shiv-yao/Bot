@@ -1,202 +1,105 @@
 from collections import defaultdict
 import time
 
-# =========================
-# GLOBAL STORAGE
-# =========================
-
-# wallet -> performance stats
 wallet_stats = defaultdict(lambda: {
     "wins": 0,
     "losses": 0,
     "pnl": 0.0,
     "trades": 0,
-    "recent_pnls": [],
-    "last_seen": 0.0,
+    "recent": [],
+    "last_seen": 0,
+    "disabled": False,
 })
 
-# mint -> wallets seen on this token
 token_wallet_map = defaultdict(set)
-
-# wallet graph / co-appearance
 wallet_links = defaultdict(lambda: defaultdict(int))
 
-# auto blacklist
-wallet_blacklist = set()
+BLACKLIST = set()
 
 
-# =========================
-# RECORD WALLET RESULT
-# =========================
 def record_wallet_result(wallet: str, pnl: float):
     if not wallet:
-        wallet = "BOOTSTRAP_WALLET"
+        wallet = "BOOTSTRAP"
 
     row = wallet_stats[wallet]
+
     row["trades"] += 1
-    row["pnl"] += float(pnl)
+    row["pnl"] += pnl
     row["last_seen"] = time.time()
 
-    if pnl >= 0:
+    if pnl > 0:
         row["wins"] += 1
     else:
         row["losses"] += 1
 
-    row["recent_pnls"].append(float(pnl))
-    row["recent_pnls"] = row["recent_pnls"][-20:]
+    row["recent"].append(pnl)
+    row["recent"] = row["recent"][-20:]
 
-    # 自動黑名單：夠多交易後仍明顯爛
-    if row["trades"] >= 8:
-        win_rate = row["wins"] / max(row["trades"], 1)
-        avg_pnl = row["pnl"] / max(row["trades"], 1)
+    # 爛 wallet 自動封殺
+    if row["trades"] >= 10:
+        win_rate = row["wins"] / row["trades"]
+        avg = row["pnl"] / row["trades"]
 
-        if win_rate < 0.25 and avg_pnl < -0.01:
-            wallet_blacklist.add(wallet)
+        if win_rate < 0.25 and avg < -0.01:
+            row["disabled"] = True
+            BLACKLIST.add(wallet)
 
 
-# =========================
-# TRACK TOKEN WALLETS
-# =========================
-def track_token_wallets(mint: str, wallets: list[str]):
-    if not mint or not wallets:
+def record_token_wallets(mint: str, wallets: list[str]):
+    if not wallets:
         return
 
-    uniq = []
-    seen = set()
-
-    for w in wallets:
-        if w and w not in seen:
-            uniq.append(w)
-            seen.add(w)
+    uniq = list(set(wallets))
 
     for w in uniq:
         token_wallet_map[mint].add(w)
 
-    # 建 graph
+    # cluster graph
     for i in range(len(uniq)):
         for j in range(i + 1, len(uniq)):
-            a = uniq[i]
-            b = uniq[j]
+            a, b = uniq[i], uniq[j]
             wallet_links[a][b] += 1
             wallet_links[b][a] += 1
 
 
-# 舊名稱相容
-def record_token_wallets(mint: str, wallets: list[str]):
-    track_token_wallets(mint, wallets)
-
-
-# =========================
-# WALLET SCORING
-# =========================
-def wallet_score(wallet: str) -> float:
-    if not wallet:
-        return 0.0
-
-    if wallet in wallet_blacklist:
-        return 0.0
+def get_wallet_score(wallet: str) -> float:
+    if wallet in BLACKLIST:
+        return 0
 
     row = wallet_stats.get(wallet)
-    if not row:
-        return 0.0
+    if not row or row["trades"] < 3:
+        return 0.01  # bootstrap
 
-    trades = row["trades"]
-    if trades < 3:
-        return 0.0
+    win_rate = row["wins"] / row["trades"]
+    avg = row["pnl"] / row["trades"]
 
-    wins = row["wins"]
-    pnl = row["pnl"]
+    score = 0
+    score += win_rate * 0.4
+    score += max(0, avg) * 0.6
 
-    win_rate = wins / max(trades, 1)
-    avg_pnl = pnl / max(trades, 1)
-
-    recent = row["recent_pnls"]
-    recent_avg = sum(recent) / len(recent) if recent else 0.0
-
-    score = (
-        win_rate * 0.40
-        + (avg_pnl * 6.0) * 0.40
-        + (recent_avg * 4.0) * 0.20
-    )
-
-    return round(max(min(score, 1.0), 0.0), 4)
+    return min(score, 1.0)
 
 
-def cluster_score(wallets: list[str]) -> float:
-    if not wallets or len(wallets) <= 1:
-        return 0.0
-
-    uniq = []
-    seen = set()
-    for w in wallets:
-        if w and w not in seen:
-            uniq.append(w)
-            seen.add(w)
-
-    links = 0
-    pairs = 0
-
-    for i in range(len(uniq)):
-        for j in range(i + 1, len(uniq)):
-            pairs += 1
-            links += wallet_links[uniq[i]].get(uniq[j], 0)
-
-    if pairs == 0:
-        return 0.0
-
-    return round(min((links / pairs) / 3.0, 1.0), 4)
-
-
-def get_top_wallets(wallets: list[str], min_score=0.35):
-    return [w for w in wallets if wallet_score(w) >= min_score]
-
-
-def get_best_wallet(wallets: list[str]):
-    if not wallets:
-        return None
-    return max(wallets, key=wallet_score)
-
-
-# =========================
-# TOKEN WALLET ALPHA (V6)
-# =========================
 def get_token_wallet_alpha(mint: str):
-    wallets = list(token_wallet_map.get(mint, set()))
+    wallets = list(token_wallet_map.get(mint, []))
 
     if not wallets:
-        return {
-            "count": 0,
-            "top_count": 0,
-            "best_wallet": None,
-            "best_score": 0.0,
-            "avg_score": 0.0,
-            "cluster_score": 0.0,
-            "copy_signal": 0,
-        }
+        return 0, 0, 0, 0
 
-    scores = [wallet_score(w) for w in wallets]
-    top_wallets = get_top_wallets(wallets, min_score=0.35)
-    best_wallet = get_best_wallet(wallets)
+    scores = [get_wallet_score(w) for w in wallets]
 
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    best_score = wallet_score(best_wallet) if best_wallet else 0.0
-    c_score = cluster_score(wallets)
+    avg = sum(scores) / len(scores)
+    best = max(scores)
+
+    # cluster
+    cluster = 0
+    for w in wallets:
+        cluster += sum(wallet_links[w].values())
+
+    cluster = min(cluster * 0.01, 0.3)
 
     # copy signal
-    copy_signal = 0
-    if best_score > 0.55:
-        copy_signal += 1
-    if len(top_wallets) >= 2:
-        copy_signal += 1
-    if c_score > 0.30:
-        copy_signal += 1
+    strong = [s for s in scores if s > 0.3]
+    copy_signal = min(len(strong) * 0.05, 0.3)
 
-    return {
-        "count": len(wallets),
-        "top_count": len(top_wallets),
-        "best_wallet": best_wallet,
-        "best_score": round(best_score, 4),
-        "avg_score": round(avg_score, 4),
-        "cluster_score": round(c_score, 4),
-        "copy_signal": copy_signal,
-    }
+    return avg, best, cluster, copy_signal
