@@ -376,50 +376,60 @@ async def evaluate_route(route: dict):
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
     wallet_list = list(token_wallets.get(mint, set()))
-    wa = get_token_wallet_alpha(mint)
+    wallet_alpha = get_token_wallet_alpha(mint)
 
-    wallet_alpha_avg = wa["avg"]
-    wallet_best = wa["best"]
-    wallet_cluster = wa["cluster"]
-    wallet_copy_signal = wa["copy_signal"]
-    lead_wallet = wa["top_wallet"]
-    top_wallet_count = wa["count"]
+    bootstrap_mode = len(engine.trade_history) < 10
+    min_wallet_score = 0.20 if bootstrap_mode else 0.35
+    top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
+    lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
     l = liquidity_score(token)
     insider = get_token_insider_score(mint)
 
+    if insider == 0:
+        insider = round(((b + s + l) / 3.0) * 0.20, 4)
+        engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
+
+    top_wallet_count = len(top_wallets)
+
+    engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
+    engine.log(f"TOP_WALLETS {mint[:6]} {top_wallet_count}")
     engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
     engine.log(
         f"WALLET_ALPHA {mint[:6]} "
-        f"avg={wallet_alpha_avg:.3f} "
-        f"best={wallet_best:.3f} "
-        f"cluster={wallet_cluster:.3f} "
-        f"copy={wallet_copy_signal}"
+        f"avg={wallet_alpha['avg_score']:.3f} "
+        f"best={wallet_alpha['best_score']:.3f} "
+        f"cluster={wallet_alpha['cluster_score']:.3f} "
+        f"copy={wallet_alpha.get('copy_signal', 0)}"
     )
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
-    weights = get_dynamic_weights(
-        build_source_stats(engine.trade_history),
-        build_insider_perf(engine.trade_history),
-    )
+    # 基礎 gating
+    if top_wallet_count == 0:
+        if bootstrap_mode or insider >= 0.10:
+            engine.log(f"BOOTSTRAP_NO_WALLET {mint[:6]}")
+        else:
+            engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+            return
 
-    # ===== wallet alpha v6 =====
-    wallet_boost = (
-        wallet_alpha_avg * 0.4 +
-        wallet_best * 0.3 +
-        wallet_cluster * 0.15 +
-        wallet_copy_signal * 0.15
-    )
+    if lead_wallet is None and not bootstrap_mode:
+        engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
+        return
 
-    early_bonus = 0.0
-    for i, w in enumerate(wallets[:3]):
-        early_bonus += get_wallet_score(w) * (1 - i * 0.3)
+    if s <= 0.10 and not bootstrap_mode:
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
+        return
 
-    wallet_boost += early_bonus
-    wallet_boost = min(wallet_boost, 0.5)
+    if insider <= 0.05 and not bootstrap_mode:
+        engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
+        return
+
+    source_stats = build_source_stats(engine.trade_history)
+    insider_perf = build_insider_perf(engine.trade_history)
+    weights = get_dynamic_weights(source_stats, insider_perf)
 
     score = combine_scores(
         breakout=b,
@@ -427,27 +437,38 @@ async def evaluate_route(route: dict):
         liquidity=l,
         insider=insider,
         regime=engine.regime,
-        source_stats=build_source_stats(engine.trade_history),
-        insider_perf=build_insider_perf(engine.trade_history),
+        source_stats=source_stats,
+        insider_perf=insider_perf,
     )
 
-    score += wallet_boost
-    score = min(score, 1.0)
+    # Wallet Alpha v6 核心加分
+    score += wallet_alpha["avg_score"] * 0.20
+    score += wallet_alpha["best_score"] * 0.20
+    score += wallet_alpha["cluster_score"] * 0.15
+
+    if wallet_alpha.get("copy_signal", 0) >= 2:
+        score += 0.20
+        engine.log(f"COPY_SIGNAL {mint[:6]}")
+
+    if wallet_alpha["best_score"] > 0.60:
+        score += 0.10
+        engine.log(f"BEST_WALLET_BOOST {mint[:6]}")
+
+    if wallet_alpha["count"] == 0:
+        score += 0.05
+        engine.log(f"BOOTSTRAP {mint[:6]}")
+
+    score = round(min(score, 1.0), 4)
 
     engine.log(
         f"ROUTE {mint[:6]} "
         f"src={source} "
         f"route={float(route.get('score', 0.0) or 0.0):.3f} "
-        f"final={score:.4f} "
+        f"final={score:.3f} "
         f"b={b:.3f} "
         f"s={s:.3f} "
         f"l={l:.3f} "
         f"ins={insider:.3f} "
-        f"top_wallet_count={top_wallet_count} "
-        f"wallet_alpha_avg={wallet_alpha_avg:.3f} "
-        f"wallet_alpha_best={wallet_best:.3f} "
-        f"wallet_cluster={wallet_cluster:.3f} "
-        f"wallet_copy_signal={wallet_copy_signal} "
         f"wb={weights['breakout']:.2f} "
         f"ws={weights['smart_money']:.2f} "
         f"wl={weights['liquidity']:.2f} "
@@ -455,17 +476,16 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    # 沒 edge 不做
-    if wallet_alpha_avg < 0.04 and wallet_best < 0.10:
-        engine.log(f"REJECT_NO_EDGE {mint[:6]}")
-        return
-
     entry_threshold = 0.32
     if engine.regime == "trend_up":
         entry_threshold = 0.28
+    if bootstrap_mode and engine.regime == "trend_up":
+        entry_threshold = 0.24
 
     if score < entry_threshold:
-        engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
+        engine.log(
+            f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}"
+        )
         return
 
     price = await get_price(token)
@@ -477,18 +497,25 @@ async def evaluate_route(route: dict):
     cap = portfolio.weighted_position_size(engine, source)
     size = min(base, cap)
 
+    # 倉位調整
     if s <= 0.15:
-        size *= 0.5
+        size *= 0.50
         engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
 
-    if wallet_best > 0.5:
-        size *= 1.5
+    if top_wallet_count == 0:
+        size *= 0.50
+        engine.log(f"SIZE_CUT_NO_TOP_WALLET {mint[:6]} size={size:.4f}")
 
-    if wallet_copy_signal:
-        size *= 1.3
+    if lead_wallet is None:
+        size *= 0.70
+        engine.log(f"SIZE_CUT_NO_LEAD_WALLET {mint[:6]} size={size:.4f}")
 
-    if wallet_cluster > 0.5:
-        size *= 1.2
+    if wallet_alpha.get("copy_signal", 0) >= 2:
+        size *= 1.50
+        engine.log(f"SIZE_COPY_SIGNAL {mint[:6]} size={size:.4f}")
+    elif wallet_alpha["best_score"] > 0.60:
+        size *= 1.30
+        engine.log(f"SIZE_STRONG_WALLET {mint[:6]} size={size:.4f}")
 
     if size <= 0:
         engine.log(f"SIZE_ZERO {mint[:6]}")
@@ -522,10 +549,10 @@ async def evaluate_route(route: dict):
             "insider": insider,
             "wallet": lead_wallet,
             "top_wallet_count": top_wallet_count,
-            "wallet_alpha_avg": wallet_alpha_avg,
-            "wallet_alpha_best": wallet_best,
-            "wallet_cluster": wallet_cluster,
-            "wallet_copy_signal": wallet_copy_signal,
+            "wallet_alpha_avg": wallet_alpha["avg_score"],
+            "wallet_alpha_best": wallet_alpha["best_score"],
+            "wallet_cluster": wallet_alpha["cluster_score"],
+            "wallet_copy_signal": wallet_alpha.get("copy_signal", 0),
             "weights": weights,
         },
     )
