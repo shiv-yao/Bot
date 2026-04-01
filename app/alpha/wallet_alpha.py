@@ -7,7 +7,6 @@ wallet_stats = defaultdict(lambda: {
     "pnl": 0.0,
     "trades": 0,
     "recent_pnls": [],
-    "last_seen": 0,
 })
 
 token_wallet_map = defaultdict(set)
@@ -20,28 +19,29 @@ def record_wallet_result(wallet: str, pnl: float):
         wallet = "BOOTSTRAP"
 
     row = wallet_stats[wallet]
+
     row["trades"] += 1
-    row["pnl"] += float(pnl)
-    row["last_seen"] = time.time()
+    row["pnl"] += pnl
 
     if pnl >= 0:
         row["wins"] += 1
     else:
         row["losses"] += 1
 
-    row["recent_pnls"].append(float(pnl))
+    row["recent_pnls"].append(pnl)
     row["recent_pnls"] = row["recent_pnls"][-20:]
 
-    if row["trades"] >= 10:
+    # 黑名單
+    if row["trades"] >= 8:
         win_rate = row["wins"] / row["trades"]
         avg = row["pnl"] / row["trades"]
 
-        if win_rate < 0.2 and avg < -0.01:
+        if win_rate < 0.25 and avg < -0.01:
             wallet_blacklist.add(wallet)
 
 
 def track_token_wallets(mint: str, wallets: list[str]):
-    if not mint or not wallets:
+    if not wallets:
         return
 
     uniq = list(set(wallets))
@@ -49,13 +49,14 @@ def track_token_wallets(mint: str, wallets: list[str]):
     for w in uniq:
         token_wallet_map[mint].add(w)
 
+    # cluster
     for i in range(len(uniq)):
         for j in range(i + 1, len(uniq)):
             wallet_links[uniq[i]][uniq[j]] += 1
             wallet_links[uniq[j]][uniq[i]] += 1
 
 
-# 舊版相容名稱
+# 相容
 def record_token_wallets(mint: str, wallets: list[str]):
     track_token_wallets(mint, wallets)
 
@@ -76,11 +77,11 @@ def wallet_score(wallet: str) -> float:
     avg_pnl = row["pnl"] / trades
 
     recent = row["recent_pnls"]
-    recent_avg = sum(recent) / len(recent) if recent else 0.0
+    recent_avg = sum(recent) / len(recent) if recent else 0
 
     score = (
-        win_rate * 0.5 +
-        (avg_pnl * 6) * 0.3 +
+        win_rate * 0.4 +
+        (avg_pnl * 6) * 0.4 +
         (recent_avg * 4) * 0.2
     )
 
@@ -105,7 +106,7 @@ def cluster_score(wallets: list[str]) -> float:
     return min((links / pairs) / 3.0, 1.0)
 
 
-def get_top_wallets(wallets: list[str], min_score=0.55):
+def get_top_wallets(wallets: list[str], min_score=0.35):
     return [w for w in wallets if wallet_score(w) >= min_score]
 
 
@@ -115,6 +116,7 @@ def get_best_wallet(wallets: list[str]):
     return max(wallets, key=wallet_score)
 
 
+# 🔥 v6核心
 def get_token_wallet_alpha(mint: str):
     wallets = list(token_wallet_map.get(mint, set()))
 
@@ -123,18 +125,29 @@ def get_token_wallet_alpha(mint: str):
             "count": 0,
             "top_count": 0,
             "best_wallet": None,
-            "best_score": 0.0,
-            "avg_score": 0.0,
-            "cluster_score": 0.0,
+            "best_score": 0,
+            "avg_score": 0,
+            "cluster_score": 0,
+            "copy_signal": 0,
         }
 
     scores = [wallet_score(w) for w in wallets]
+
     top_wallets = get_top_wallets(wallets)
     best_wallet = get_best_wallet(wallets)
 
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    best_score = wallet_score(best_wallet) if best_wallet else 0.0
+    avg_score = sum(scores) / len(scores) if scores else 0
+    best_score = wallet_score(best_wallet) if best_wallet else 0
     c_score = cluster_score(wallets)
+
+    # 🔥 copy trading signal
+    copy_signal = 0
+    if best_score > 0.55:
+        copy_signal += 1
+    if len(top_wallets) >= 2:
+        copy_signal += 1
+    if c_score > 0.3:
+        copy_signal += 1
 
     return {
         "count": len(wallets),
@@ -143,4 +156,5 @@ def get_token_wallet_alpha(mint: str):
         "best_score": round(best_score, 4),
         "avg_score": round(avg_score, 4),
         "cluster_score": round(c_score, 4),
+        "copy_signal": copy_signal,
     }
