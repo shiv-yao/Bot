@@ -19,7 +19,7 @@ from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
 from app.alpha.wallet_alpha import (
-    record_wallet_result as record_ranked_wallet_trade,
+    record_wallet_result,
     get_best_wallet,
     get_top_wallets,
     get_token_wallet_alpha,
@@ -169,6 +169,7 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "time": now,
         "score": score,
         "meta": meta,
+        "wallet": meta.get("wallet"),
         "breakeven_armed": False,
         "stop_price": None,
         "tp1_done": False,
@@ -206,18 +207,18 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
 def sell(pos: dict, price: float, reason: str):
     pnl = record_trade(pos, price, reason)
 
-    wallet = (pos.get("meta", {}) or {}).get("wallet")
+    wallet = pos.get("wallet") or (pos.get("meta", {}) or {}).get("wallet")
     if wallet:
-        record_ranked_wallet_trade(wallet, pnl)
+        record_wallet_result(wallet, pnl)
     else:
-        record_ranked_wallet_trade("SIM_WALLET", pnl)
+        record_wallet_result("SIM_WALLET", pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
         f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} "
         f"src={pos.get('meta', {}).get('source', 'unknown')} "
         f"ins={pos.get('meta', {}).get('insider', 0):.3f} "
-        f"wallet={(pos.get('meta', {}) or {}).get('wallet')}"
+        f"wallet={wallet}"
     )
 
 
@@ -239,10 +240,15 @@ def partial_sell(pos: dict, price: float, ratio: float):
         "meta": pos.get("meta", {}),
     })
 
+    wallet = pos.get("wallet") or (pos.get("meta", {}) or {}).get("wallet")
+    if wallet:
+        record_wallet_result(wallet, pnl)
+
     risk_engine.record_realized(pnl)
     engine.log(
         f"PARTIAL {pos['mint'][:6]} ratio={ratio} pnl={pnl:.4f} "
-        f"ins={pos.get('meta', {}).get('insider', 0):.3f}"
+        f"ins={pos.get('meta', {}).get('insider', 0):.3f} "
+        f"wallet={wallet}"
     )
 
 
@@ -291,12 +297,15 @@ async def manage_positions():
             for act, ratio in actions:
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
+
                 elif act == "add":
                     add_winner(pos, price, ratio)
+
                 elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
                     sold = True
                     break
+
                 elif act == "breakeven":
                     engine.log(
                         f"BREAKEVEN {pos['mint'][:6]} "
@@ -353,13 +362,12 @@ async def evaluate_route(route: dict):
         engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
     wallet_list = list(token_wallets.get(mint, set()))
+    wallet_alpha = get_token_wallet_alpha(mint)
 
     bootstrap_mode = len(engine.trade_history) < 10
     min_wallet_score = 0.20 if bootstrap_mode else 0.55
     top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
     lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
-
-    wallet_alpha = get_token_wallet_alpha(mint)
 
     b = breakout_score(token)
     s = await smart_money_score(mint)
@@ -384,24 +392,35 @@ async def evaluate_route(route: dict):
     engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
     engine.log(f"TOKEN {mint[:6]}")
 
+    # bootstrap：沒有 top wallet 但 smart/insider 有一定程度時，允許小倉進場學習
     if top_wallet_count == 0:
-        if bootstrap_mode and insider >= 0.22 and s >= 0.10:
+        if bootstrap_mode and insider >= 0.05 and s >= 0.10:
             engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
         else:
             engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
             return
 
+    # lead wallet 不存在時，bootstrap 可放行；正式模式拒絕
     if lead_wallet is None:
-        engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
-        return
+        if bootstrap_mode:
+            engine.log(f"BOOTSTRAP_NO_LEAD_WALLET {mint[:6]}")
+        else:
+            engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
+            return
 
-    if s <= 0.12:
-        engine.log(f"REJECT_NO_SMART {mint[:6]}")
-        return
+    if s <= 0.10:
+        if bootstrap_mode:
+            engine.log(f"BOOTSTRAP_NO_SMART {mint[:6]}")
+        else:
+            engine.log(f"REJECT_NO_SMART {mint[:6]}")
+            return
 
-    if insider <= 0.12:
-        engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
-        return
+    if insider <= 0.05:
+        if bootstrap_mode:
+            engine.log(f"BOOTSTRAP_LOW_INSIDER {mint[:6]}")
+        else:
+            engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
+            return
 
     source_stats = build_source_stats(engine.trade_history)
     insider_perf = build_insider_perf(engine.trade_history)
@@ -441,7 +460,7 @@ async def evaluate_route(route: dict):
     if engine.regime == "trend_up":
         entry_threshold = 0.28
     if bootstrap_mode and engine.regime == "trend_up":
-        entry_threshold = 0.25
+        entry_threshold = 0.24
 
     if score < entry_threshold:
         engine.log(
@@ -473,6 +492,10 @@ async def evaluate_route(route: dict):
     if top_wallet_count == 0:
         size *= 0.50
         engine.log(f"SIZE_CUT_NO_TOP_WALLET {mint[:6]} size={size:.4f}")
+
+    if lead_wallet is None:
+        size *= 0.70
+        engine.log(f"SIZE_CUT_NO_LEAD_WALLET {mint[:6]} size={size:.4f}")
 
     if size <= 0:
         engine.log(f"SIZE_ZERO {mint[:6]}")
