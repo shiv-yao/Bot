@@ -6,6 +6,7 @@ from app.core.scanner import scan
 from app.core.pricing import get_price
 from app.core.risk import allow
 from app.core.risk_runtime import risk_engine
+from app.core.position_manager import manage_position
 
 from app.alpha.breakout import breakout_score
 from app.alpha.smart_money import smart_money_score
@@ -26,7 +27,6 @@ from app.alpha.wallet_alpha import (
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
-from app.core.position_manager import manage_position
 
 TP = 0.045
 SL = -0.008
@@ -208,9 +208,9 @@ def sell(pos: dict, price: float, reason: str):
 
     wallet = (pos.get("meta", {}) or {}).get("wallet")
     if wallet:
-        record_ranked_wallet_trade(wallet, pos["mint"], pnl)
+        record_ranked_wallet_trade(wallet, pnl)
     else:
-        record_ranked_wallet_trade("SIM_WALLET", pos["mint"], pnl)
+        record_ranked_wallet_trade("SIM_WALLET", pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
@@ -331,84 +331,189 @@ async def manage_positions():
     engine.positions = remaining
 
 
-wallet_alpha = get_token_wallet_alpha(mint)
+async def evaluate_route(route: dict):
+    global last_trade_time
 
-engine.log(
-    f"WALLET_ALPHA {mint[:6]} "
-    f"avg={wallet_alpha['avg_score']:.3f} "
-    f"best={wallet_alpha['best_score']:.3f} "
-    f"cluster={wallet_alpha['cluster_score']:.3f}"
-)
+    token = route["token"]
+    mint = route["mint"]
+    source = route["source"]
+    now = time.time()
 
-top_wallet_count = wallet_alpha["top_count"]
-lead_wallet = wallet_alpha["best_wallet"]
+    if now - last_trade_time < TRADE_INTERVAL:
+        return
 
-engine.log(f"TOP_WALLETS {mint[:6]} {top_wallet_count}")
-engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
+    wallets = []
+    try:
+        wallets = await update_token_wallets(mint)
+        if wallets:
+            engine.log(f"WALLET_OK {mint[:6]} {len(wallets)}")
+        else:
+            engine.log(f"WALLET_EMPTY {mint[:6]}")
+    except Exception as e:
+        engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
 
-# =========================
-# BOOTSTRAP（🔥關鍵）
-# =========================
-bootstrap = False
+    wallet_list = list(token_wallets.get(mint, set()))
 
-if wallet_alpha["count"] == 0:
-    bootstrap = True
-    engine.log(f"BOOTSTRAP_EMPTY {mint[:6]}")
+    bootstrap_mode = len(engine.trade_history) < 10
+    min_wallet_score = 0.20 if bootstrap_mode else 0.55
+    top_wallets = get_top_wallets(wallet_list, min_score=min_wallet_score)
+    lead_wallet = get_best_wallet(top_wallets if top_wallets else wallet_list)
 
-elif top_wallet_count == 0:
-    bootstrap = True
-    engine.log(f"BOOTSTRAP_NO_TOP {mint[:6]}")
+    wallet_alpha = get_token_wallet_alpha(mint)
 
-# =========================
-# WALLET ALPHA 分數
-# =========================
-wallet_boost = (
-    wallet_alpha["avg_score"] * 0.5 +
-    wallet_alpha["cluster_score"] * 0.5
-)
+    b = breakout_score(token)
+    s = await smart_money_score(mint)
+    l = liquidity_score(token)
+    insider = get_token_insider_score(mint)
 
-# fallback
-if wallet_boost == 0:
-    wallet_boost = insider * 0.3
+    if insider == 0:
+        insider = round(((b + s + l) / 3.0) * 0.20, 4)
+        engine.log(f"INS_FALLBACK {mint[:6]} {insider}")
 
-# =========================
-# FINAL SCORE
-# =========================
-score = combine_scores(
-    breakout=b,
-    smart_money=s,
-    liquidity=l,
-    insider=insider,
-    regime=engine.regime,
-    source_stats=source_stats,
-    insider_perf=insider_perf,
-)
+    top_wallet_count = len(top_wallets)
 
-score += wallet_boost * 0.3
+    engine.log(f"WALLETS {mint[:6]} {len(wallet_list)}")
+    engine.log(f"TOP_WALLETS {mint[:6]} {top_wallet_count}")
+    engine.log(f"LEAD_WALLET {mint[:6]} {lead_wallet}")
+    engine.log(
+        f"WALLET_ALPHA {mint[:6]} "
+        f"avg={wallet_alpha['avg_score']:.3f} "
+        f"best={wallet_alpha['best_score']:.3f} "
+        f"cluster={wallet_alpha['cluster_score']:.3f}"
+    )
+    engine.log(f"INSIDER_RAW {mint[:6]} {insider}")
+    engine.log(f"TOKEN {mint[:6]}")
 
-# =========================
-# ENTRY FILTER
-# =========================
-if not bootstrap and score < 0.55:
-    engine.log(f"REJECT_SCORE {mint[:6]} {score:.3f}")
-    return
+    if top_wallet_count == 0:
+        if bootstrap_mode and insider >= 0.22 and s >= 0.10:
+            engine.log(f"BOOTSTRAP_ALLOW {mint[:6]}")
+        else:
+            engine.log(f"REJECT_NO_TOP_WALLET {mint[:6]}")
+            return
 
-# =========================
-# SIZE 控制（🔥很重要）
-# =========================
-size = base
+    if lead_wallet is None:
+        engine.log(f"REJECT_NO_LEAD_WALLET {mint[:6]}")
+        return
 
-if bootstrap:
-    size *= 0.3
-    engine.log(f"SIZE_BOOTSTRAP {mint[:6]} {size:.4f}")
+    if s <= 0.12:
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
+        return
 
-elif wallet_alpha["avg_score"] < 0.2:
-    size *= 0.5
-    engine.log(f"SIZE_WEAK_WALLET {mint[:6]}")
+    if insider <= 0.12:
+        engine.log(f"REJECT_LOW_INSIDER {mint[:6]}")
+        return
 
-elif wallet_alpha["avg_score"] > 0.6:
-    size *= 1.3
-    engine.log(f"SIZE_STRONG_WALLET {mint[:6]}")
+    source_stats = build_source_stats(engine.trade_history)
+    insider_perf = build_insider_perf(engine.trade_history)
+    weights = get_dynamic_weights(source_stats, insider_perf)
+
+    score = combine_scores(
+        breakout=b,
+        smart_money=s,
+        liquidity=l,
+        insider=insider,
+        regime=engine.regime,
+        source_stats=source_stats,
+        insider_perf=insider_perf,
+    )
+
+    score += wallet_alpha["avg_score"] * 0.10
+    score += wallet_alpha["cluster_score"] * 0.05
+    score = round(min(score, 1.0), 4)
+
+    engine.log(
+        f"ROUTE {mint[:6]} "
+        f"src={source} "
+        f"route={float(route.get('score', 0.0) or 0.0):.3f} "
+        f"final={score:.3f} "
+        f"b={b:.3f} "
+        f"s={s:.3f} "
+        f"l={l:.3f} "
+        f"ins={insider:.3f} "
+        f"wb={weights['breakout']:.2f} "
+        f"ws={weights['smart_money']:.2f} "
+        f"wl={weights['liquidity']:.2f} "
+        f"wi={weights['insider']:.2f} "
+        f"regime={engine.regime}"
+    )
+
+    entry_threshold = 0.32
+    if engine.regime == "trend_up":
+        entry_threshold = 0.28
+    if bootstrap_mode and engine.regime == "trend_up":
+        entry_threshold = 0.25
+
+    if score < entry_threshold:
+        engine.log(
+            f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}"
+        )
+        return
+
+    price = await get_price(token)
+    if not price:
+        engine.log(f"NO_PRICE {mint[:6]}")
+        return
+
+    base = get_position_size(score, engine.capital, engine)
+    cap = portfolio.weighted_position_size(engine, source)
+
+    insider_boost = 1.0
+    if top_wallet_count > 0:
+        if insider >= 0.50:
+            insider_boost = 1.30
+        elif insider >= 0.30:
+            insider_boost = 1.15
+
+    size = min(base * insider_boost, cap)
+
+    if s <= 0.15:
+        size *= 0.50
+        engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
+
+    if top_wallet_count == 0:
+        size *= 0.50
+        engine.log(f"SIZE_CUT_NO_TOP_WALLET {mint[:6]} size={size:.4f}")
+
+    if size <= 0:
+        engine.log(f"SIZE_ZERO {mint[:6]}")
+        return
+
+    if not allow(engine, score, size):
+        engine.log(f"BLOCKED_ALLOW {mint[:6]}")
+        return
+
+    ok, reason = should_enter(
+        token,
+        {
+            "momentum": 0.01,
+            "smart_money": s,
+        }
+    )
+    if not ok:
+        engine.log(f"FILTERED {mint[:6]} {reason}")
+        return
+
+    buy(
+        mint,
+        price,
+        score,
+        size,
+        {
+            "source": source,
+            "breakout": b,
+            "smart_money": s,
+            "liquidity": l,
+            "insider": insider,
+            "wallet": lead_wallet,
+            "top_wallet_count": top_wallet_count,
+            "wallet_alpha_avg": wallet_alpha["avg_score"],
+            "wallet_alpha_best": wallet_alpha["best_score"],
+            "wallet_cluster": wallet_alpha["cluster_score"],
+            "weights": weights,
+        },
+    )
+
+    engine.log(f"WALLET_TRACK {lead_wallet}")
 
 
 async def main_loop():
