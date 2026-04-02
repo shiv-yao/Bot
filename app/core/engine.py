@@ -67,18 +67,19 @@ def log(msg: str):
 
 # ===== v14 SIZE ENGINE =====
 def get_dynamic_size(score, wallet, insider):
-    size = BASE_SIZE
+    size = engine.capital * 0.25
 
     if score > 0.03:
-        size *= 1.8
-    elif score > 0.02:
-        size *= 1.4
-
-    if wallet > 0.2:
         size *= 1.5
 
-    if insider > 0.15:
+    if wallet > 0.2:
         size *= 1.3
+
+    if insider > 0.15:
+        size *= 1.2
+
+    # 防爆倉
+    size = min(size, engine.capital * 0.4)
 
     return size
 
