@@ -6,7 +6,7 @@ from collections import defaultdict
 from app.state import engine
 
 # ===== CONFIG =====
-BASE_SIZE = 270000
+BASE_SIZE = 1.0
 MAX_POSITIONS = 4
 
 TAKE_PROFIT = 0.02
@@ -53,6 +53,9 @@ def ensure_engine():
     if not hasattr(engine, "capital"):
         engine.capital = 5.0
 
+    if not hasattr(engine, "peak_capital"):
+        engine.peak_capital = engine.capital
+
     if not hasattr(engine, "running"):
         engine.running = True
 
@@ -62,15 +65,18 @@ def log(msg: str):
     msg = str(msg)
     print(msg)
     engine.logs.append(msg)
-    engine.logs = engine.logs[-200:]
+    engine.logs = engine.logs[-300:]
 
 
-# ===== v14 SIZE ENGINE =====
-def get_dynamic_size(score, wallet, insider):
+# ===== V14 SIZE ENGINE =====
+def get_dynamic_size(score: float, wallet: float, insider: float) -> float:
+    # 用資金比例，避免單位爆炸
     size = engine.capital * 0.25
 
     if score > 0.03:
         size *= 1.5
+    elif score > 0.02:
+        size *= 1.2
 
     if wallet > 0.2:
         size *= 1.3
@@ -81,7 +87,7 @@ def get_dynamic_size(score, wallet, insider):
     # 防爆倉
     size = min(size, engine.capital * 0.4)
 
-    # ⭐ 防 0 倉（關鍵）
+    # 防 0 倉
     size = max(size, 0.01)
 
     return size
@@ -127,7 +133,7 @@ def fake_insider_score(mint: str) -> float:
 def compute_score(item):
     mint = item["mint"]
 
-    momentum = float(item.get("momentum", 0))
+    momentum = float(item.get("momentum", 0.0) or 0.0)
     wallet = fake_wallet_alpha(mint)
     cluster = fake_cluster_score(mint)
     insider = fake_insider_score(mint)
@@ -165,12 +171,18 @@ def fake_price(entry, age):
         drift = -0.05 + 0.008 * (phase - 12)
 
     drift += random.uniform(-0.012, 0.015)
-    return int(entry * (1 + drift))
+    return max(1, int(entry * (1 + drift)))
 
 
 async def get_price(mint, entry, age):
     await asyncio.sleep(0)
     return fake_price(entry, age)
+
+
+# ===== CAPITAL HELPERS =====
+def mark_peak_capital():
+    if engine.capital > engine.peak_capital:
+        engine.peak_capital = engine.capital
 
 
 # ===== SELL =====
@@ -199,8 +211,9 @@ async def try_sell(pos, price):
 
     engine.positions.remove(pos)
 
-    # ✅ 正確資金回寫
-    engine.capital += pos["size"] * (1 + pnl)
+    # 先回本金，再加盈虧
+    engine.capital += pos["size"]
+    engine.capital += pos["size"] * pnl
 
     engine.trade_history.append({
         "mint": pos["mint"],
@@ -215,7 +228,12 @@ async def try_sell(pos, price):
     else:
         engine.stats["losses"] += 1
 
-    log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
+    mark_peak_capital()
+
+    log(
+        f"SELL {pos['mint'][:6]} {reason} "
+        f"pnl={pnl:.4f} size={pos['size']:.4f} cap={engine.capital:.4f}"
+    )
 
     return True
 
@@ -257,19 +275,40 @@ async def try_trade(item):
 
     log(
         f"SCORE {mint[:6]} "
-        f"s={score:.4f} m={f['momentum']:.4f} "
-        f"w={f['wallet']:.4f} c={f['cluster']:.4f} i={f['insider']:.4f}"
+        f"s={score:.4f} "
+        f"m={f['momentum']:.4f} "
+        f"w={f['wallet']:.4f} "
+        f"c={f['cluster']:.4f} "
+        f"i={f['insider']:.4f}"
     )
+
+    out = fake_buy_out(score)
+    last_price = LAST_PRICE.get(mint)
+
+    if last_price:
+        move = abs(out - last_price) / last_price
+
+        if move < 0.003:
+            score *= 0.85
+            log(f"LOW_VOL {mint[:6]} adj={score:.4f}")
+
+    LAST_PRICE[mint] = out
 
     thr = dynamic_threshold()
 
     if score < thr:
-        engine.stats["rejected"] += 1
-        log(f"REJECT {mint[:6]} thr={thr:.4f}")
-        return
+        if random.random() < 0.35:
+            log(f"FORCE_ENTRY {mint[:6]}")
+        else:
+            engine.stats["rejected"] += 1
+            log(f"REJECT {mint[:6]} thr={thr:.4f}")
+            return
 
-    # ✅ v14 size
     size = get_dynamic_size(score, f["wallet"], f["insider"])
+
+    if size <= 0:
+        log(f"SKIP_ZERO_SIZE {mint[:6]}")
+        return
 
     if engine.capital < size:
         log("NO_CAPITAL")
@@ -277,9 +316,7 @@ async def try_trade(item):
 
     engine.capital -= size
 
-    out = fake_buy_out(score)
-
-    log(f"BUY {mint[:6]} size={int(size)} out={out}")
+    log(f"BUY {mint[:6]} size={size:.4f} out={out}")
 
     engine.positions.append({
         "mint": mint,
