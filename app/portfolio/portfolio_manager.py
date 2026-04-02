@@ -3,7 +3,7 @@ class PortfolioManager:
         capital = max(float(engine.capital), 1e-9)
 
         exposure = sum(
-            float(p.get("entry", 0.0) or 0.0) * float(p.get("size", 0.0) or 0.0)
+            float(p.get("size", 0.0) or 0.0)
             for p in engine.positions
             if p.get("meta", {}).get("source") == source
         )
@@ -14,7 +14,7 @@ class PortfolioManager:
         capital = max(float(engine.capital), 1e-9)
 
         exposure = sum(
-            float(p.get("entry", 0.0) or 0.0) * float(p.get("size", 0.0) or 0.0)
+            float(p.get("size", 0.0) or 0.0)
             for p in engine.positions
         )
 
@@ -25,7 +25,7 @@ class PortfolioManager:
 
     def allocated_exposure_for_source(self, engine, source: str) -> float:
         return sum(
-            float(p.get("entry", 0.0) or 0.0) * float(p.get("size", 0.0) or 0.0)
+            float(p.get("size", 0.0) or 0.0)
             for p in engine.positions
             if p.get("meta", {}).get("source") == source
         )
@@ -38,20 +38,12 @@ class PortfolioManager:
         max_position_size: float = 0.12,
         min_position_size: float = 0.02,
     ) -> float:
-        """
-        基礎資金分配：
-        - 先用 capital * base_risk_pct 算基本風險額
-        - 再按 source 做權重調整
-        - 再按目前總曝險做收縮
-        """
-
         capital = max(float(engine.capital), 0.0)
         if capital <= 0:
             return 0.0
 
         base = capital * float(base_risk_pct)
 
-        # 各訊號來源上限
         source_weights = {
             "breakout": 1.00,
             "smart_money": 0.95,
@@ -69,7 +61,6 @@ class PortfolioManager:
 
         total_exposure = self.total_exposure_ratio(engine)
 
-        # 曝險越高，倉位越保守
         if total_exposure > 0.60:
             size *= 0.50
         elif total_exposure > 0.40:
@@ -77,7 +68,6 @@ class PortfolioManager:
         elif total_exposure > 0.25:
             size *= 0.85
 
-        # 限制單來源曝險
         source_exposure = self.source_exposure_ratio(engine, source)
         if source_exposure > 0.20:
             size *= 0.50
