@@ -10,18 +10,15 @@ wallet_db = defaultdict(lambda: {
 })
 
 
-# ===== LOAD =====
 def load_wallet_db():
     global wallet_db
     try:
         with open(DB_FILE, "r") as f:
-            data = json.load(f)
-            wallet_db.update(data)
+            wallet_db.update(json.load(f))
     except:
         pass
 
 
-# ===== SAVE =====
 def save_wallet_db():
     try:
         with open(DB_FILE, "w") as f:
@@ -30,7 +27,6 @@ def save_wallet_db():
         pass
 
 
-# ===== UPDATE =====
 def update_wallet(wallet: str, pnl: float):
     if not wallet:
         return
@@ -44,7 +40,6 @@ def update_wallet(wallet: str, pnl: float):
         w["wins"] += 1
 
 
-# ===== SCORE =====
 def wallet_rank(wallet: str) -> float:
     w = wallet_db.get(wallet)
 
@@ -58,7 +53,6 @@ def wallet_rank(wallet: str) -> float:
     return min(score, 1.0)
 
 
-# ===== LEADERBOARD =====
 def top_wallets(n=10):
     ranked = sorted(wallet_db.items(), key=lambda x: wallet_rank(x[0]), reverse=True)
     return ranked[:n]
