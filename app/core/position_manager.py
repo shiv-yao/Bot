@@ -1,43 +1,47 @@
-def manage_position(pos, price):
-    entry = float(pos.get("entry", 0.0) or 0.0)
-    peak = float(pos.get("peak", 0.0) or 0.0)
+TP = 0.05
+SL = -0.01
+TRAIL = 0.005
+
+
+def check_exit(pos, price):
+    entry = float(pos.get("entry", 0) or 0)
+    peak = float(pos.get("peak", entry) or entry)
 
     if entry <= 0 or price <= 0:
-        return []
+        return None
 
     pnl = (price - entry) / entry
-    drawdown = (price - peak) / peak if peak > 0 else 0.0
+    dd = (price - peak) / peak if peak > 0 else 0.0
 
-    actions = []
+    if pnl >= TP:
+        return "TP"
 
-    # 1) break-even arm
-    if pnl > 0.02 and pos.get("breakeven_armed") is not True:
-        pos["breakeven_armed"] = True
-        pos["stop_price"] = entry
-        actions.append(("breakeven", 0.0))
+    if pnl <= SL:
+        return "SL"
 
-    # 2) partial TP
-    if pnl > 0.04 and not pos.get("tp1_done"):
-        pos["tp1_done"] = True
-        actions.append(("partial_sell", 0.5))
+    if pnl > 0.02 and dd < -TRAIL:
+        return "TRAIL"
 
-    # 3) add winner
-    if pnl > 0.03 and pos.get("add_done") is not True:
-        pos["add_done"] = True
-        actions.append(("add", 0.5))
+    return None
 
-    # 4) break-even exit
-    stop_price = pos.get("stop_price")
-    if pos.get("breakeven_armed") and stop_price is not None:
-        if price <= stop_price:
-            actions.append(("sell_all", 1.0))
 
-    # 5) trailing exit
-    if pnl > 0.015 and drawdown < -0.005:
-        actions.append(("sell_all", 1.0))
+def manage_position(pos, price):
+    """
+    相容舊系統：
+    回傳 list[tuple[str, float]]
+    可讓舊 engine 用：
+      for act, ratio in actions:
+          ...
+    """
+    reason = check_exit(pos, price)
+    if not reason:
+        return []
 
-    # 6) time stop
-    if pos.get("time") and (pos.get("time_age", 0) > 60):
-        actions.append(("sell_all", 1.0))
+    if reason == "TP":
+        return [("sell_all", 1.0)]
+    if reason == "SL":
+        return [("sell_all", 1.0)]
+    if reason == "TRAIL":
+        return [("sell_all", 1.0)]
 
-    return actions
+    return []
