@@ -66,7 +66,7 @@ def ensure_engine():
     engine.strategy_weights = getattr(engine, "strategy_weights", {
         "breakout": 0.25,
         "smart_money": 0.25,
-        "liquidity": 0.2,
+        "liquidity": 0.20,
         "insider": 0.15,
         "fusion": 0.15,
     })
@@ -121,11 +121,7 @@ async def build_features(mint):
         wallets = []
 
     try:
-        quote = await get_quote(
-            SOL_MINT,
-            mint,
-            QUOTE_AMOUNT,
-        )
+        quote = await get_quote(SOL_MINT, mint, QUOTE_AMOUNT)
     except Exception:
         quote = None
 
@@ -134,6 +130,9 @@ async def build_features(mint):
 
     out_amount = safe_float(quote.get("outAmount", 0.0), 0.0)
     price_impact = safe_float(quote.get("priceImpactPct", 1.0), 1.0)
+
+    if out_amount <= 0:
+        return None
 
     liquidity = out_amount / 1e6
 
@@ -163,9 +162,9 @@ def get_size(score):
 
 # ===== SELL =====
 async def try_sell(pos):
+    # 先保留簡化版 exit，不讓系統卡死
     price = pos["entry"] * 1.02
     pnl = (price - pos["entry"]) / pos["entry"]
-
     held = time.time() - pos["time"]
 
     log(f"CHECK_EXIT {pos['mint'][:6]} pnl={pnl:.4f} held={held:.1f}")
@@ -182,7 +181,7 @@ async def try_sell(pos):
             "score": pos.get("score", 0.0),
             "size": pos.get("size", 0.0),
             "timestamp": time.time(),
-            "meta": pos["meta"],
+            "meta": pos.get("meta", {}),
         })
 
         if pnl >= 0:
@@ -216,23 +215,36 @@ async def try_trade(mint):
 
     f = await build_features(mint)
 
+    if not f:
+        engine.stats["rejected"] += 1
+        log(f"NO_FEATURE {mint[:6]}")
+        return
+
     metrics = None
     if len(engine.trade_history) > 5:
         try:
             metrics = compute_metrics(engine)
-        except Exception:
+        except Exception as e:
+            log(f"METRICS_ERR {e}")
             metrics = None
 
-    ok, th = adaptive_filter(f, metrics)
+    try:
+        ok, th = adaptive_filter(f, metrics)
+    except Exception as e:
+        engine.stats["errors"] += 1
+        log(f"FILTER_ERR {e}")
+        return
+
+    state = th.get("state", "unknown")
 
     if not ok:
         engine.stats["rejected"] += 1
         log(
             f"SKIP {mint[:6]} "
-            f"state={th['state']} "
-            f"w={f['wallet_count']} "
-            f"liq={f['liquidity']:.4f} "
-            f"imp={f['price_impact']:.4f}"
+            f"state={state} "
+            f"w={f.get('wallet_count', 0)} "
+            f"liq={f.get('liquidity', 0):.4f} "
+            f"imp={f.get('price_impact', 0):.4f}"
         )
         return
 
@@ -246,14 +258,14 @@ async def try_trade(mint):
         {},
     )
 
-    score *= th["score_boost"]
+    score *= th.get("score_boost", 1.0)
 
     if f["wallet_count"] <= 2:
         score *= 0.75
 
     if score < 0.25:
         engine.stats["rejected"] += 1
-        log(f"LOW_SCORE {mint[:6]} score={score:.4f}")
+        log(f"LOW_SCORE {mint[:6]} state={state} score={score:.4f}")
         return
 
     size = get_size(score)
@@ -271,17 +283,21 @@ async def try_trade(mint):
         "size": size,
         "score": score,
         "time": now,
-        "meta": f,
+        "meta": {
+            **f,
+            "source": "fusion",
+            "filter_state": state,
+        },
     })
 
     LAST_TRADE[mint] = now
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
-    engine.last_signal = f"{mint[:6]} score={score:.4f}"
+    engine.last_signal = f"{mint[:6]} state={state} score={score:.4f}"
 
     log(
         f"BUY {mint[:6]} "
-        f"state={th['state']} "
+        f"state={state} "
         f"size={size:.4f} "
         f"score={score:.3f}"
     )
@@ -290,7 +306,6 @@ async def try_trade(mint):
 # ===== MAIN LOOP =====
 async def main_loop():
     ensure_engine()
-
     log("🔥 V24 AI FILTER ENGINE START")
 
     while engine.running:
