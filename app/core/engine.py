@@ -12,18 +12,19 @@ from app.alpha.breakout import breakout_score
 from app.alpha.smart_money import smart_money_score
 from app.alpha.liquidity import liquidity_score
 from app.alpha.regime import detect_regime
-from app.alpha.combiner import combine_scores, get_dynamic_weights
+from app.alpha.combiner import get_dynamic_weights
 from app.alpha.signal_router import router
 from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
-from app.alpha.helius_wallet_tracker import update_token_wallets, token_wallets
 from app.alpha.insider_engine import get_token_insider_score
-from app.alpha.wallet_alpha import (
-    record_wallet_result,
-    get_best_wallet,
-    get_top_wallets,
-    get_token_wallet_alpha,
+
+# 只保留 v7/v8 這套
+from app.alpha.wallet_alpha_v7 import (
+    get_wallet_alpha,
+    record_token_wallets,
+    record_wallet_trade as record_ranked_wallet_trade,
 )
+from app.alpha.helius_smart_wallet import fetch_smart_wallets
 
 from app.portfolio.allocator import get_position_size
 from app.portfolio.portfolio_manager import portfolio
@@ -38,7 +39,7 @@ recent_changes = []
 
 
 def calc_drawdown() -> float:
-    if engine.peak_capital <= 0:
+    if getattr(engine, "peak_capital", 0) <= 0:
         return 0.0
     return (engine.capital - engine.peak_capital) / engine.peak_capital
 
@@ -162,12 +163,8 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
     now = time.time()
 
     wallet_for_trade = meta.get("wallet")
-    if wallet_for_trade is None:
-        wallets = list(token_wallets.get(mint, set()))
-        if wallets:
-            wallet_for_trade = wallets[0]
-        else:
-            wallet_for_trade = "BOOTSTRAP_WALLET"
+    if not wallet_for_trade:
+        wallet_for_trade = "BOOTSTRAP_WALLET"
 
     meta = {**meta, "wallet": wallet_for_trade}
 
@@ -223,7 +220,7 @@ def sell(pos: dict, price: float, reason: str):
     if not wallet:
         wallet = "BOOTSTRAP_WALLET"
 
-    record_wallet_result(wallet, pnl)
+    record_ranked_wallet_trade(wallet, pnl)
 
     engine.capital += pos["size"] * (1 + pnl)
     engine.log(
@@ -253,8 +250,10 @@ def partial_sell(pos: dict, price: float, ratio: float):
     })
 
     wallet = pos.get("wallet") or (pos.get("meta", {}) or {}).get("wallet")
-    if wallet:
-        record_wallet_result(wallet, pnl)
+    if not wallet:
+        wallet = "BOOTSTRAP_WALLET"
+
+    record_ranked_wallet_trade(wallet, pnl)
 
     risk_engine.record_realized(pnl)
     engine.log(
@@ -309,15 +308,12 @@ async def manage_positions():
             for act, ratio in actions:
                 if act == "partial_sell":
                     partial_sell(pos, price, ratio)
-
                 elif act == "add":
                     add_winner(pos, price, ratio)
-
                 elif act == "sell_all":
                     sell(pos, price, "PM_EXIT")
                     sold = True
                     break
-
                 elif act == "breakeven":
                     engine.log(
                         f"BREAKEVEN {pos['mint'][:6]} "
@@ -351,59 +347,69 @@ async def manage_positions():
 
     engine.positions = remaining
 
-from app.alpha.wallet_alpha import get_token_wallet_alpha
 
-
-from app.alpha.wallet_alpha_v7 import (
-    get_wallet_alpha,
-    record_token_wallets,
-    record_wallet_trade,
-)
-from app.alpha.helius_smart_wallet import fetch_smart_wallets
-
-
-async def evaluate_route(route):
+async def evaluate_route(route: dict):
+    global last_trade_time
 
     mint = route["mint"]
     token = route["token"]
     source = route.get("source", "unknown")
+    now = time.time()
 
-    # ===== 1️⃣ 抓鏈上 wallet =====
-    wallets = await fetch_smart_wallets(mint)
-    record_token_wallets(mint, wallets)
+    if now - last_trade_time < TRADE_INTERVAL:
+        return
+
+    # 1. 抓鏈上 smart wallets
+    try:
+        wallets = await fetch_smart_wallets(mint)
+    except Exception as e:
+        engine.log(f"WALLET_FETCH_ERR {mint[:6]} {e}")
+        wallets = []
 
     if wallets:
-        print(f"WALLET_OK {mint[:6]} {len(wallets)}")
+        record_token_wallets(mint, wallets)
+        engine.log(f"WALLET_OK {mint[:6]} {len(wallets)}")
     else:
-        print(f"WALLET_EMPTY {mint[:6]}")
+        engine.log(f"WALLET_EMPTY {mint[:6]}")
 
-    # ===== 2️⃣ alpha =====
+    # 2. 讀 wallet alpha
+    wa = get_wallet_alpha(mint)
+    if not wa:
+        engine.log(f"REJECT_NO_WALLET {mint[:6]}")
+        return
+
+    w_avg = float(wa["avg"])
+    w_best = float(wa["best"])
+    w_cluster = float(wa["cluster"])
+    copy_signal = int(wa["copy_signal"])
+    top_wallet = wa["top_wallet"]
+    top_wallet_count = int(wa["count"])
+
+    engine.log(
+        f"WALLET_ALPHA {mint[:6]} "
+        f"avg={w_avg:.3f} "
+        f"best={w_best:.3f} "
+        f"cluster={w_cluster:.3f} "
+        f"copy={copy_signal}"
+    )
+    engine.log(f"LEAD_WALLET {mint[:6]} {top_wallet}")
+
+    # 3. 原 alpha
     b = breakout_score(token)
     l = liquidity_score(token)
     s = await smart_money_score(mint)
     ins = get_token_insider_score(mint)
 
-    wa = get_wallet_alpha(mint)
-
-    if not wa:
-        print(f"REJECT_NO_WALLET {mint[:6]}")
-        return
-
-    w_avg = wa["avg"]
-    w_best = wa["best"]
-    w_cluster = wa["cluster"]
-    copy = wa["copy_signal"]
-    top_wallet = wa["top_wallet"]
-
-    print(
-        f"WALLET_ALPHA {mint[:6]} "
-        f"avg={w_avg:.3f} "
-        f"best={w_best:.3f} "
-        f"cluster={w_cluster:.3f} "
-        f"copy={copy}"
+    engine.log(
+        f"ALPHA_RAW {mint[:6]} "
+        f"b={b:.3f} s={s:.3f} l={l:.3f} ins={ins:.3f}"
     )
 
-    # ===== 3️⃣ v7 核心（wallet主導）=====
+    # 4. v8 主融合分數
+    source_stats = build_source_stats(engine.trade_history)
+    insider_perf = build_insider_perf(engine.trade_history)
+    weights = get_dynamic_weights(source_stats, insider_perf)
+
     score = (
         b * 0.25 +
         l * 0.10 +
@@ -411,48 +417,93 @@ async def evaluate_route(route):
         ins * 0.15 +
         w_avg * 0.30
     )
+    score = round(min(score, 1.0), 4)
 
-    print(
+    engine.log(
         f"ROUTE {mint[:6]} "
-        f"score={score:.3f} "
+        f"src={source} "
+        f"score={score:.4f} "
         f"b={b:.3f} "
         f"s={s:.3f} "
         f"l={l:.3f} "
-        f"ins={ins:.3f}"
+        f"ins={ins:.3f} "
+        f"top_wallet_count={top_wallet_count} "
+        f"wallet_alpha_avg={w_avg:.3f} "
+        f"wallet_alpha_best={w_best:.3f} "
+        f"wallet_cluster={w_cluster:.3f} "
+        f"wallet_copy_signal={copy_signal} "
+        f"wb={weights.get('breakout', 0):.2f} "
+        f"ws={weights.get('smart_money', 0):.2f} "
+        f"wl={weights.get('liquidity', 0):.2f} "
+        f"wi={weights.get('insider', 0):.2f} "
+        f"regime={engine.regime}"
     )
 
-    # ===== 4️⃣ 強制過濾 =====
+    # 5. 強制條件
     if w_best < 0.2:
-        print(f"REJECT_NO_SMART {mint[:6]}")
+        engine.log(f"REJECT_NO_SMART {mint[:6]}")
         return
 
     if w_cluster < 0.2:
-        print(f"REJECT_NO_CLUSTER {mint[:6]}")
+        engine.log(f"REJECT_NO_CLUSTER {mint[:6]}")
         return
 
-    # ===== 5️⃣ size =====
-    size = 0.01
+    entry_threshold = 0.30
+    if engine.regime == "trend_up":
+        entry_threshold = 0.26
+
+    if score < entry_threshold:
+        engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
+        return
+
+    # 6. 價格
+    price = await get_price(token)
+    if not price:
+        engine.log(f"NO_PRICE {mint[:6]}")
+        return
+
+    # 7. 倉位
+    base = get_position_size(score, engine.capital, engine)
+    cap = portfolio.weighted_position_size(engine, source)
+    size = min(base, cap)
+
+    if s <= 0.15:
+        size *= 0.5
+        engine.log(f"SIZE_CUT_LOW_SMART {mint[:6]} size={size:.4f}")
 
     if w_best > 0.6:
-        size *= 2
+        size *= 2.0
+        engine.log(f"SIZE_BEST_WALLET {mint[:6]} size={size:.4f}")
 
-    if copy:
+    if copy_signal:
         size *= 1.5
+        engine.log(f"SIZE_COPY_SIGNAL {mint[:6]} size={size:.4f}")
 
     if w_cluster > 0.5:
         size *= 1.3
+        engine.log(f"SIZE_CLUSTER_BOOST {mint[:6]} size={size:.4f}")
 
-    print(
-        f"BUY {mint[:6]} "
-        f"size={size:.4f} "
-        f"wallet={top_wallet}"
-    )
-
-    # ===== 6️⃣ 下單 =====
-    price = await get_price(token)
-    if not price:
+    if size <= 0:
+        engine.log(f"SIZE_ZERO {mint[:6]}")
         return
 
+    # 8. 風控
+    if not allow(engine, score, size):
+        engine.log(f"BLOCKED_ALLOW {mint[:6]}")
+        return
+
+    ok, reason = should_enter(
+        token,
+        {
+            "momentum": 0.01,
+            "smart_money": s,
+        }
+    )
+    if not ok:
+        engine.log(f"FILTERED {mint[:6]} {reason}")
+        return
+
+    # 9. 下單
     buy(
         mint,
         price,
@@ -460,14 +511,21 @@ async def evaluate_route(route):
         size,
         {
             "source": source,
+            "breakout": b,
+            "smart_money": s,
+            "liquidity": l,
+            "insider": ins,
             "wallet": top_wallet,
+            "top_wallet_count": top_wallet_count,
             "wallet_alpha_avg": w_avg,
             "wallet_alpha_best": w_best,
             "wallet_cluster": w_cluster,
-            "wallet_copy_signal": copy,
+            "wallet_copy_signal": copy_signal,
+            "weights": weights,
         },
     )
 
+    engine.log(f"WALLET_TRACK {top_wallet}")
 
 
 async def main_loop():
