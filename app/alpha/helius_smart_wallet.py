@@ -7,14 +7,11 @@ async def fetch_smart_wallets(mint: str):
     if not HELIUS_KEY or not mint:
         return []
 
-    url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_KEY}"
+    url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions?api-key={HELIUS_KEY}"
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json={
-                "mint": mint,
-                "limit": 50
-            })
+            r = await client.get(url)
 
             if r.status_code != 200:
                 return []
@@ -25,10 +22,13 @@ async def fetch_smart_wallets(mint: str):
 
     wallets = []
 
-    for tx in data:
-        w = tx.get("toUserAccount")
-        if w and isinstance(w, str):
-            wallets.append(w)
+    for tx in data[:30]:
+        try:
+            for acc in tx.get("accountData", []):
+                addr = acc.get("account")
+                if addr:
+                    wallets.append(addr)
+        except:
+            continue
 
-    # 🔥 去重 + early wallets
     return list(dict.fromkeys(wallets))[:20]
