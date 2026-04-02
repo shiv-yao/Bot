@@ -1,35 +1,43 @@
 from collections import defaultdict
 
-wallet_scores = defaultdict(list)
+wallet_history = defaultdict(list)
+token_wallets = defaultdict(list)
 
+def record_wallet(wallet, pnl):
+    wallet_history[wallet].append(pnl)
 
-def record_token_wallets(mint: str, wallets: list[str]):
-    for w in wallets:
-        wallet_scores[w].append(mint)
+def record_token_wallets(mint, wallets):
+    token_wallets[mint] = wallets[:10]
 
+def score_wallet(wallet):
+    trades = wallet_history.get(wallet, [])
 
-def get_wallet_alpha(wallets: list[str]):
+    if len(trades) < 3:
+        return 0.05
+
+    win = sum(1 for x in trades if x > 0)
+    winrate = win / len(trades)
+    avg = sum(trades) / len(trades)
+
+    return min(1.0, winrate * 0.7 + max(avg, 0) * 5)
+
+def get_wallet_alpha(mint):
+    wallets = token_wallets.get(mint, [])
+
     if not wallets:
-        return {
-            "avg": 0.0,
-            "best": 0.0,
-            "cluster": 0.0,
-            "count": 0
-        }
+        return None
 
-    scores = []
+    scores = [(w, score_wallet(w)) for w in wallets]
 
-    for w in wallets:
-        history = wallet_scores.get(w, [])
-        score = min(len(history) * 0.1, 1.0)
-        scores.append(score)
+    best_wallet, best = max(scores, key=lambda x: x[1])
+    avg = sum(s for _, s in scores) / len(scores)
 
-    avg = sum(scores) / len(scores)
-    best = max(scores)
+    strong = [s for _, s in scores if s > 0.2]
+    cluster = len(strong) / len(scores)
 
     return {
-        "avg": round(avg, 3),
-        "best": round(best, 3),
-        "cluster": round(len(wallets) / 10, 3),
-        "count": len(wallets)
+        "avg": avg,
+        "best": best,
+        "cluster": cluster,
+        "wallet": best_wallet
     }
