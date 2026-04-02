@@ -19,9 +19,6 @@ def _source_perf(source_stats: dict, source: str) -> float:
 
 
 def _insider_perf_boost(insider_perf: dict | None) -> float:
-    """
-    根據 high_insider vs low_insider 績效差，調整 insider 權重。
-    """
     if not insider_perf:
         return 0.0
 
@@ -40,13 +37,6 @@ def _insider_perf_boost(insider_perf: dict | None) -> float:
 
 
 def get_dynamic_weights(source_stats: dict, insider_perf: dict | None = None) -> dict:
-    """
-    初始權重：
-    breakout    0.35
-    smart_money 0.25
-    liquidity   0.15
-    insider     0.25
-    """
     wb = 0.35 + _source_perf(source_stats, "breakout")
     ws = 0.25 + _source_perf(source_stats, "smart_money")
     wl = 0.15 + _source_perf(source_stats, "liquidity")
