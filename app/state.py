@@ -5,6 +5,7 @@ class EngineState:
         self.capital = 5.0
         self.start_capital = 5.0
         self.peak_capital = 5.0
+        self.regime = "unknown"
 
         self.positions = []
         self.trade_history = []
@@ -21,6 +22,14 @@ class EngineState:
 
         self.win_streak = 0
         self.loss_streak = 0
+        self.last_signal = ""
+        self.last_trade = ""
+
+    def log(self, msg):
+        msg = str(msg)
+        print(msg)
+        self.logs.append(msg)
+        self.logs = self.logs[-300:]
 
 
 engine = EngineState()
