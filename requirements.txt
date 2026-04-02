@@ -1,4 +1,11 @@
-fastapi
-uvicorn
-httpx
-websockets
+fastapi==0.110.0
+uvicorn==0.27.1
+httpx==0.27.0
+pydantic==2.6.4
+python-dotenv==1.0.1
+
+# async / utils
+anyio==4.3.0
+
+# optional（你後面會用到）
+websockets==12.0
