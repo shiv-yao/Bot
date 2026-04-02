@@ -1,113 +1,286 @@
 import asyncio
+import random
+import time
+from collections import defaultdict
 
-from app.core.state import engine
-from app.core.scanner import scan
-from app.core.pricing import get_price
-from app.core.allocator import get_position_size
-from app.core.position_manager import check_exit
+from app.state import engine
 
-from app.core.score_engine import compute_score
-from app.core.weight_engine import get_weights, adjust_weights
+# ===== CONFIG =====
+BASE_SIZE = 270000
+MAX_POSITIONS = 4
 
-from app.alpha.wallet_alpha_v7 import get_wallet_alpha, record_token_wallets
-from app.alpha.wallet_brain import update_wallet, wallet_rank
-from app.alpha.helius_smart_wallet import fetch_smart_wallets
+TAKE_PROFIT = 0.02
+STOP_LOSS = -0.01
+TRAILING_STOP = -0.008
+MAX_HOLD_SEC = 20
 
-from app.alpha.breakout import breakout_score
-from app.alpha.smart_money import smart_money_score
-from app.alpha.liquidity import liquidity_score
-from app.alpha.insider_engine import get_token_insider_score
-from app.alpha.wallet_graph import cluster_score
-from app.alpha.insider_v2 import insider_score_v2
+TOKEN_COOLDOWN = 10
+TOP_N = 4
+
+LAST_TRADE = defaultdict(float)
+LAST_PRICE = {}
+
+# ===== SINGLE BRAIN WEIGHTS =====
+WEIGHTS = {
+    "momentum": 0.45,
+    "wallet": 0.25,
+    "cluster": 0.15,
+    "insider": 0.15,
+}
 
 
-async def evaluate_route(route):
-    mint = route["mint"]
-    token = route["token"]
+def log(msg: str):
+    msg = str(msg)
+    print(msg)
+    engine.logs.append(msg)
+    engine.logs = engine.logs[-200:]
 
-    wallets = await fetch_smart_wallets(mint)
-    record_token_wallets(mint, wallets)
 
-    wa = get_wallet_alpha(mint)
-    if not wa:
-        return
+# ===== 動態門檻 =====
+def dynamic_threshold():
+    n = len(engine.positions)
 
-    top_wallet = wa["top_wallet"]
+    if n < 2:
+        return 0.012
+    elif n < 4:
+        return 0.014
+    else:
+        return 0.018
 
-    alpha = {
-        "b": breakout_score(token),
-        "s": await smart_money_score(mint),
-        "l": liquidity_score(token),
-        "i": get_token_insider_score(mint),
-        "w": wa["avg"],
-        "c": cluster_score(top_wallet),
-        "i2": insider_score_v2(mint),
+
+# ===== MOCK SCANNER =====
+async def fetch_candidates():
+    base = [
+        {"mint": "8F8FLuwv7iL26ecsQ1yXmYKJ6us6Y55QEpJDMFk11Wau", "momentum": 0.020},
+        {"mint": "sosd5Q3DutGxMEaukBDmkPgsapMQz59jNjGWmhYcdTQ", "momentum": 0.018},
+        {"mint": "SooEj828BSjtgTecBRkqBJ4oquc713yyFZqbCawawoN", "momentum": 0.017},
+        {"mint": "sokhCSmzutMPPuNcxG1j6gYLowgiM8mswjJu8FBYm5r", "momentum": 0.020},
+    ]
+    await asyncio.sleep(0)
+    return base[:TOP_N]
+
+
+# ===== 模擬 wallet / cluster / insider =====
+def fake_wallet_alpha(mint: str) -> float:
+    return 0.05 + (sum(ord(c) for c in mint[:6]) % 20) / 100.0
+
+
+def fake_cluster_score(mint: str) -> float:
+    return (sum(ord(c) for c in mint[-6:]) % 10) / 20.0
+
+
+def fake_insider_score(mint: str) -> float:
+    return (sum(ord(c) for c in mint[3:9]) % 10) / 25.0
+
+
+def compute_score(item):
+    mint = item["mint"]
+    momentum = float(item.get("momentum", 0.0) or 0.0)
+    wallet = fake_wallet_alpha(mint)
+    cluster = fake_cluster_score(mint)
+    insider = fake_insider_score(mint)
+
+    score = (
+        momentum * WEIGHTS["momentum"]
+        + wallet * WEIGHTS["wallet"]
+        + cluster * WEIGHTS["cluster"]
+        + insider * WEIGHTS["insider"]
+    )
+
+    return {
+        "score": score,
+        "momentum": momentum,
+        "wallet": wallet,
+        "cluster": cluster,
+        "insider": insider,
     }
 
-    score = compute_score(alpha, get_weights())
-    rank = wallet_rank(top_wallet)
 
-    size = get_position_size(engine.capital, score)
+def fake_buy_out(score):
+    return int(200 + score * 3000)
 
-    if rank > 0.7:
-        size *= 2
-    if rank > 0.85:
-        size *= 3
 
-    price = await get_price(token)
-    if not price:
-        return
+def fake_price(entry, age):
+    phase = age % 16
 
-    engine.positions.append({
-        "mint": mint,
-        "entry": price,
-        "peak": price,
-        "size": size,
-        "wallet": top_wallet
+    if phase < 4:
+        drift = 0.012 * phase
+    elif phase < 8:
+        drift = 0.05 - 0.01 * (phase - 4)
+    elif phase < 12:
+        drift = 0.01 - 0.015 * (phase - 8)
+    else:
+        drift = -0.05 + 0.008 * (phase - 12)
+
+    drift += random.uniform(-0.012, 0.015)
+
+    return int(entry * (1 + drift))
+
+
+async def get_price(mint, entry, age):
+    await asyncio.sleep(0)
+    return fake_price(entry, age)
+
+
+# ===== SELL LOGIC =====
+async def check_exit(pos, price):
+    entry = pos["entry_out"]
+    peak = pos["peak"]
+
+    pnl = (price - entry) / entry
+    dd = (price - peak) / peak
+
+    log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
+
+    if pnl >= TAKE_PROFIT:
+        return "TP", pnl
+
+    if pnl <= STOP_LOSS:
+        return "SL", pnl
+
+    if peak > entry and dd <= TRAILING_STOP:
+        return "TRAIL", pnl
+
+    if time.time() - pos["time"] > MAX_HOLD_SEC:
+        return "TIME", pnl
+
+    return None, pnl
+
+
+async def try_sell(pos, price):
+    reason, pnl = await check_exit(pos, price)
+
+    if not reason:
+        return False
+
+    engine.positions.remove(pos)
+    engine.capital *= (1 + pnl)
+
+    engine.trade_history.append({
+        "mint": pos["mint"],
+        "pnl": pnl,
+        "reason": reason,
+        "score": pos.get("score", 0),
+        "meta": pos.get("meta", {}),
     })
 
-    engine.log(f"BUY {mint} score={score:.3f} rank={rank:.2f}")
+    if pnl >= 0:
+        engine.stats["wins"] = engine.stats.get("wins", 0) + 1
+    else:
+        engine.stats["losses"] = engine.stats.get("losses", 0) + 1
+
+    log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
+
+    return True
 
 
 async def manage_positions():
-    remaining = []
+    now = time.time()
 
-    for pos in engine.positions:
-        price = await get_price(pos["mint"])
+    for pos in list(engine.positions):
+        age = now - pos["time"]
+
+        price = await get_price(pos["mint"], pos["entry_out"], age)
 
         if price > pos["peak"]:
             pos["peak"] = price
 
-        exit_reason = check_exit(pos, price)
+        await try_sell(pos, price)
 
-        if exit_reason:
-            pnl = (price - pos["entry"]) / pos["entry"]
 
-            update_wallet(pos["wallet"], pnl)
-            adjust_weights(pnl)
+# ===== BUY LOGIC =====
+async def try_trade(item):
+    mint = item["mint"]
+    now = time.time()
 
-            engine.capital += pos["size"] * (1 + pnl)
+    if any(p["mint"] == mint for p in engine.positions):
+        return
 
-            engine.log(f"SELL {pos['mint']} {exit_reason} pnl={pnl:.3f}")
+    if len(engine.positions) >= MAX_POSITIONS:
+        log("MAX_POSITIONS")
+        return
+
+    if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
+        log(f"COOLDOWN {mint[:6]}")
+        return
+
+    engine.stats["signals"] += 1
+
+    features = compute_score(item)
+    score = features["score"]
+
+    log(
+        f"SCORE {mint[:6]} "
+        f"s={score:.4f} "
+        f"m={features['momentum']:.4f} "
+        f"w={features['wallet']:.4f} "
+        f"c={features['cluster']:.4f} "
+        f"i={features['insider']:.4f}"
+    )
+
+    new_price = fake_buy_out(score)
+    last_price = LAST_PRICE.get(mint)
+
+    if last_price:
+        move = abs(new_price - last_price) / last_price
+
+        if move < 0.003:
+            score *= 0.85
+            log(f"LOW_VOL {mint[:6]} adj={score:.4f}")
+
+    LAST_PRICE[mint] = new_price
+
+    thr = dynamic_threshold()
+
+    if score < thr:
+        if random.random() < 0.35:
+            log(f"FORCE_ENTRY {mint[:6]}")
         else:
-            remaining.append(pos)
+            engine.stats["rejected"] += 1
+            log(f"REJECT {mint[:6]} thr={thr:.4f}")
+            return
 
-    engine.positions = remaining
+    out = new_price
+
+    log(f"BUY {mint[:6]} out={out}")
+
+    engine.positions.append({
+        "mint": mint,
+        "entry_out": out,
+        "size": BASE_SIZE,
+        "peak": out,
+        "time": now,
+        "score": score,
+        "meta": {
+            "momentum": features["momentum"],
+            "wallet": features["wallet"],
+            "cluster": features["cluster"],
+            "insider": features["insider"],
+        },
+    })
+
+    LAST_TRADE[mint] = now
+    engine.stats["executed"] += 1
+
+    log(f"EXECUTED {mint[:6]}")
 
 
+# ===== MAIN LOOP =====
 async def main_loop():
-    engine.log("🚀 v13 PRODUCT ENGINE START")
+    log("ENGINE STARTED")
 
     while engine.running:
         try:
             await manage_positions()
 
-            tokens = await scan()
+            items = await fetch_candidates()
+            ranked = sorted(items, key=lambda x: compute_score(x)["score"], reverse=True)
 
-            for t in tokens:
-                await evaluate_route(t)
+            for item in ranked:
+                await try_trade(item)
 
         except Exception as e:
-            engine.log(f"ERR {e}")
+            engine.stats["errors"] += 1
+            log(f"ERR {e}")
 
         await asyncio.sleep(2)
