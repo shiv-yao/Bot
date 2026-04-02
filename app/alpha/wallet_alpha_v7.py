@@ -5,6 +5,7 @@ token_wallets = defaultdict(list)
 
 MIN_TRADES = 3
 
+
 def record_wallet_trade(wallet, pnl):
     if not wallet:
         wallet = "BOOTSTRAP_WALLET"
@@ -19,8 +20,8 @@ def record_token_wallets(mint, wallets):
     if not wallets:
         return
 
-    # 🔥 只保留 early wallets（最關鍵）
-    token_wallets[mint] = wallets[:10]
+    # 只保留 early wallets
+    token_wallets[mint] = list(dict.fromkeys(wallets))[:10]
 
 
 def wallet_score(wallet):
@@ -47,9 +48,8 @@ def get_wallet_alpha(mint):
     best_wallet, best_score = max(scored, key=lambda x: x[1])
     avg = sum(s for _, s in scored) / len(scored)
 
-    # 🔥 cluster（真正關鍵）
     strong = [s for _, s in scored if s > 0.2]
-    cluster = len(strong) / len(scored)
+    cluster = len(strong) / len(scored) if scored else 0.0
 
     copy_signal = 1 if best_score > 0.5 else 0
 
@@ -59,5 +59,5 @@ def get_wallet_alpha(mint):
         "cluster": cluster,
         "top_wallet": best_wallet,
         "copy_signal": copy_signal,
-        "count": len(wallets)
+        "count": len(wallets),
     }
