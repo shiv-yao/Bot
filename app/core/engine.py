@@ -1,6 +1,7 @@
 import asyncio
 import random
 import time
+from app.metrics import compute_metrics
 from collections import defaultdict
 
 from app.state import engine
@@ -280,8 +281,25 @@ async def main_loop():
             for item in items:
                 await try_trade(item)
 
+            # ===== 📊 METRICS（加在這裡）=====
+            if len(engine.trade_history) >= 5:
+                m = compute_metrics(engine)
+
+                log(
+                    f"📊 trades={m['trades']} "
+                    f"wr={m['win_rate']} "
+                    f"pf={m['profit_factor']} "
+                    f"dd={m['max_drawdown']} "
+                    f"sharpe={m['sharpe']}"
+                )
+
         except Exception as e:
             engine.stats["errors"] += 1
             log(f"ERR {e}")
 
         await asyncio.sleep(2)
+        
+
+
+
+
