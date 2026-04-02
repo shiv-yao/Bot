@@ -3,40 +3,34 @@ import random
 import time
 from collections import defaultdict
 
-from app.state import engine
 from app.metrics import compute_metrics
-
-# ===== V20 =====
-from app.mempool.sniper import mempool_sniper
-from app.discovery.pump import pump_scanner
-
-# ===== V19 =====
-from app.strategy.engine import run_strategies
-from app.strategy.allocator import allocate_capital
-from app.strategy.auto_kill import update_strategy_weights
-
-# ===== V17 =====
+from app.state import engine
 from app.alpha.combiner import combine_scores
+from app.portfolio.allocator import get_position_size
 
-# ===== CONFIG =====
 MAX_POSITIONS = 4
 TAKE_PROFIT = 0.02
 STOP_LOSS = -0.01
+TRAILING_STOP = -0.008
+MAX_HOLD_SEC = 20
+
 TOKEN_COOLDOWN = 10
+TOP_N = 4
 
 LAST_TRADE = defaultdict(float)
+LAST_PRICE = {}
 
-# ===== INIT =====
+WIN_STREAK = 0
+LOSS_STREAK = 0
+
+
 def ensure_engine():
     if not hasattr(engine, "positions"):
         engine.positions = []
-
     if not hasattr(engine, "logs"):
         engine.logs = []
-
     if not hasattr(engine, "trade_history"):
         engine.trade_history = []
-
     if not hasattr(engine, "stats"):
         engine.stats = {
             "signals": 0,
@@ -44,73 +38,250 @@ def ensure_engine():
             "wins": 0,
             "losses": 0,
             "errors": 0,
+            "rejected": 0,
         }
-
     if not hasattr(engine, "capital"):
         engine.capital = 5.0
-
+    if not hasattr(engine, "start_capital"):
+        engine.start_capital = engine.capital
     if not hasattr(engine, "peak_capital"):
         engine.peak_capital = engine.capital
-
     if not hasattr(engine, "running"):
         engine.running = True
-
-    if not hasattr(engine, "candidates"):
-        engine.candidates = {}
-
-    if not hasattr(engine, "strategy_weights"):
-        engine.strategy_weights = {
-            "breakout": 0.2,
-            "smart_money": 0.2,
-            "insider": 0.2,
-            "momentum": 0.2,
-            "fusion": 0.2,
-        }
+    if not hasattr(engine, "regime"):
+        engine.regime = "unknown"
+    if not hasattr(engine, "win_streak"):
+        engine.win_streak = 0
+    if not hasattr(engine, "loss_streak"):
+        engine.loss_streak = 0
+    if not hasattr(engine, "last_signal"):
+        engine.last_signal = ""
+    if not hasattr(engine, "last_trade"):
+        engine.last_trade = ""
 
 
-# ===== LOG =====
 def log(msg):
+    msg = str(msg)
     print(msg)
-    engine.logs.append(str(msg))
+    engine.logs.append(msg)
     engine.logs = engine.logs[-300:]
 
 
-# ===== FAKE DATA =====
-def fake_features():
-    return {
-        "momentum": random.uniform(0.01, 0.03),
-        "wallet": random.uniform(0.05, 0.25),
-        "cluster": random.uniform(0.05, 0.3),
-        "insider": random.uniform(0.0, 0.2),
+async def fetch_candidates():
+    base = [
+        {"mint": "8F8FLu", "momentum": 0.020},
+        {"mint": "sosd5Q", "momentum": 0.018},
+        {"mint": "SooEj8", "momentum": 0.017},
+        {"mint": "sokhCS", "momentum": 0.020},
+    ]
+    await asyncio.sleep(0)
+    return base[:TOP_N]
+
+
+def fake_wallet(_m):
+    return random.uniform(0.05, 0.25)
+
+
+def fake_cluster(_m):
+    return random.uniform(0.05, 0.3)
+
+
+def fake_insider(_m):
+    return random.uniform(0.0, 0.5)
+
+
+def _build_source_stats():
+    stats = {}
+    for t in engine.trade_history:
+        if not isinstance(t, dict):
+            continue
+        src = (t.get("meta", {}) or {}).get("source", "unknown")
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+
+        if src not in stats:
+            stats[src] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+            }
+
+        stats[src]["count"] += 1
+        stats[src]["total_pnl"] += pnl
+        if pnl >= 0:
+            stats[src]["wins"] += 1
+        else:
+            stats[src]["losses"] += 1
+
+    for src, row in stats.items():
+        c = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / c
+        row["win_rate"] = row["wins"] / c
+
+    return stats
+
+
+def _build_insider_perf(threshold: float = 0.10):
+    buckets = {
+        "high_insider": {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0},
+        "low_insider": {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0},
     }
 
+    for t in engine.trade_history:
+        if not isinstance(t, dict):
+            continue
+        meta = t.get("meta", {}) or {}
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        insider = float(meta.get("insider", 0.0) or 0.0)
 
-# ===== SELL =====
+        name = "high_insider" if insider >= threshold else "low_insider"
+        row = buckets[name]
+        row["count"] += 1
+        row["total_pnl"] += pnl
+        if pnl >= 0:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+
+    for row in buckets.values():
+        c = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / c
+        row["win_rate"] = row["wins"] / c
+
+    buckets["comparison"] = {
+        "avg_pnl_diff": buckets["high_insider"]["avg_pnl"] - buckets["low_insider"]["avg_pnl"],
+        "win_rate_diff": buckets["high_insider"]["win_rate"] - buckets["low_insider"]["win_rate"],
+        "threshold": threshold,
+    }
+
+    return buckets
+
+
+def compute_score(item):
+    mint = item["mint"]
+
+    breakout = float(item["momentum"])
+    smart_money = float(fake_wallet(mint))
+    liquidity = float(fake_cluster(mint))
+    insider = float(fake_insider(mint))
+
+    source_stats = _build_source_stats()
+    insider_perf = _build_insider_perf()
+
+    score = combine_scores(
+        breakout=breakout,
+        smart_money=smart_money,
+        liquidity=liquidity,
+        insider=insider,
+        regime=getattr(engine, "regime", "unknown"),
+        source_stats=source_stats,
+        insider_perf=insider_perf,
+    )
+
+    return score, breakout, smart_money, liquidity, insider
+
+
+def fake_price(entry):
+    return entry * (1 + random.uniform(-0.02, 0.05))
+
+
 async def try_sell(pos):
-    price = pos["entry"] * (1 + random.uniform(-0.02, 0.05))
+    global WIN_STREAK, LOSS_STREAK
+
+    price = fake_price(pos["entry"])
     pnl = (price - pos["entry"]) / pos["entry"]
 
-    if pnl >= TAKE_PROFIT or pnl <= STOP_LOSS:
-        engine.positions.remove(pos)
+    if pnl >= TAKE_PROFIT:
+        reason = "TP"
+    elif pnl <= STOP_LOSS:
+        reason = "SL"
+    else:
+        return
 
-        engine.capital += pos["size"]
-        engine.capital += pos["size"] * pnl
+    engine.positions.remove(pos)
+
+    engine.capital += pos["size"]
+    engine.capital += pos["size"] * pnl
+
+    engine.trade_history.append({
+        "mint": pos["mint"],
+        "pnl": pnl,
+        "reason": reason,
+        "score": pos.get("score", 0.0),
+        "size": pos.get("size", 0.0),
+        "timestamp": time.time(),
+        "meta": pos.get("meta", {}),
+    })
+
+    if pnl >= 0:
+        engine.stats["wins"] += 1
+        WIN_STREAK += 1
+        LOSS_STREAK = 0
+    else:
+        engine.stats["losses"] += 1
+        LOSS_STREAK += 1
+        WIN_STREAK = 0
+
+    engine.win_streak = WIN_STREAK
+    engine.loss_streak = LOSS_STREAK
+    engine.last_trade = f"{pos['mint']} {reason} pnl={pnl:.4f}"
+
+    if engine.capital > engine.peak_capital:
+        engine.peak_capital = engine.capital
+
+    log(f"SELL {pos['mint']} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
+
+
+def try_add_position(pos):
+    if pos.get("added"):
+        return
+
+    if random.random() < 0.3:
+        size = round(pos["size"] * 0.5, 4)
+
+        if engine.capital < size:
+            return
+
+        engine.capital -= size
+        pos["size"] += size
+        pos["added"] = True
+
+        log(f"ADD {pos['mint']} size={size:.4f}")
+
+
+def try_partial(pos):
+    if pos.get("tp_done"):
+        return
+
+    price = fake_price(pos["entry"])
+    pnl = (price - pos["entry"]) / pos["entry"]
+
+    if pnl > 0.015:
+        size = round(pos["size"] * 0.5, 4)
+
+        engine.capital += size
+        engine.capital += size * pnl
+        pos["size"] *= 0.5
+        pos["tp_done"] = True
 
         engine.trade_history.append({
             "mint": pos["mint"],
             "pnl": pnl,
+            "reason": "PARTIAL",
+            "score": pos.get("score", 0.0),
+            "size": size,
+            "timestamp": time.time(),
             "meta": pos.get("meta", {}),
         })
 
-        if pnl >= 0:
-            engine.stats["wins"] += 1
-        else:
-            engine.stats["losses"] += 1
+        if engine.capital > engine.peak_capital:
+            engine.peak_capital = engine.capital
 
-        log(f"SELL {pos['mint']} pnl={pnl:.4f}")
+        log(f"PARTIAL {pos['mint']} pnl={pnl:.4f}")
 
 
-# ===== TRADE =====
 async def try_trade(item):
     mint = item["mint"]
 
@@ -118,89 +289,95 @@ async def try_trade(item):
         return
 
     if len(engine.positions) >= MAX_POSITIONS:
+        engine.stats["rejected"] += 1
+        log("MAX_POSITIONS")
         return
 
-    f = fake_features()
+    now = time.time()
+    if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
+        engine.stats["rejected"] += 1
+        log(f"COOLDOWN {mint}")
+        return
 
-    # ===== 多策略 =====
-    strategy_scores = run_strategies({
-        "mint": mint,
-        "momentum": f["momentum"],
-        "wallet": f["wallet"],
-        "cluster": f["cluster"],
-        "insider": f["insider"],
-    }, engine)
+    score, breakout, smart_money, liquidity, insider = compute_score(item)
+    engine.stats["signals"] += 1
+    engine.last_signal = f"{mint} score={score:.4f}"
 
-    allocations = allocate_capital(engine, strategy_scores)
+    log(
+        f"SCORE {mint} "
+        f"s={score:.4f} "
+        f"b={breakout:.4f} "
+        f"sm={smart_money:.4f} "
+        f"l={liquidity:.4f} "
+        f"i={insider:.4f}"
+    )
 
-    best_strat = max(strategy_scores, key=strategy_scores.get)
-    score = strategy_scores[best_strat]
+    size = get_position_size(score, engine.capital, engine)
 
-    size = engine.capital * allocations.get(best_strat, 0.1)
+    if size <= 0:
+        engine.stats["rejected"] += 1
+        log(f"SKIP_ZERO_SIZE {mint}")
+        return
 
-    if engine.capital < size or size <= 0:
+    if engine.capital < size:
+        engine.stats["rejected"] += 1
+        log("NO_CAPITAL")
         return
 
     engine.capital -= size
 
     engine.positions.append({
         "mint": mint,
-        "entry": 100,
+        "entry": 100.0,
         "size": size,
+        "added": False,
+        "tp_done": False,
         "score": score,
-        "strategy": best_strat,
-        "time": time.time(),
+        "time": now,
         "meta": {
-            "source": best_strat,
-            **f,
+            "source": "fusion",
+            "breakout": breakout,
+            "smart_money": smart_money,
+            "liquidity": liquidity,
+            "momentum": breakout,
+            "insider": insider,
         },
     })
 
+    LAST_TRADE[mint] = now
     engine.stats["executed"] += 1
 
-    log(f"BUY {mint} strat={best_strat} size={size:.4f}")
+    log(f"BUY {mint} size={size:.4f}")
 
 
-# ===== MAIN LOOP =====
 async def main_loop():
     ensure_engine()
-
-    # ===== 背景 =====
-    asyncio.create_task(mempool_sniper(engine))
-
-    log("🔥 V20 WAR ENGINE START")
+    log("🚀 V18 START")
 
     while engine.running:
         try:
-            # ===== pump.fun =====
-            await pump_scanner(engine)
+            for pos in list(engine.positions):
+                try_partial(pos)
+                try_add_position(pos)
+                await try_sell(pos)
 
-            # ===== candidates =====
-            items = []
-            for mint in list(engine.candidates.keys())[-20:]:
-                items.append({"mint": mint})
-
+            items = await fetch_candidates()
             for item in items:
                 await try_trade(item)
 
-            # ===== manage =====
-            for pos in list(engine.positions):
-                await try_sell(pos)
-
-            # ===== metrics + AI進化 =====
             if len(engine.trade_history) >= 5:
                 m = compute_metrics(engine)
-
                 if m:
-                    update_strategy_weights(engine, m)
-
                     log(
-                        f"📊 WR={m['performance']['win_rate']} "
-                        f"PF={m['performance']['profit_factor']}"
+                        f"📊 trades={m.get('performance', {}).get('trades', 0)} "
+                        f"wr={m.get('performance', {}).get('win_rate', 0)} "
+                        f"pf={m.get('performance', {}).get('profit_factor', 0)} "
+                        f"dd={m.get('summary', {}).get('drawdown', 0)} "
+                        f"sharpe={m.get('performance', {}).get('sharpe', 0)}"
                     )
 
         except Exception as e:
             engine.stats["errors"] += 1
             log(f"ERR {e}")
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
