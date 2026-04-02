@@ -1,7 +1,3 @@
-def clamp(v, lo, hi):
-    return max(lo, min(v, hi))
-
-
 def compute_market_state(metrics: dict | None):
     if not metrics:
         return "neutral"
@@ -22,47 +18,67 @@ def compute_market_state(metrics: dict | None):
     return "neutral"
 
 
-def adaptive_thresholds(metrics: dict | None):
+def adaptive_thresholds(metrics: dict | None, no_trade_cycles: int = 0):
     state = compute_market_state(metrics)
 
     if state == "aggressive":
-        return {
+        th = {
             "wallet_min": 1,
             "liquidity_min": 0.003,
             "max_price_impact": 0.08,
             "score_boost": 1.10,
+            "score_min": 0.15,
             "state": state,
         }
-
-    if state == "defensive":
-        return {
+    elif state == "defensive":
+        th = {
             "wallet_min": 3,
             "liquidity_min": 0.020,
             "max_price_impact": 0.020,
             "score_boost": 0.80,
+            "score_min": 0.25,
+            "state": state,
+        }
+    else:
+        th = {
+            "wallet_min": 2,
+            "liquidity_min": 0.005,
+            "max_price_impact": 0.050,
+            "score_boost": 1.00,
+            "score_min": 0.20,
             "state": state,
         }
 
-    return {
-        "wallet_min": 2,
-        "liquidity_min": 0.005,
-        "max_price_impact": 0.050,
-        "score_boost": 1.00,
-        "state": state,
-    }
+    # 長時間沒交易，自動放寬
+    if no_trade_cycles >= 5:
+        th["wallet_min"] = max(1, th["wallet_min"] - 1)
+        th["liquidity_min"] *= 0.6
+        th["max_price_impact"] *= 1.5
+        th["score_min"] *= 0.8
+        th["state"] = f"{th['state']}_loosen1"
+
+    if no_trade_cycles >= 10:
+        th["wallet_min"] = 1
+        th["liquidity_min"] *= 0.5
+        th["max_price_impact"] *= 1.5
+        th["score_min"] *= 0.8
+        th["state"] = f"{th['state']}_loosen2"
+
+    return th
 
 
-def adaptive_filter(features: dict | None, metrics: dict | None):
+def adaptive_filter(features: dict | None, metrics: dict | None, no_trade_cycles: int = 0):
     if not features:
         return False, {
             "wallet_min": 999,
             "liquidity_min": 999,
             "max_price_impact": 999,
             "score_boost": 0.0,
+            "score_min": 999,
             "state": "invalid",
         }
 
-    th = adaptive_thresholds(metrics)
+    th = adaptive_thresholds(metrics, no_trade_cycles=no_trade_cycles)
 
     if float(features.get("wallet_count", 0) or 0) < th["wallet_min"]:
         return False, th
