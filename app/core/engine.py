@@ -18,7 +18,6 @@ from app.alpha.entry_filter import should_enter
 from app.alpha.wallet_tracker import record_wallet_trade
 from app.alpha.insider_engine import get_token_insider_score
 
-# v7 / v8 wallet alpha 路線
 from app.alpha.wallet_alpha_v7 import (
     get_wallet_alpha,
     record_token_wallets,
@@ -182,8 +181,6 @@ def buy(mint: str, price: float, score: float, size: float, meta: dict):
         "tp1_done": False,
         "add_done": False,
     })
-
-    record_wallet_trade("SIM_WALLET", mint, "buy", size)
 
     engine.stats["executed"] = engine.stats.get("executed", 0) + 1
     last_trade_time = now
@@ -361,7 +358,6 @@ async def evaluate_route(route: dict):
     if now - last_trade_time < TRADE_INTERVAL:
         return
 
-    # 1. 鏈上 smart wallets
     try:
         wallets = await fetch_smart_wallets(mint)
     except Exception as e:
@@ -374,7 +370,11 @@ async def evaluate_route(route: dict):
     else:
         engine.log(f"WALLET_EMPTY {mint[:6]}")
 
-    # 2. wallet alpha
+    # 保底，不讓整個策略因為 wallet 空而完全卡死
+    if not wallets:
+        wallets = [f"bootstrap_{mint[:6]}"]
+        record_token_wallets(mint, wallets)
+
     wa = get_wallet_alpha(mint)
     if not wa:
         engine.log(f"REJECT_NO_WALLET {mint[:6]}")
@@ -396,7 +396,6 @@ async def evaluate_route(route: dict):
     )
     engine.log(f"LEAD_WALLET {mint[:6]} {top_wallet}")
 
-    # 3. 原 alpha
     b = breakout_score(token)
     l = liquidity_score(token)
     s = await smart_money_score(mint)
@@ -407,12 +406,10 @@ async def evaluate_route(route: dict):
         f"b={b:.3f} s={s:.3f} l={l:.3f} ins={ins:.3f}"
     )
 
-    # 4. 權重分析
     source_stats = build_source_stats(engine.trade_history)
     insider_perf = build_insider_perf(engine.trade_history)
     weights = get_dynamic_weights(source_stats, insider_perf)
 
-    # 5. v8 主融合 score
     score = (
         b * 0.25 +
         l * 0.10 +
@@ -442,15 +439,6 @@ async def evaluate_route(route: dict):
         f"regime={engine.regime}"
     )
 
-    # 6. 強制條件
-    if w_best < 0.2:
-        engine.log(f"REJECT_NO_SMART {mint[:6]}")
-        return
-
-    if w_cluster < 0.2:
-        engine.log(f"REJECT_NO_CLUSTER {mint[:6]}")
-        return
-
     entry_threshold = 0.30
     if engine.regime == "trend_up":
         entry_threshold = 0.26
@@ -459,13 +447,11 @@ async def evaluate_route(route: dict):
         engine.log(f"REJECT_SCORE {mint[:6]} score={score:.3f} thr={entry_threshold:.3f}")
         return
 
-    # 7. 價格
     price = await get_price(token)
     if not price:
         engine.log(f"NO_PRICE {mint[:6]}")
         return
 
-    # 8. 倉位
     base = get_position_size(score, engine.capital, engine)
     cap = portfolio.weighted_position_size(engine, source)
     size = min(base, cap)
@@ -490,7 +476,6 @@ async def evaluate_route(route: dict):
         engine.log(f"SIZE_ZERO {mint[:6]}")
         return
 
-    # 9. 風控
     if not allow(engine, score, size):
         engine.log(f"BLOCKED_ALLOW {mint[:6]}")
         return
@@ -506,7 +491,6 @@ async def evaluate_route(route: dict):
         engine.log(f"FILTERED {mint[:6]} {reason}")
         return
 
-    # 10. 下單
     buy(
         mint,
         price,
