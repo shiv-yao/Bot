@@ -80,7 +80,6 @@ def _score_component_stats(trade_history: list[dict]) -> dict:
     for t in trade_history:
         if not isinstance(t, dict):
             continue
-
         meta = t.get("meta", {}) or {}
         for key in rows.keys():
             if key in meta and meta[key] is not None:
@@ -138,9 +137,7 @@ def _wallet_metrics():
             "top_wallet_strength": top_wallet_strength,
         }
     except Exception as e:
-        return {
-            "error": f"wallet_metrics_failed: {e}"
-        }
+        return {"error": f"wallet_metrics_failed: {e}"}
 
 
 def _insider_metrics():
@@ -167,9 +164,7 @@ def _insider_metrics():
             "token_insider_summary": token_summary,
         }
     except Exception as e:
-        return {
-            "error": f"insider_metrics_failed: {e}"
-        }
+        return {"error": f"insider_metrics_failed: {e}"}
 
 
 def _insider_vs_non_insider_performance(trade_history: list[dict], threshold: float = 0.30):
@@ -233,7 +228,7 @@ def _insider_vs_non_insider_performance(trade_history: list[dict], threshold: fl
 @app.get("/debug")
 def debug():
     try:
-        from app.core.state import engine
+        from app.state import engine
         from app.core.risk_runtime import risk_engine
         from app.core import engine as engine_module
         from app.portfolio.portfolio_manager import portfolio
@@ -270,7 +265,9 @@ def debug():
 
         positions_view = []
         for p in getattr(engine, "positions", []):
-            meta = p.get("meta", {}) if isinstance(p, dict) else {}
+            if not isinstance(p, dict):
+                continue
+            meta = p.get("meta", {}) or {}
             positions_view.append({
                 "mint": p.get("mint"),
                 "entry": p.get("entry"),
@@ -334,7 +331,7 @@ def debug():
 @app.get("/metrics")
 def metrics():
     try:
-        from app.core.state import engine
+        from app.state import engine
 
         trade_history = getattr(engine, "trade_history", []) or []
         safe_history = [t for t in trade_history if isinstance(t, dict)]
@@ -357,7 +354,6 @@ def metrics():
         total_trades = len(safe_history)
         avg_trade_pnl = total_realized_pnl / total_trades if total_trades else 0.0
 
-        # ===== safe source stats =====
         source_stats = _source_stats(safe_history)
         best_source, worst_source = _best_worst_source(source_stats)
         score_component_stats = _score_component_stats(safe_history)
@@ -382,7 +378,6 @@ def metrics():
                 "meta": meta,
             })
 
-        # ===== optional modules =====
         risk_block = {
             "equity_peak": None,
             "drawdown": None,
@@ -472,7 +467,7 @@ def metrics():
     except Exception as e:
         tb = traceback.format_exc()
         try:
-            from app.core.state import engine
+            from app.state import engine
             logs = getattr(engine, "logs", None)
             if isinstance(logs, list):
                 logs.append(f"METRICS_ERROR: {str(e)}")
@@ -493,7 +488,7 @@ def metrics():
 @app.get("/health")
 def health():
     try:
-        from app.core.state import engine
+        from app.state import engine
 
         out = {
             "ok": getattr(engine, "running", False),
@@ -536,7 +531,7 @@ def health():
 @app.post("/kill")
 def kill():
     try:
-        from app.core.state import engine
+        from app.state import engine
         from app.core.risk_runtime import risk_engine
 
         risk_engine.set_manual_kill(True)
@@ -553,7 +548,7 @@ def kill():
 @app.post("/resume")
 def resume():
     try:
-        from app.core.state import engine
+        from app.state import engine
         from app.core.risk_runtime import risk_engine
 
         risk_engine.set_manual_kill(False)
