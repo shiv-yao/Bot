@@ -1,7 +1,4 @@
-import json
 from collections import defaultdict
-
-DB_FILE = "wallet_db.json"
 
 wallet_db = defaultdict(lambda: {
     "trades": 0,
@@ -9,38 +6,18 @@ wallet_db = defaultdict(lambda: {
     "pnl": 0.0
 })
 
-
-def load_wallet_db():
-    global wallet_db
-    try:
-        with open(DB_FILE, "r") as f:
-            wallet_db.update(json.load(f))
-    except:
-        pass
-
-
-def save_wallet_db():
-    try:
-        with open(DB_FILE, "w") as f:
-            json.dump(wallet_db, f)
-    except:
-        pass
-
-
-def update_wallet(wallet: str, pnl: float):
+def update_wallet(wallet, pnl):
     if not wallet:
         return
 
     w = wallet_db[wallet]
-
     w["trades"] += 1
     w["pnl"] += pnl
 
     if pnl > 0:
         w["wins"] += 1
 
-
-def wallet_rank(wallet: str) -> float:
+def wallet_rank(wallet):
     w = wallet_db.get(wallet)
 
     if not w or w["trades"] < 3:
@@ -49,10 +26,4 @@ def wallet_rank(wallet: str) -> float:
     winrate = w["wins"] / w["trades"]
     avg = w["pnl"] / w["trades"]
 
-    score = winrate * 0.6 + max(avg, 0) * 4
-    return min(score, 1.0)
-
-
-def top_wallets(n=10):
-    ranked = sorted(wallet_db.items(), key=lambda x: wallet_rank(x[0]), reverse=True)
-    return ranked[:n]
+    return min(winrate * 0.6 + max(avg, 0) * 4, 1.0)
