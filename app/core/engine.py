@@ -6,7 +6,6 @@ from collections import defaultdict
 from app.state import engine
 
 # ===== CONFIG =====
-BASE_SIZE = 1.0
 MAX_POSITIONS = 4
 
 TAKE_PROFIT = 0.02
@@ -20,7 +19,11 @@ TOP_N = 4
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 
-# ===== SINGLE BRAIN WEIGHTS =====
+# ===== STREAK =====
+WIN_STREAK = 0
+LOSS_STREAK = 0
+
+# ===== WEIGHTS =====
 WEIGHTS = {
     "momentum": 0.45,
     "wallet": 0.25,
@@ -29,7 +32,7 @@ WEIGHTS = {
 }
 
 
-# ===== INIT SAFE =====
+# ===== INIT =====
 def ensure_engine():
     if not hasattr(engine, "positions"):
         engine.positions = []
@@ -61,82 +64,82 @@ def ensure_engine():
 
 
 # ===== LOG =====
-def log(msg: str):
-    msg = str(msg)
+def log(msg):
     print(msg)
-    engine.logs.append(msg)
+    engine.logs.append(str(msg))
     engine.logs = engine.logs[-300:]
 
 
-# ===== V14 SIZE ENGINE =====
-def get_dynamic_size(score: float, wallet: float, insider: float) -> float:
-    # 用資金比例，避免單位爆炸
-    size = engine.capital * 0.25
+# ===== SIZE ENGINE (v15) =====
+def get_dynamic_size(score, wallet, insider):
+    base = engine.capital * 0.25
 
     if score > 0.03:
-        size *= 1.5
+        base *= 1.5
     elif score > 0.02:
-        size *= 1.2
+        base *= 1.2
 
     if wallet > 0.2:
-        size *= 1.3
+        base *= 1.3
 
     if insider > 0.15:
-        size *= 1.2
+        base *= 1.2
 
-    # 防爆倉
-    size = min(size, engine.capital * 0.4)
+    # ===== WIN BOOST =====
+    if WIN_STREAK >= 2:
+        boost = min(1 + WIN_STREAK * 0.2, 2.5)
+        base *= boost
+        log(f"WIN_BOOST x{boost:.2f}")
 
-    # 防 0 倉
-    size = max(size, 0.01)
+    # ===== LOSS CUT =====
+    if LOSS_STREAK >= 2:
+        cut = max(0.4, 1 - LOSS_STREAK * 0.25)
+        base *= cut
+        log(f"LOSS_CUT x{cut:.2f}")
 
-    return size
+    # ===== DD PROTECT =====
+    dd = 0
+    if engine.peak_capital > 0:
+        dd = (engine.capital - engine.peak_capital) / engine.peak_capital
+
+    if dd < -0.1:
+        base *= 0.5
+        log("DD_PROTECT")
+
+    if dd < -0.2:
+        base *= 0.3
+        log("DD_HARD_PROTECT")
+
+    base = min(base, engine.capital * 0.4)
+    base = max(base, 0.01)
+
+    return base
 
 
-# ===== 動態門檻 =====
-def dynamic_threshold():
-    n = len(engine.positions)
-
-    if n < 2:
-        return 0.012
-    elif n < 4:
-        return 0.014
-    else:
-        return 0.018
-
-
-# ===== MOCK SCANNER =====
+# ===== MOCK =====
 async def fetch_candidates():
     base = [
-        {"mint": "8F8FLuwv7iL26ecsQ1yXmYKJ6us6Y55QEpJDMFk11Wau", "momentum": 0.020},
-        {"mint": "sosd5Q3DutGxMEaukBDmkPgsapMQz59jNjGWmhYcdTQ", "momentum": 0.018},
-        {"mint": "SooEj828BSjtgTecBRkqBJ4oquc713yyFZqbCawawoN", "momentum": 0.017},
-        {"mint": "sokhCSmzutMPPuNcxG1j6gYLowgiM8mswjJu8FBYm5r", "momentum": 0.020},
+        {"mint": "8F8FLu", "momentum": 0.02},
+        {"mint": "sosd5Q", "momentum": 0.018},
+        {"mint": "SooEj8", "momentum": 0.017},
+        {"mint": "sokhCS", "momentum": 0.02},
     ]
     await asyncio.sleep(0)
     return base[:TOP_N]
 
 
-# ===== FAKE SIGNAL =====
-def fake_wallet_alpha(mint: str) -> float:
-    return 0.05 + (sum(ord(c) for c in mint[:6]) % 20) / 100.0
-
-
-def fake_cluster_score(mint: str) -> float:
-    return (sum(ord(c) for c in mint[-6:]) % 10) / 20.0
-
-
-def fake_insider_score(mint: str) -> float:
-    return (sum(ord(c) for c in mint[3:9]) % 10) / 25.0
+def fake_wallet(m): return random.uniform(0.05, 0.25)
+def fake_cluster(m): return random.uniform(0.05, 0.3)
+def fake_insider(m): return random.uniform(0.0, 0.2)
 
 
 def compute_score(item):
-    mint = item["mint"]
+    m = item["mint"]
 
-    momentum = float(item.get("momentum", 0.0) or 0.0)
-    wallet = fake_wallet_alpha(mint)
-    cluster = fake_cluster_score(mint)
-    insider = fake_insider_score(mint)
+    momentum = item["momentum"]
+    wallet = fake_wallet(m)
+    cluster = fake_cluster(m)
+    insider = fake_insider(m)
 
     score = (
         momentum * WEIGHTS["momentum"]
@@ -145,170 +148,103 @@ def compute_score(item):
         + insider * WEIGHTS["insider"]
     )
 
-    return {
-        "score": score,
-        "momentum": momentum,
-        "wallet": wallet,
-        "cluster": cluster,
-        "insider": insider,
-    }
+    return score, momentum, wallet, cluster, insider
 
 
-def fake_buy_out(score):
-    return int(200 + score * 3000)
+def fake_price(entry):
+    return entry * (1 + random.uniform(-0.02, 0.05))
 
 
-def fake_price(entry, age):
-    phase = int(age) % 16
+# ===== EXIT =====
+async def try_sell(pos):
+    global WIN_STREAK, LOSS_STREAK
 
-    if phase < 4:
-        drift = 0.012 * phase
-    elif phase < 8:
-        drift = 0.05 - 0.01 * (phase - 4)
-    elif phase < 12:
-        drift = 0.01 - 0.015 * (phase - 8)
-    else:
-        drift = -0.05 + 0.008 * (phase - 12)
-
-    drift += random.uniform(-0.012, 0.015)
-    return max(1, int(entry * (1 + drift)))
-
-
-async def get_price(mint, entry, age):
-    await asyncio.sleep(0)
-    return fake_price(entry, age)
-
-
-# ===== CAPITAL HELPERS =====
-def mark_peak_capital():
-    if engine.capital > engine.peak_capital:
-        engine.peak_capital = engine.capital
-
-
-# ===== SELL =====
-async def try_sell(pos, price):
-    entry = pos["entry_out"]
-    peak = pos["peak"]
-
-    pnl = (price - entry) / entry
-    dd = (price - peak) / peak
-
-    log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
-
-    reason = None
+    price = fake_price(pos["entry"])
+    pnl = (price - pos["entry"]) / pos["entry"]
 
     if pnl >= TAKE_PROFIT:
         reason = "TP"
     elif pnl <= STOP_LOSS:
         reason = "SL"
-    elif peak > entry and dd <= TRAILING_STOP:
-        reason = "TRAIL"
-    elif time.time() - pos["time"] > MAX_HOLD_SEC:
-        reason = "TIME"
-
-    if not reason:
-        return False
+    else:
+        return
 
     engine.positions.remove(pos)
 
-    # 先回本金，再加盈虧
     engine.capital += pos["size"]
     engine.capital += pos["size"] * pnl
 
     engine.trade_history.append({
         "mint": pos["mint"],
         "pnl": pnl,
-        "reason": reason,
-        "score": pos.get("score", 0),
-        "meta": pos.get("meta", {}),
     })
 
     if pnl >= 0:
         engine.stats["wins"] += 1
+        WIN_STREAK += 1
+        LOSS_STREAK = 0
     else:
         engine.stats["losses"] += 1
+        LOSS_STREAK += 1
+        WIN_STREAK = 0
 
-    mark_peak_capital()
+    if engine.capital > engine.peak_capital:
+        engine.peak_capital = engine.capital
 
-    log(
-        f"SELL {pos['mint'][:6]} {reason} "
-        f"pnl={pnl:.4f} size={pos['size']:.4f} cap={engine.capital:.4f}"
-    )
-
-    return True
+    log(f"SELL {pos['mint']} pnl={pnl:.4f} cap={engine.capital:.4f}")
 
 
-async def manage_positions():
-    now = time.time()
+# ===== ADD WINNER (v16) =====
+def try_add_position(pos):
+    if pos.get("added"):
+        return
 
-    for pos in list(engine.positions):
-        age = now - pos["time"]
+    if random.random() < 0.3:
+        size = pos["size"] * 0.5
 
-        price = await get_price(pos["mint"], pos["entry_out"], age)
+        if engine.capital < size:
+            return
 
-        if price > pos["peak"]:
-            pos["peak"] = price
+        engine.capital -= size
+        pos["size"] += size
+        pos["added"] = True
 
-        await try_sell(pos, price)
+        log(f"ADD {pos['mint']} size={size:.4f}")
 
 
-# ===== BUY =====
+# ===== PARTIAL TP (v16) =====
+def try_partial(pos):
+    if pos.get("tp_done"):
+        return
+
+    price = fake_price(pos["entry"])
+    pnl = (price - pos["entry"]) / pos["entry"]
+
+    if pnl > 0.015:
+        size = pos["size"] * 0.5
+
+        engine.capital += size * (1 + pnl)
+        pos["size"] *= 0.5
+        pos["tp_done"] = True
+
+        log(f"PARTIAL {pos['mint']} pnl={pnl:.4f}")
+
+
+# ===== TRADE =====
 async def try_trade(item):
     mint = item["mint"]
-    now = time.time()
 
     if any(p["mint"] == mint for p in engine.positions):
         return
 
     if len(engine.positions) >= MAX_POSITIONS:
-        log("MAX_POSITIONS")
         return
 
-    if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
-        log(f"COOLDOWN {mint[:6]}")
-        return
+    score, m, w, c, i = compute_score(item)
 
-    engine.stats["signals"] += 1
+    log(f"SCORE {mint} s={score:.4f}")
 
-    f = compute_score(item)
-    score = f["score"]
-
-    log(
-        f"SCORE {mint[:6]} "
-        f"s={score:.4f} "
-        f"m={f['momentum']:.4f} "
-        f"w={f['wallet']:.4f} "
-        f"c={f['cluster']:.4f} "
-        f"i={f['insider']:.4f}"
-    )
-
-    out = fake_buy_out(score)
-    last_price = LAST_PRICE.get(mint)
-
-    if last_price:
-        move = abs(out - last_price) / last_price
-
-        if move < 0.003:
-            score *= 0.85
-            log(f"LOW_VOL {mint[:6]} adj={score:.4f}")
-
-    LAST_PRICE[mint] = out
-
-    thr = dynamic_threshold()
-
-    if score < thr:
-        if random.random() < 0.35:
-            log(f"FORCE_ENTRY {mint[:6]}")
-        else:
-            engine.stats["rejected"] += 1
-            log(f"REJECT {mint[:6]} thr={thr:.4f}")
-            return
-
-    size = get_dynamic_size(score, f["wallet"], f["insider"])
-
-    if size <= 0:
-        log(f"SKIP_ZERO_SIZE {mint[:6]}")
-        return
+    size = get_dynamic_size(score, w, i)
 
     if engine.capital < size:
         log("NO_CAPITAL")
@@ -316,37 +252,32 @@ async def try_trade(item):
 
     engine.capital -= size
 
-    log(f"BUY {mint[:6]} size={size:.4f} out={out}")
-
     engine.positions.append({
         "mint": mint,
-        "entry_out": out,
+        "entry": 100,
         "size": size,
-        "peak": out,
-        "time": now,
-        "score": score,
-        "meta": f,
+        "added": False,
+        "tp_done": False,
     })
 
-    LAST_TRADE[mint] = now
-    engine.stats["executed"] += 1
-
-    log(f"EXECUTED {mint[:6]}")
+    log(f"BUY {mint} size={size:.4f}")
 
 
-# ===== MAIN =====
+# ===== LOOP =====
 async def main_loop():
     ensure_engine()
-    log("🚀 ENGINE START")
+    log("🚀 V16 START")
 
     while engine.running:
         try:
-            await manage_positions()
+            for pos in list(engine.positions):
+                try_partial(pos)
+                try_add_position(pos)
+                await try_sell(pos)
 
             items = await fetch_candidates()
-            ranked = sorted(items, key=lambda x: compute_score(x)["score"], reverse=True)
 
-            for item in ranked:
+            for item in items:
                 await try_trade(item)
 
         except Exception as e:
