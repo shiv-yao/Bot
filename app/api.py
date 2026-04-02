@@ -24,8 +24,3 @@ def root():
 @app.get("/metrics")
 def metrics():
     return compute_metrics(engine)
-
-
-@app.get("/logs")
-def logs():
-    return engine.logs[-50:]
