@@ -6,7 +6,7 @@ token_wallets = defaultdict(list)
 MIN_TRADES = 3
 
 
-def record_wallet_trade(wallet, pnl):
+def record_wallet_trade(wallet: str, pnl: float):
     if not wallet:
         wallet = "BOOTSTRAP_WALLET"
 
@@ -16,15 +16,16 @@ def record_wallet_trade(wallet, pnl):
         wallet_trades[wallet] = wallet_trades[wallet][-50:]
 
 
-def record_token_wallets(mint, wallets):
+def record_token_wallets(mint: str, wallets: list[str]):
     if not wallets:
         return
 
-    # 只保留 early wallets
-    token_wallets[mint] = list(dict.fromkeys(wallets))[:10]
+    # 保留順序去重，取 early wallets
+    uniq = list(dict.fromkeys(wallets))
+    token_wallets[mint] = uniq[:10]
 
 
-def wallet_score(wallet):
+def wallet_score(wallet: str) -> float:
     trades = wallet_trades.get(wallet, [])
 
     if len(trades) < MIN_TRADES:
@@ -34,10 +35,10 @@ def wallet_score(wallet):
     winrate = wins / len(trades)
     avg = sum(trades) / len(trades)
 
-    return min(1.0, winrate * 0.7 + max(avg, 0) * 5)
+    return min(1.0, winrate * 0.7 + max(avg, 0.0) * 5.0)
 
 
-def get_wallet_alpha(mint):
+def get_wallet_alpha(mint: str):
     wallets = token_wallets.get(mint, [])
 
     if not wallets:
