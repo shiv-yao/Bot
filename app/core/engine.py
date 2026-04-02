@@ -81,6 +81,9 @@ def get_dynamic_size(score, wallet, insider):
     # 防爆倉
     size = min(size, engine.capital * 0.4)
 
+    # ⭐ 防 0 倉（關鍵）
+    size = max(size, 0.01)
+
     return size
 
 
