@@ -29,11 +29,58 @@ WEIGHTS = {
 }
 
 
+# ===== INIT SAFE =====
+def ensure_engine():
+    if not hasattr(engine, "positions"):
+        engine.positions = []
+
+    if not hasattr(engine, "logs"):
+        engine.logs = []
+
+    if not hasattr(engine, "trade_history"):
+        engine.trade_history = []
+
+    if not hasattr(engine, "stats"):
+        engine.stats = {
+            "signals": 0,
+            "executed": 0,
+            "wins": 0,
+            "losses": 0,
+            "errors": 0,
+            "rejected": 0,
+        }
+
+    if not hasattr(engine, "capital"):
+        engine.capital = 5.0
+
+    if not hasattr(engine, "running"):
+        engine.running = True
+
+
+# ===== LOG =====
 def log(msg: str):
     msg = str(msg)
     print(msg)
     engine.logs.append(msg)
     engine.logs = engine.logs[-200:]
+
+
+# ===== v14 SIZE ENGINE =====
+def get_dynamic_size(score, wallet, insider):
+    size = BASE_SIZE
+
+    if score > 0.03:
+        size *= 1.8
+    elif score > 0.02:
+        size *= 1.4
+
+    if wallet > 0.2:
+        size *= 1.5
+
+    if insider > 0.15:
+        size *= 1.3
+
+    return size
 
 
 # ===== 動態門檻 =====
@@ -60,7 +107,7 @@ async def fetch_candidates():
     return base[:TOP_N]
 
 
-# ===== 模擬 wallet / cluster / insider =====
+# ===== FAKE SIGNAL =====
 def fake_wallet_alpha(mint: str) -> float:
     return 0.05 + (sum(ord(c) for c in mint[:6]) % 20) / 100.0
 
@@ -75,7 +122,8 @@ def fake_insider_score(mint: str) -> float:
 
 def compute_score(item):
     mint = item["mint"]
-    momentum = float(item.get("momentum", 0.0) or 0.0)
+
+    momentum = float(item.get("momentum", 0))
     wallet = fake_wallet_alpha(mint)
     cluster = fake_cluster_score(mint)
     insider = fake_insider_score(mint)
@@ -101,7 +149,7 @@ def fake_buy_out(score):
 
 
 def fake_price(entry, age):
-    phase = age % 16
+    phase = int(age) % 16
 
     if phase < 4:
         drift = 0.012 * phase
@@ -113,7 +161,6 @@ def fake_price(entry, age):
         drift = -0.05 + 0.008 * (phase - 12)
 
     drift += random.uniform(-0.012, 0.015)
-
     return int(entry * (1 + drift))
 
 
@@ -122,8 +169,8 @@ async def get_price(mint, entry, age):
     return fake_price(entry, age)
 
 
-# ===== SELL LOGIC =====
-async def check_exit(pos, price):
+# ===== SELL =====
+async def try_sell(pos, price):
     entry = pos["entry_out"]
     peak = pos["peak"]
 
@@ -132,29 +179,24 @@ async def check_exit(pos, price):
 
     log(f"CHECK {pos['mint'][:6]} pnl={pnl:.4f} dd={dd:.4f}")
 
+    reason = None
+
     if pnl >= TAKE_PROFIT:
-        return "TP", pnl
-
-    if pnl <= STOP_LOSS:
-        return "SL", pnl
-
-    if peak > entry and dd <= TRAILING_STOP:
-        return "TRAIL", pnl
-
-    if time.time() - pos["time"] > MAX_HOLD_SEC:
-        return "TIME", pnl
-
-    return None, pnl
-
-
-async def try_sell(pos, price):
-    reason, pnl = await check_exit(pos, price)
+        reason = "TP"
+    elif pnl <= STOP_LOSS:
+        reason = "SL"
+    elif peak > entry and dd <= TRAILING_STOP:
+        reason = "TRAIL"
+    elif time.time() - pos["time"] > MAX_HOLD_SEC:
+        reason = "TIME"
 
     if not reason:
         return False
 
     engine.positions.remove(pos)
-    engine.capital *= (1 + pnl)
+
+    # ✅ 正確資金回寫
+    engine.capital += pos["size"] * (1 + pnl)
 
     engine.trade_history.append({
         "mint": pos["mint"],
@@ -165,9 +207,9 @@ async def try_sell(pos, price):
     })
 
     if pnl >= 0:
-        engine.stats["wins"] = engine.stats.get("wins", 0) + 1
+        engine.stats["wins"] += 1
     else:
-        engine.stats["losses"] = engine.stats.get("losses", 0) + 1
+        engine.stats["losses"] += 1
 
     log(f"SELL {pos['mint'][:6]} {reason} pnl={pnl:.4f} cap={engine.capital:.4f}")
 
@@ -188,7 +230,7 @@ async def manage_positions():
         await try_sell(pos, price)
 
 
-# ===== BUY LOGIC =====
+# ===== BUY =====
 async def try_trade(item):
     mint = item["mint"]
     now = time.time()
@@ -206,57 +248,43 @@ async def try_trade(item):
 
     engine.stats["signals"] += 1
 
-    features = compute_score(item)
-    score = features["score"]
+    f = compute_score(item)
+    score = f["score"]
 
     log(
         f"SCORE {mint[:6]} "
-        f"s={score:.4f} "
-        f"m={features['momentum']:.4f} "
-        f"w={features['wallet']:.4f} "
-        f"c={features['cluster']:.4f} "
-        f"i={features['insider']:.4f}"
+        f"s={score:.4f} m={f['momentum']:.4f} "
+        f"w={f['wallet']:.4f} c={f['cluster']:.4f} i={f['insider']:.4f}"
     )
-
-    new_price = fake_buy_out(score)
-    last_price = LAST_PRICE.get(mint)
-
-    if last_price:
-        move = abs(new_price - last_price) / last_price
-
-        if move < 0.003:
-            score *= 0.85
-            log(f"LOW_VOL {mint[:6]} adj={score:.4f}")
-
-    LAST_PRICE[mint] = new_price
 
     thr = dynamic_threshold()
 
     if score < thr:
-        if random.random() < 0.35:
-            log(f"FORCE_ENTRY {mint[:6]}")
-        else:
-            engine.stats["rejected"] += 1
-            log(f"REJECT {mint[:6]} thr={thr:.4f}")
-            return
+        engine.stats["rejected"] += 1
+        log(f"REJECT {mint[:6]} thr={thr:.4f}")
+        return
 
-    out = new_price
+    # ✅ v14 size
+    size = get_dynamic_size(score, f["wallet"], f["insider"])
 
-    log(f"BUY {mint[:6]} out={out}")
+    if engine.capital < size:
+        log("NO_CAPITAL")
+        return
+
+    engine.capital -= size
+
+    out = fake_buy_out(score)
+
+    log(f"BUY {mint[:6]} size={int(size)} out={out}")
 
     engine.positions.append({
         "mint": mint,
         "entry_out": out,
-        "size": BASE_SIZE,
+        "size": size,
         "peak": out,
         "time": now,
         "score": score,
-        "meta": {
-            "momentum": features["momentum"],
-            "wallet": features["wallet"],
-            "cluster": features["cluster"],
-            "insider": features["insider"],
-        },
+        "meta": f,
     })
 
     LAST_TRADE[mint] = now
@@ -265,9 +293,10 @@ async def try_trade(item):
     log(f"EXECUTED {mint[:6]}")
 
 
-# ===== MAIN LOOP =====
+# ===== MAIN =====
 async def main_loop():
-    log("ENGINE STARTED")
+    ensure_engine()
+    log("🚀 ENGINE START")
 
     while engine.running:
         try:
