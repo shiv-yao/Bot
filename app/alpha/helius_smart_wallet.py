@@ -1,16 +1,14 @@
 import os
 import httpx
 
-HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
+HELIUS_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
 
-async def fetch_smart_wallets(mint: str):
-
-    if not HELIUS_KEY:
+async def fetch_smart_wallets(mint: str) -> list[str]:
+    if not HELIUS_KEY or not mint:
         return []
 
     url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_KEY}"
-
     payload = {
         "mint": mint,
         "limit": 50,
@@ -37,12 +35,11 @@ async def fetch_smart_wallets(mint: str):
             w1 = tx.get("fromUserAccount")
             w2 = tx.get("toUserAccount")
 
-            if w1:
+            if w1 and isinstance(w1, str):
                 wallets.add(w1)
-            if w2:
+            if w2 and isinstance(w2, str):
                 wallets.add(w2)
-
-        except:
+        except Exception:
             continue
 
-    return list(wallets)
+    return list(wallets)[:20]
