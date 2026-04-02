@@ -5,9 +5,26 @@ from collections import defaultdict
 from app.state import engine
 from app.metrics import compute_metrics
 from app.alpha.combiner import combine_scores
-from app.market.dex import fetch_pump_candidates
-from app.market.jupiter import get_quote
-from app.wallets.tracker import update_token_wallets
+
+# ===== SAFE IMPORT（防炸）=====
+try:
+    from app.sources.pump import fetch_pump_candidates
+except Exception:
+    async def fetch_pump_candidates():
+        return []
+
+try:
+    from app.data.market import get_quote
+except Exception:
+    async def get_quote(input_mint, output_mint, amount):
+        return None
+
+try:
+    from app.alpha.helius_wallet_tracker import update_token_wallets
+except Exception:
+    async def update_token_wallets(mint):
+        return []
+
 
 # ===== CONFIG =====
 MAX_POSITIONS = 4
@@ -21,6 +38,7 @@ MAX_HOLD_SEC = 30
 TOKEN_COOLDOWN = 15
 
 LAST_TRADE = defaultdict(float)
+
 
 # ===== INIT =====
 def ensure_engine():
@@ -52,7 +70,10 @@ def log(msg):
 
 # ===== RISK ENGINE =====
 def risk_check():
-    dd = (engine.capital - engine.peak_capital) / engine.peak_capital
+    if engine.peak_capital > 0:
+        dd = (engine.capital - engine.peak_capital) / engine.peak_capital
+    else:
+        dd = 0
 
     if dd < -0.25:
         log("🛑 HARD STOP DD")
@@ -68,13 +89,19 @@ def exposure():
 
 # ===== ALPHA =====
 async def build_features(mint):
-    wallets = await update_token_wallets(mint)
+    try:
+        wallets = await update_token_wallets(mint)
+    except:
+        wallets = []
 
-    quote = await get_quote(
-        "So11111111111111111111111111111111111111112",
-        mint,
-        1000000
-    )
+    try:
+        quote = await get_quote(
+            "So11111111111111111111111111111111111111112",
+            mint,
+            1000000
+        )
+    except:
+        quote = None
 
     if not quote:
         return None
@@ -83,7 +110,7 @@ async def build_features(mint):
     price_impact = float(quote.get("priceImpactPct", 1))
 
     return {
-        "breakout": 0.02,  # 可接 momentum
+        "breakout": 0.02,
         "smart_money": min(len(wallets) / 10, 1),
         "liquidity": liquidity,
         "insider": 0.05,
@@ -92,7 +119,7 @@ async def build_features(mint):
     }
 
 
-# ===== FILTER（超重要）=====
+# ===== FILTER =====
 def alpha_filter(f):
     if not f:
         return False
@@ -124,7 +151,7 @@ def get_size(score):
 
 # ===== SELL =====
 async def try_sell(pos):
-    price = pos["entry"] * 1.02
+    price = pos["entry"] * (1 + 0.02)
     pnl = (price - pos["entry"]) / pos["entry"]
 
     held = time.time() - pos["time"]
@@ -140,6 +167,9 @@ async def try_sell(pos):
             "meta": pos["meta"]
         })
 
+        if engine.capital > engine.peak_capital:
+            engine.peak_capital = engine.capital
+
         log(f"SELL {pos['mint']} pnl={pnl:.4f}")
 
 
@@ -154,6 +184,7 @@ async def try_trade(mint):
         return
 
     if exposure() > engine.capital * MAX_EXPOSURE:
+        log("EXPOSURE_LIMIT")
         return
 
     f = await build_features(mint)
@@ -167,12 +198,13 @@ async def try_trade(mint):
         f["smart_money"],
         f["liquidity"],
         f["insider"],
-        "unknown",
+        getattr(engine, "regime", "unknown"),
         {},
         {},
     )
 
     if score < 0.25:
+        log(f"LOW_SCORE {mint[:6]}")
         return
 
     size = get_size(score)
@@ -210,7 +242,9 @@ async def main_loop():
             tokens = await fetch_pump_candidates()
 
             for t in tokens:
-                await try_trade(t["mint"])
+                mint = t.get("mint")
+                if mint:
+                    await try_trade(mint)
 
             for pos in list(engine.positions):
                 await try_sell(pos)
