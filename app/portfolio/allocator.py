@@ -5,14 +5,13 @@ def get_position_size(score: float, capital: float, engine) -> float:
     risk_adj = dynamic_risk_factor(engine)
 
     if score >= 0.72:
-        base = 0.08
+        base = capital * 0.08
     elif score >= 0.62:
-        base = 0.05
+        base = capital * 0.05
     else:
-        base = 0.03
+        base = capital * 0.03
 
     size = base * risk_adj
-
     size = min(size, capital * 0.20)
     size = max(size, 0.02)
 
