@@ -1,35 +1,79 @@
-import streamlit as st
+import os
+import time
 import requests
+import streamlit as st
+import pandas as pd
 
-API = "http://localhost:8000"
+API = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.set_page_config(layout="wide")
 
-st.title("🔥 Quant Fund Dashboard")
+st.title("🔥 Quant Trading Dashboard")
 
-metrics = requests.get(f"{API}/metrics").json()
-state = requests.get(f"{API}/").json()
+# ===== AUTO REFRESH =====
+REFRESH = st.sidebar.slider("Refresh (sec)", 1, 10, 2)
 
-col1, col2 = st.columns(2)
+while True:
 
-col1.metric("Capital", round(state["capital"], 2))
-col2.metric("Positions", state["positions"])
+    try:
+        metrics = requests.get(f"{API}/metrics", timeout=5).json()
 
-st.subheader("📊 Performance")
+        summary = metrics["summary"]
+        perf = metrics["performance"]
 
-if metrics:
-    col1, col2, col3, col4 = st.columns(4)
+        # ===== HEADER =====
+        c1, c2, c3, c4 = st.columns(4)
 
-    col1.metric("Win Rate", metrics["win_rate"])
-    col2.metric("Profit Factor", metrics["profit_factor"])
-    col3.metric("Drawdown", metrics["max_drawdown"])
-    col4.metric("Sharpe", metrics["sharpe"])
+        c1.metric("💰 Capital", summary["capital"])
+        c2.metric("📈 Return %", summary["return_pct"])
+        c3.metric("📉 Drawdown", summary["drawdown"])
+        c4.metric("⚡ Trades", perf["trades"])
 
-    st.subheader("Equity Curve")
-    st.line_chart(metrics["equity_curve"])
+        # ===== PERFORMANCE =====
+        st.subheader("📊 Performance")
 
-st.subheader("Logs")
-logs = requests.get(f"{API}/logs").json()
+        c1, c2, c3, c4 = st.columns(4)
 
-for l in reversed(logs):
-    st.text(l)
+        c1.metric("Win Rate", perf["win_rate"])
+        c2.metric("Profit Factor", perf["profit_factor"])
+        c3.metric("Sharpe", perf["sharpe"])
+        c4.metric("Max DD", perf["max_drawdown"])
+
+        # ===== EQUITY =====
+        st.subheader("📈 Equity Curve")
+
+        eq = metrics.get("equity_curve", [])
+        if eq:
+            df_eq = pd.DataFrame({"equity": eq})
+            st.line_chart(df_eq)
+
+        # ===== POSITIONS =====
+        st.subheader("📦 Positions")
+
+        pos = metrics.get("positions", [])
+        if pos:
+            df_pos = pd.DataFrame(pos)
+            st.dataframe(df_pos, use_container_width=True)
+        else:
+            st.info("No open positions")
+
+        # ===== TRADES =====
+        st.subheader("🧾 Recent Trades")
+
+        trades = metrics.get("recent_trades", [])
+        if trades:
+            df_trades = pd.DataFrame(trades)
+            st.dataframe(df_trades, use_container_width=True)
+
+        # ===== LOGS =====
+        st.subheader("📜 Logs")
+
+        logs = metrics.get("logs", [])
+        for l in reversed(logs):
+            st.text(l)
+
+    except Exception as e:
+        st.error(f"API Error: {e}")
+
+    time.sleep(REFRESH)
+    st.rerun()
