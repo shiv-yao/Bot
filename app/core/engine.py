@@ -29,16 +29,17 @@ except Exception:
 
 # ===== CONFIG =====
 MAX_POSITIONS = 4
-MAX_EXPOSURE = 0.50
-MAX_POSITION_SIZE = 0.20
+MAX_EXPOSURE = 0.35
+MAX_POSITION_SIZE = 0.10
+MAX_FORCED_POSITIONS = 2
 
 TAKE_PROFIT = 0.04
 STOP_LOSS = -0.02
 TRAILING_GAP = 0.015
 MAX_HOLD_SEC = 40
 
-TOKEN_COOLDOWN = 10
-FORCE_TRADE_INTERVAL = 15
+TOKEN_COOLDOWN = 12
+FORCE_TRADE_INTERVAL = 20
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 QUOTE_AMOUNT = 1_000_000  # 0.001 SOL
@@ -72,6 +73,8 @@ def ensure_engine():
     engine.last_signal = getattr(engine, "last_signal", "")
     engine.last_trade = getattr(engine, "last_trade", "")
     engine.no_trade_cycles = getattr(engine, "no_trade_cycles", 0)
+    engine.win_streak = getattr(engine, "win_streak", 0)
+    engine.loss_streak = getattr(engine, "loss_streak", 0)
 
 
 # ===== LOG =====
@@ -97,7 +100,7 @@ def risk_check():
     else:
         dd = 0.0
 
-    if dd < -0.30:
+    if dd < -0.25:
         log("🛑 HARD STOP DD")
         engine.running = False
         return False
@@ -107,6 +110,17 @@ def risk_check():
 
 def exposure():
     return sum(safe_float(p.get("size", 0.0), 0.0) for p in engine.positions)
+
+
+def forced_open_positions():
+    count = 0
+    for p in engine.positions:
+        if not isinstance(p, dict):
+            continue
+        meta = p.get("meta", {}) or {}
+        if bool(meta.get("forced", False)):
+            count += 1
+    return count
 
 
 def wallet_alpha(wallets):
@@ -125,7 +139,6 @@ async def get_price(mint: str):
     if out_amount <= 0:
         return None
 
-    # 用 SOL->token quote 的 outAmount 當可交易近似價格尺度
     return out_amount / 1e6, q
 
 
@@ -154,7 +167,7 @@ async def build_features(mint):
 
     LAST_MARK_PRICE[mint] = price
 
-    # 這裡沿用你目前系統實測後比較容易出手的尺度
+    # 沿用你目前較容易出手的尺度，但交給後面收斂條件處理
     liquidity = out_amount / 1e5
 
     return {
@@ -171,18 +184,23 @@ async def build_features(mint):
 
 
 # ===== SIZE =====
-def get_size(score):
-    base = engine.capital * 0.08
+def get_size(score, forced=False):
+    base = engine.capital * 0.05
 
     if score > 0.60:
-        base *= 1.5
+        base *= 1.4
     elif score > 0.40:
-        base *= 1.2
+        base *= 1.15
+
+    if forced:
+        base *= 0.5
 
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
-        if dd < -0.10:
-            base *= 0.6
+        if dd < -0.08:
+            base *= 0.7
+        if dd < -0.15:
+            base *= 0.5
         if dd < -0.20:
             base *= 0.4
 
@@ -217,7 +235,7 @@ def update_trailing(pos, pnl):
 
 # ===== SELL =====
 async def try_sell(pos):
-    pnl, price = await mark_to_market(pos)
+    pnl, _price = await mark_to_market(pos)
     if pnl is None:
         return
 
@@ -253,8 +271,12 @@ async def try_sell(pos):
 
     if pnl >= 0:
         engine.stats["wins"] += 1
+        engine.win_streak = getattr(engine, "win_streak", 0) + 1
+        engine.loss_streak = 0
     else:
         engine.stats["losses"] += 1
+        engine.loss_streak = getattr(engine, "loss_streak", 0) + 1
+        engine.win_streak = 0
 
     if engine.capital > engine.peak_capital:
         engine.peak_capital = engine.capital
@@ -318,9 +340,13 @@ async def try_trade(mint):
     if now - LAST_EXECUTION > FORCE_TRADE_INTERVAL:
         loosen = True
 
+    forced = False
     if not ok:
-        # V24.2 fallback：避免 0 交易
-        if f["wallet_count"] >= 1 and f["liquidity"] > 0.0003:
+        if (
+            f["wallet_count"] >= 1
+            and f["liquidity"] > 0.0003
+            and forced_open_positions() < MAX_FORCED_POSITIONS
+        ):
             log(
                 f"FORCE_PASS {mint[:6]} "
                 f"state={state} "
@@ -329,6 +355,7 @@ async def try_trade(mint):
                 f"imp={f['price_impact']:.4f}"
             )
             loosen = True
+            forced = True
         else:
             engine.stats["rejected"] += 1
             log(
@@ -355,16 +382,28 @@ async def try_trade(mint):
     if f["wallet_count"] <= 2:
         score *= 0.75
 
-    min_score = th.get("score_min", 0.20)
-    if loosen:
-        min_score *= 0.8
+    normal_min_score = max(th.get("score_min", 0.20), 0.18)
+    forced_min_score = max(normal_min_score * 0.9, 0.12)
 
-    if score < min_score and not loosen:
+    if forced:
+        min_score = forced_min_score
+    elif loosen:
+        min_score = normal_min_score * 0.9
+    else:
+        min_score = normal_min_score
+
+    if score < min_score:
         engine.stats["rejected"] += 1
-        log(f"LOW_SCORE {mint[:6]} state={state} score={score:.4f}")
+        log(
+            f"LOW_SCORE {mint[:6]} "
+            f"state={state} "
+            f"score={score:.4f} "
+            f"need={min_score:.4f} "
+            f"forced={forced}"
+        )
         return False
 
-    size = get_size(score)
+    size = get_size(score, forced=forced)
     if engine.capital < size:
         engine.stats["rejected"] += 1
         log("NO_CAPITAL")
@@ -374,7 +413,7 @@ async def try_trade(mint):
 
     engine.positions.append({
         "mint": mint,
-        "entry": f["price"],  # V25 真 entry 價格
+        "entry": f["price"],
         "size": size,
         "score": score,
         "time": now,
@@ -383,7 +422,7 @@ async def try_trade(mint):
             **f,
             "source": "fusion",
             "filter_state": state,
-            "forced": loosen,
+            "forced": forced,
         },
     })
 
@@ -393,7 +432,7 @@ async def try_trade(mint):
     engine.stats["executed"] += 1
     engine.last_signal = f"{mint[:6]} state={state} score={score:.4f}"
 
-    if loosen and score < min_score:
+    if forced:
         log(f"FORCE_BUY {mint[:6]} state={state} size={size:.4f} score={score:.3f}")
     else:
         log(f"BUY {mint[:6]} state={state} size={size:.4f} score={score:.3f}")
@@ -404,7 +443,7 @@ async def try_trade(mint):
 # ===== MAIN LOOP =====
 async def main_loop():
     ensure_engine()
-    log("🔥 V24.2 + V25 ENGINE START")
+    log("🔥 V25.1 CONVERGENCE ENGINE START")
 
     while engine.running:
         traded_this_cycle = False
@@ -435,7 +474,8 @@ async def main_loop():
                     m = compute_metrics(engine)
                     log(
                         f"📊 WR={m['performance']['win_rate']} "
-                        f"PF={m['performance']['profit_factor']}"
+                        f"PF={m['performance']['profit_factor']} "
+                        f"DD={m['summary']['drawdown']}"
                     )
                 except Exception as e:
                     log(f"METRICS_LOOP_ERR {e}")
