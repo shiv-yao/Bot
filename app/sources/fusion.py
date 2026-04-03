@@ -1,5 +1,5 @@
 import asyncio
-import os
+import socket
 import time
 import httpx
 
@@ -7,159 +7,167 @@ from app.data.market import looks_like_solana_mint
 
 CACHE = []
 LAST_FETCH = 0
-CACHE_TTL = 4
-
-HELIUS_KEY = os.getenv(“HELIUS_API_KEY”, “”)
+FAIL_STREAK = 0
+COOLDOWN_UNTIL = 0
 
 HEADERS = {
-“User-Agent”: “Mozilla/5.0”,
-“Accept”: “application/json”,
-“Content-Type”: “application/json”,
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
 }
 
-async def _get(url):
-try:
-async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
-return await c.get(url, headers=HEADERS)
-except Exception as e:
-print(“FUSION HTTP ERR:”, repr(e))
-return None
+PUMP_URL = "https://frontend-api.pump.fun/coins/latest"
+DEX_URL = "https://api.dexscreener.com/latest/dex/search/?q=sol"
+JUP_URL = "https://token.jup.ag/all"
 
-async def _post(url, payload):
-try:
-async with httpx.AsyncClient(timeout=8, follow_redirects=True) as c:
-return await c.post(url, headers=HEADERS, json=payload)
-except Exception as e:
-print(“FUSION POST ERR:”, repr(e))
-return None
 
-async def fetch_helius():
-if not HELIUS_KEY:
-return []
+async def _get(url: str):
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            return await client.get(url, headers=HEADERS)
+    except Exception as e:
+        print("FUSION HTTP ERR:", repr(e))
+        return None
 
-```
-url = "https://mainnet.helius-rpc.com/?api-key=" + HELIUS_KEY
-payload = {
-    "jsonrpc": "2.0",
-    "id": "fusion-search",
-    "method": "searchAssets",
-    "params": {
-        "tokenType": "fungible",
-        "sortBy": {"sortBy": "created", "sortDirection": "desc"},
-        "limit": 40,
-        "page": 1,
-    },
-}
 
-r = await _post(url, payload)
-if r is None or r.status_code != 200:
-    print("HELIUS DAS ERR:", getattr(r, "status_code", "no_response"))
-    return []
+async def _get_dns_fallback(url: str):
+    try:
+        host = url.split("/")[2]
+        ip = socket.gethostbyname(host)
+        new_url = url.replace(host, ip, 1)
 
-try:
-    data = r.json()
-except Exception as e:
-    print("HELIUS DAS JSON ERR:", repr(e))
-    return []
+        headers = dict(HEADERS)
+        headers["Host"] = host
 
-items = (data.get("result") or {}).get("items") or []
-out = []
-for item in items:
-    mint = item.get("id")
-    if looks_like_solana_mint(mint):
-        out.append({"mint": mint, "source": "helius"})
-return out
-```
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+            print(f"FUSION DNS FIX: {host} -> {ip}")
+            return await client.get(new_url, headers=headers)
+    except Exception as e:
+        print("FUSION DNS FAIL:", repr(e))
+        return None
 
-async def fetch_dex_boosts():
-url = “https://api.dexscreener.com/token-boosts/latest/v1”
-r = await _get(url)
-if r is None:
-return []
-if r.status_code != 200:
-print(“DEX BOOST ERR:”, r.status_code)
-return []
 
-```
-try:
-    data = r.json() or []
-except Exception as e:
-    print("DEX BOOST JSON ERR:", repr(e))
-    return []
+async def _safe_get(url: str):
+    r = await _get(url)
+    if r is not None:
+        return r
+    return await _get_dns_fallback(url)
 
-out = []
-for item in data[:60]:
-    if item.get("chainId") != "solana":
-        continue
-    mint = item.get("tokenAddress")
-    if looks_like_solana_mint(mint):
-        out.append({"mint": mint, "source": "dex_boost"})
-return out
-```
 
-async def fetch_dex_tokens():
-url = “https://api.dexscreener.com/latest/dex/tokens/solana”
-r = await _get(url)
-if r is None:
-return []
-if r.status_code != 200:
-print(“DEX TOKENS ERR:”, r.status_code)
-return []
+async def fetch_pump():
+    r = await _safe_get(PUMP_URL)
+    if r is None:
+        return []
 
-```
-try:
-    data = r.json() or {}
-except Exception as e:
-    print("DEX TOKENS JSON ERR:", repr(e))
-    return []
+    if r.status_code != 200:
+        print("PUMP HTTP ERR:", r.status_code)
+        return []
 
-pairs = data.get("pairs") or []
-out = []
-for p in pairs[:80]:
-    if p.get("chainId") != "solana":
-        continue
-    mint = (p.get("baseToken") or {}).get("address")
-    if looks_like_solana_mint(mint):
-        out.append({"mint": mint, "source": "dex"})
-return out
-```
+    try:
+        data = r.json() or []
+    except Exception as e:
+        print("PUMP JSON ERR:", repr(e))
+        return []
+
+    out = []
+    for x in data[:30]:
+        mint = x.get("mint")
+        if looks_like_solana_mint(mint):
+            out.append({"mint": mint, "source": "pump"})
+    return out
+
+
+async def fetch_dex():
+    r = await _safe_get(DEX_URL)
+    if r is None:
+        return []
+
+    if r.status_code != 200:
+        print("DEX HTTP ERR:", r.status_code)
+        return []
+
+    try:
+        data = r.json() or {}
+    except Exception as e:
+        print("DEX JSON ERR:", repr(e))
+        return []
+
+    pairs = data.get("pairs", []) or []
+    out = []
+
+    for p in pairs[:80]:
+        if p.get("chainId") != "solana":
+            continue
+
+        mint = ((p.get("baseToken") or {}).get("address"))
+        if looks_like_solana_mint(mint):
+            out.append({"mint": mint, "source": "dex"})
+
+    return out
+
+
+async def fetch_jup():
+    r = await _safe_get(JUP_URL)
+    if r is None:
+        return []
+
+    if r.status_code != 200:
+        print("JUP HTTP ERR:", r.status_code)
+        return []
+
+    try:
+        data = r.json() or []
+    except Exception as e:
+        print("JUP JSON ERR:", repr(e))
+        return []
+
+    out = []
+    for x in data[:120]:
+        mint = x.get("address")
+        if looks_like_solana_mint(mint):
+            out.append({"mint": mint, "source": "jup"})
+    return out
+
 
 async def fetch_candidates():
-global CACHE, LAST_FETCH
+    global CACHE, LAST_FETCH, FAIL_STREAK, COOLDOWN_UNTIL
 
-```
-now = time.time()
-if now - LAST_FETCH < CACHE_TTL:
-    return CACHE
+    now = time.time()
 
-LAST_FETCH = now
+    if now < COOLDOWN_UNTIL:
+        return CACHE
 
-helius, boosts, tokens = await asyncio.gather(
-    fetch_helius(),
-    fetch_dex_boosts(),
-    fetch_dex_tokens(),
-    return_exceptions=True,
-)
+    if now - LAST_FETCH < 3:
+        return CACHE
 
-merged = []
-for result in (helius, boosts, tokens):
-    if isinstance(result, list):
-        merged.extend(result)
+    LAST_FETCH = now
 
-seen = set()
-out = []
-for item in merged:
-    mint = item.get("mint")
-    if mint and mint not in seen:
+    pump, dex, jup = await asyncio.gather(
+        fetch_pump(),
+        fetch_dex(),
+        fetch_jup(),
+    )
+
+    merged = pump + dex + jup
+
+    seen = set()
+    out = []
+
+    for item in merged:
+        mint = item["mint"]
+        if mint in seen:
+            continue
         seen.add(mint)
         out.append(item)
 
-if out:
-    CACHE = out[:60]
-    h = len(helius) if isinstance(helius, list) else "ERR"
-    b = len(boosts) if isinstance(boosts, list) else "ERR"
-    d = len(tokens) if isinstance(tokens, list) else "ERR"
-    print("FUSION OK:", len(CACHE), "tokens helius=" + str(h), "boosts=" + str(b), "dex=" + str(d))
+    if out:
+        CACHE = out[:60]
+        FAIL_STREAK = 0
+        return CACHE
 
-return CACHE
-```
+    FAIL_STREAK += 1
+
+    if FAIL_STREAK >= 3:
+        COOLDOWN_UNTIL = time.time() + 30
+        print("FUSION COOLDOWN 30s")
+
+    return CACHE
