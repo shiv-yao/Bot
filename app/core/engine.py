@@ -1,4 +1,4 @@
-# ================= V35 FULL FUSION ADAPTIVE MODE =================
+# ================= V35.1 FULL FUSION ADAPTIVE MODE =================
 
 import asyncio
 import time
@@ -161,6 +161,13 @@ async def get_price(m):
     if not q:
         return None
 
+    # ⭐ V35.1 FIX: fallback source 用真 priceUsd，不再把 outAmount 當價格
+    if q.get("source") == "dexscreener":
+        price = sf(q.get("priceUsd", 0))
+        if price <= 0:
+            return None
+        return price, q
+
     out = sf(q.get("outAmount", 0))
     if out <= 0:
         return None
@@ -169,11 +176,6 @@ async def get_price(m):
 
 
 # ================= FUND BRAIN =================
-def source_total(src):
-    s = SOURCE_STATS[src]
-    return s["wins"] + s["losses"]
-
-
 def source_ok(src):
     s = SOURCE_STATS[src]
     total = s["wins"] + s["losses"]
@@ -235,25 +237,28 @@ async def features(t):
     price, q = data
     prev = LAST_PRICE.get(m)
 
-    if price < 1e-8:
+    if price < 1e-12:
         log(f"FEATURE_BAD_PRICE {m[:6]} price={price}")
         return None
 
     if prev and prev > 0:
         raw = (price - prev) / prev
         breakout = min(max(raw * 4.0, 0.0), 1.0)
-    else:
-        breakout = 0.01
-
-    if prev and prev > 0:
         impact = abs(price - prev) / prev
-        if impact > 0.5:
+    else:
+        breakout = 0.0
+        impact = 0.0
+
+    # ⭐ V35.1 FIX: fallback source 不做 impact 誤殺
+    if q.get("source") != "dexscreener":
+        if prev and prev > 0 and impact > 0.5:
             LAST_PRICE[m] = price
             log(f"FEATURE_IMPACT_FAIL {m[:6]} impact={impact:.4f}")
             return None
 
     LAST_PRICE[m] = price
 
+    # liquidity 正規化
     liq_raw = sf(q.get("outAmount", 0))
     liquidity = min(liq_raw / 1e6, 1.0)
 
@@ -266,26 +271,28 @@ async def features(t):
     smart_money = min(wallet_count / 5, 1.0)
 
     # ===== V35 自適應模式 =====
-    # 有 wallet 資料 -> smart
-    # 沒 wallet 資料 / 很少 -> momentum
     if wallet_count >= 2:
         strategy_mode = "smart"
     else:
         strategy_mode = "momentum"
 
-    # fallback source 不再硬卡 smart
     if strategy_mode == "smart":
         if smart_money < 0.3:
             log(f"FEATURE_SMART_FAIL {m[:6]} smart={smart_money:.3f}")
             return None
     else:
-        # momentum 模式時，用 breakout 補 smart 權重，不硬擋
+        # momentum 模式時，不再因 smart 低而硬擋
         smart_money = max(smart_money, min(breakout * 1.5, 0.5))
         log(f"LOW_SMART_USE_MOMENTUM {m[:6]} smart={smart_money:.3f}")
 
+    # ⭐ V35.1 FIX: momentum 模式 breakout=0 時補一個 fallback breakout
     if breakout < MIN_BREAKOUT:
-        log(f"FEATURE_BREAKOUT_FAIL {m[:6]} breakout={breakout:.4f}")
-        return None
+        if strategy_mode == "momentum":
+            breakout = 0.015
+            log(f"MOMENTUM_BREAKOUT_FIX {m[:6]}")
+        else:
+            log(f"FEATURE_BREAKOUT_FAIL {m[:6]} breakout={breakout:.4f}")
+            return None
 
     if liquidity < MIN_LIQUIDITY:
         log(f"FEATURE_LIQ_FAIL {m[:6]} liq={liquidity:.4f}")
@@ -337,7 +344,6 @@ def size(score, src, mode):
 
     base *= source_weight(src)
 
-    # momentum 模式縮一點，smart 模式可以大一些
     if mode == "momentum":
         base *= 0.9
     else:
@@ -514,7 +520,7 @@ async def trade(t):
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🔥 V35 FULL FUSION ADAPTIVE MODE START")
+    log("🔥 V35.1 FULL FUSION ADAPTIVE MODE START")
 
     while engine.running:
         try:
