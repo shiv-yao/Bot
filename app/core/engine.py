@@ -1,4 +1,4 @@
-# ================= V33.1 TRUE FUSION =================
+# ================= V33.2 TRUE ALPHA =================
 
 import asyncio
 import time
@@ -27,15 +27,15 @@ except:
 
 # ================= CONFIG =================
 MAX_POSITIONS = 3
-MAX_EXPOSURE = 0.45
-MAX_POSITION_SIZE = 0.18
+MAX_EXPOSURE = 0.4
+MAX_POSITION_SIZE = 0.15
 
-TAKE_PROFIT = 0.06
-STOP_LOSS = -0.02
-TRAILING_GAP = 0.012
-MAX_HOLD_SEC = 45
+TAKE_PROFIT = 0.08
+STOP_LOSS = -0.025
+TRAILING_GAP = 0.015
+MAX_HOLD_SEC = 60
 
-TOKEN_COOLDOWN = 10
+TOKEN_COOLDOWN = 8
 
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
@@ -110,37 +110,36 @@ async def features(t):
     price, q = data
     prev = LAST_PRICE.get(m)
 
+    # ===== momentum 強化 =====
     breakout = 0
     if prev:
-        breakout = max((price-prev)/prev,0)
-
-    # ⭐ fallback 修正
-    if prev is None:
-        breakout = 0.008
-
-    # ⭐ fallback source 放寬
-    if src in ("dex","helius") and breakout < 0.003:
-        breakout = 0.003
+        raw = (price - prev) / prev
+        breakout = min(raw * 5, 1)   # 🔥 放大動能
+    else:
+        breakout = 0.01
 
     LAST_PRICE[m] = price
 
-    liq = sf(q.get("outAmount",0)) / 1e5
+    # ===== liquidity 正規化 =====
+    liq_raw = sf(q.get("outAmount",0))
+    liquidity = min(liq_raw / 1e6, 1)
 
-    if breakout < 0.004:
+    # ===== smart money =====
+    smart = min(len(wallets)/5, 1)
+
+    # ===== anti-noise =====
+    if breakout < 0.01:
         return None
 
-    if liq < 0.002:
-        return None
-
-    if len(wallets) < 1:
+    if liquidity < 0.002:
         return None
 
     return {
         "mint": m,
         "source": src,
         "breakout": breakout,
-        "smart_money": min(len(wallets)/6,1),
-        "liquidity": liq,
+        "smart_money": smart,
+        "liquidity": liquidity,
         "price": price
     }
 
@@ -155,9 +154,9 @@ def source_weight(src):
     winrate = s["wins"] / total
 
     if winrate > 0.6:
-        return 1.2
-    elif winrate < 0.3:
-        return 0.7
+        return 1.5
+    elif winrate < 0.4:
+        return 0.5
 
     return 1.0
 
@@ -168,13 +167,17 @@ def score_alpha(f):
         f["smart_money"] * 0.3 +
         f["liquidity"] * 0.2
     )
-    return base * source_weight(f["source"])
+    score = base * source_weight(f["source"])
+
+    return min(score, 1.0)   # 🔥 防爆
 
 # ================= SIZE =================
 def size(score):
     base = engine.capital * 0.08
-    if score > 0.5:
-        base *= 1.3
+
+    if score > 0.6:
+        base *= 1.5
+
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
 # ================= SELL =================
@@ -195,7 +198,7 @@ async def check_sell(p):
         reason = "SL"
     elif pnl < p.get("peak",0) - TRAILING_GAP:
         reason = "TRAIL"
-    elif held > MAX_HOLD_SEC and pnl < 0.01:
+    elif held > MAX_HOLD_SEC and pnl < -0.002:   # 🔥 修 TIME
         reason = "TIME"
 
     if pnl > p.get("peak",0):
@@ -237,8 +240,8 @@ async def trade(t):
     if not f:
         return False
 
-    # ⭐ filter bypass（冷啟動）
     ok,_ = adaptive_filter(f,None,engine.no_trade_cycles)
+
     if not ok and engine.no_trade_cycles < 10:
         ok = True
 
@@ -247,7 +250,7 @@ async def trade(t):
 
     score = score_alpha(f)
 
-    if score < 0.20:
+    if score < 0.25:
         return False
 
     s = size(score)
@@ -275,7 +278,7 @@ async def trade(t):
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🔥 V33.1 TRUE FUSION START")
+    log("🔥 V33.2 TRUE ALPHA START")
 
     while engine.running:
         try:
