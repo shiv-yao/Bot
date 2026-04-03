@@ -170,7 +170,6 @@ async def features(t):
 
     breakout *= source_bonus
 
-    # ===== 關鍵修正：不同 source 用不同 breakout 規則 =====
     if prev is None:
         if source == "pump":
             breakout = max(breakout, 0.020)
@@ -196,7 +195,6 @@ async def features(t):
 
     LAST_PRICE[mint] = price
 
-    # ===== 動態 breakout threshold =====
     if source == "pump":
         min_breakout = 0.010
     elif source == "dex_boost":
@@ -331,12 +329,19 @@ async def trade(t):
         log(f"SKIP_FEATURES {mint[:6]}")
         return False
 
-    try:
-        ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
-    except Exception as e:
-        engine.stats["errors"] += 1
-        log(f"FILTER_ERR {str(e)[:60]}")
-        return False
+    # ===== 冷啟動 bypass + 長時間沒交易 override =====
+    ok = True
+    if engine.stats["executed"] >= 3:
+        try:
+            ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+        except Exception as e:
+            engine.stats["errors"] += 1
+            log(f"FILTER_ERR {str(e)[:60]}")
+            return False
+
+        if not ok and engine.no_trade_cycles > 5:
+            log(f"FILTER_OVERRIDE {mint[:6]}")
+            ok = True
 
     if not ok:
         log(f"SKIP_FILTER {mint[:6]}")
@@ -386,7 +391,7 @@ async def trade(t):
 
 async def main_loop():
     ensure_engine()
-    log("V29.4 DYNAMIC BREAKOUT START")
+    log("V29.5 FILTER BYPASS START")
 
     while engine.running:
         traded = False
