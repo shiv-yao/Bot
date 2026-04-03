@@ -7,6 +7,8 @@ from app.data.market import looks_like_solana_mint
 
 CACHE = []
 LAST_FETCH = 0
+FAIL_STREAK = 0
+COOLDOWN_UNTIL = 0
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -127,10 +129,14 @@ async def fetch_jup():
 
 
 async def fetch_candidates():
-    global CACHE, LAST_FETCH
+    global CACHE, LAST_FETCH, FAIL_STREAK, COOLDOWN_UNTIL
 
     now = time.time()
-    if now - LAST_FETCH < 3:
+
+    if now < COOLDOWN_UNTIL:
+        return CACHE
+
+    if now - LAST_FETCH < 5:
         return CACHE
 
     LAST_FETCH = now
@@ -155,5 +161,13 @@ async def fetch_candidates():
 
     if out:
         CACHE = out[:60]
+        FAIL_STREAK = 0
+        return CACHE
+
+    FAIL_STREAK += 1
+
+    if FAIL_STREAK >= 3:
+        COOLDOWN_UNTIL = time.time() + 30
+        print("FUSION COOLDOWN 30s")
 
     return CACHE
