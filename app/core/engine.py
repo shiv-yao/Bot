@@ -1,4 +1,3 @@
-# ================= V29.2 HARDENED FINAL =================
 import asyncio
 import time
 import random
@@ -28,6 +27,7 @@ try:
 except Exception:
     async def update_token_wallets(m):
         return []
+
 
 MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.45
@@ -80,7 +80,7 @@ def log(msg):
 def sf(x):
     try:
         return float(x)
-    except:
+    except Exception:
         return 0.0
 
 
@@ -88,7 +88,7 @@ def risk():
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
         if dd < -0.30:
-            log("🛑 HARD STOP")
+            log("HARD STOP")
             engine.running = False
             return False
     return True
@@ -99,24 +99,22 @@ def exposure():
 
 
 async def safe_quote(input_mint, output_mint, amount):
-    for _ in range(2):
+    for _ in range(3):
         try:
             q = await get_quote(input_mint, output_mint, amount)
             if q and q.get("outAmount"):
                 return q
         except Exception as e:
-            log(f"QUOTE_ERR {str(e)[:40]}")
-
-        await asyncio.sleep(0.2 + random.random() * 0.3)
-
+            log(f"QUOTE_ERR {str(e)[:60]}")
+        await asyncio.sleep(0.25 + random.random() * 0.35)
     return None
 
 
-async def get_price(m):
-    if not looks_like_solana_mint(m):
+async def get_price(mint):
+    if not looks_like_solana_mint(mint):
         return None
 
-    q = await safe_quote(SOL, m, AMOUNT)
+    q = await safe_quote(SOL, mint, AMOUNT)
     if not q:
         return None
 
@@ -136,7 +134,7 @@ async def features(t):
 
     try:
         wallets = await update_token_wallets(mint)
-    except:
+    except Exception:
         wallets = []
 
     data = await get_price(mint)
@@ -148,31 +146,39 @@ async def features(t):
     prev = LAST_PRICE.get(mint)
     breakout = 0.0
     if prev and prev > 0:
-        breakout = max((price - prev) / prev, 0)
+        breakout = max((price - prev) / prev, 0.0)
 
     LAST_PRICE[mint] = price
 
     liq = sf(q.get("outAmount", 0)) / 1e5
 
     source_bonus = {
-        "pump": 1.2,
-        "dex": 1.0,
+        "pump": 1.20,
+        "dex": 1.00,
+        "dex_boost": 1.10,
+        "helius": 1.05,
+        "jup": 0.85,
+        "unknown": 1.00,
     }.get(source, 1.0)
 
     breakout *= source_bonus
 
-    if breakout < 0.01:
+    # 第一輪沒有 prev 時，不要直接過濾掉
+    if prev is not None and breakout < 0.01:
         return None
+
     if liq < 0.002:
         return None
-    if len(wallets) < 2:
+
+    # 保留你原本 smart money 邏輯，但不要過嚴
+    if len(wallets) < 1:
         return None
 
     return {
         "mint": mint,
         "source": source,
         "breakout": breakout,
-        "smart_money": min(len(wallets) / 8, 1),
+        "smart_money": min(len(wallets) / 8, 1.0),
         "liquidity": liq,
         "insider": 0.05,
         "wallet_count": len(wallets),
@@ -193,8 +199,7 @@ async def check_sell(p):
         return
 
     price, _ = data
-    entry = p["entry"]
-
+    entry = sf(p.get("entry", 0))
     if entry <= 0:
         return
 
@@ -202,23 +207,24 @@ async def check_sell(p):
     held = time.time() - p["time"]
 
     reason = None
-
     if pnl >= TAKE_PROFIT:
         reason = "TP"
     elif pnl <= STOP_LOSS:
         reason = "SL"
-    elif pnl < p.get("peak", 0) - TRAILING_GAP:
+    elif pnl < p.get("peak", 0.0) - TRAILING_GAP:
         reason = "TRAIL"
     elif held > MAX_HOLD_SEC and pnl < 0.01:
         reason = "TIME"
 
-    if pnl > p.get("peak", 0):
+    if pnl > p.get("peak", 0.0):
         p["peak"] = pnl
 
     if not reason:
         return
 
-    engine.positions.remove(p)
+    if p in engine.positions:
+        engine.positions.remove(p)
+
     engine.capital += p["size"] * (1 + pnl)
 
     engine.trade_history.append({
@@ -228,7 +234,6 @@ async def check_sell(p):
         "timestamp": time.time(),
         "meta": {"source": p.get("source")},
     })
-
     engine.trade_history = engine.trade_history[-500:]
 
     if pnl > 0:
@@ -268,7 +273,13 @@ async def trade(t):
     if not f:
         return False
 
-    ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+    try:
+        ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+    except Exception as e:
+        engine.stats["errors"] += 1
+        log(f"FILTER_ERR {str(e)[:60]}")
+        return False
+
     if not ok:
         return False
 
@@ -302,7 +313,6 @@ async def trade(t):
     })
 
     LAST_TRADE[mint] = now
-
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
     engine.last_signal = f"{mint[:6]} src={f['source']} score={score:.3f}"
@@ -313,7 +323,7 @@ async def trade(t):
 
 async def main_loop():
     ensure_engine()
-    log("🔥 V29.2 HARDENED START")
+    log("V29.2 HARDENED START")
 
     while engine.running:
         traded = False
@@ -326,7 +336,7 @@ async def main_loop():
 
             if not tokens:
                 engine.no_trade_cycles += 1
-                log("NO_CANDIDATES_WAIT")
+                log("NO_TOKENS_FROM_MARKET")
                 await asyncio.sleep(5)
                 continue
 
@@ -337,10 +347,13 @@ async def main_loop():
             for p in list(engine.positions):
                 await check_sell(p)
 
-            engine.no_trade_cycles = 0 if traded else engine.no_trade_cycles + 1
+            if traded:
+                engine.no_trade_cycles = 0
+            else:
+                engine.no_trade_cycles += 1
 
         except Exception as e:
             engine.stats["errors"] += 1
-            log(f"ERR {e}")
+            log(f"ERR {str(e)[:120]}")
 
         await asyncio.sleep(2)
