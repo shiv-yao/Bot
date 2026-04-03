@@ -1,7 +1,8 @@
-# ================= V27.1 HARDENED FINAL =================
+# ================= V27.1 + INFRA FINAL =================
 import asyncio
 import time
 from collections import defaultdict
+import httpx
 
 from app.state import engine
 from app.alpha.combiner import combine_scores
@@ -9,16 +10,14 @@ from app.alpha.adaptive_filter import adaptive_filter
 
 # ===== DATA =====
 try:
-    from app.sources.fusion import fetch_candidates
+    from app.sources.fusion import fetch_candidates as raw_fetch
 except:
-    async def fetch_candidates():
+    async def raw_fetch():
         return []
 
 try:
-    from app.data.market import get_quote, looks_like_solana_mint
+    from app.data.market import looks_like_solana_mint
 except:
-    async def get_quote(a, b, c):
-        return None
     def looks_like_solana_mint(x):
         return True
 
@@ -45,6 +44,16 @@ AMOUNT = 1_000_000
 
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
+
+# ===== INFRA =====
+JUP_ENDPOINTS = [
+    "https://quote-api.jup.ag/v6/quote",
+    "https://lite-api.jup.ag/swap/v1/quote",
+]
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+LAST_FETCH = 0
 
 # ===== INIT =====
 def ensure_engine():
@@ -80,6 +89,55 @@ def sf(x):
     except:
         return 0.0
 
+# ===== NETWORK =====
+async def safe_get(url, params=None):
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(url, params=params, headers=HEADERS)
+            return r
+    except Exception as e:
+        log(f"HTTP ERR {str(e)[:40]}")
+        return None
+
+async def safe_quote(input_mint, output_mint, amount):
+    for url in JUP_ENDPOINTS:
+        r = await safe_get(url, {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": amount,
+            "slippageBps": 50
+        })
+
+        if not r:
+            continue
+
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                if "outAmount" in data:
+                    return data
+            except:
+                pass
+
+        log(f"JUP FAIL {r.status_code}")
+        await asyncio.sleep(0.3)
+
+    return None
+
+async def fetch_candidates():
+    global LAST_FETCH
+
+    if time.time() - LAST_FETCH < 2:
+        return []
+
+    LAST_FETCH = time.time()
+
+    try:
+        return await raw_fetch()
+    except Exception as e:
+        log(f"FETCH ERR {e}")
+        return []
+
 # ===== RISK =====
 def risk():
     if engine.peak_capital > 0:
@@ -98,11 +156,11 @@ async def get_price(m):
     if not looks_like_solana_mint(m):
         return None
 
-    q = await get_quote(SOL, m, AMOUNT)
-    if not q or not q.get("outAmount"):
+    q = await safe_quote(SOL, m, AMOUNT)
+    if not q:
         return None
 
-    out = sf(q["outAmount"])
+    out = sf(q.get("outAmount"))
     if out <= 0:
         return None
 
@@ -113,7 +171,6 @@ async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
 
-    # 🚨 HARD FILTER
     if not looks_like_solana_mint(mint):
         return None
 
@@ -129,24 +186,12 @@ async def features(t):
     price, q = data
 
     prev = LAST_PRICE.get(mint)
-    breakout = 0.0
-    if prev:
-        breakout = max((price - prev) / prev, 0)
+    breakout = max((price - prev) / prev, 0) if prev else 0
 
     LAST_PRICE[mint] = price
 
-    liq = sf(q.get("outAmount", 0)) / 1e5
+    liq = sf(q.get("outAmount")) / 1e5
 
-    # source weighting
-    source_bonus = {
-        "pump": 1.2,
-        "dex": 1.0,
-        "jup": 0.85
-    }.get(source, 1.0)
-
-    breakout *= source_bonus
-
-    # 🚨 強過濾（關鍵）
     if breakout < 0.01:
         return None
     if liq < 0.002:
@@ -179,12 +224,10 @@ async def check_sell(p):
         return
 
     price, _ = data
-    entry = p["entry"]
-    pnl = (price - entry) / entry
+    pnl = (price - p["entry"]) / p["entry"]
     held = time.time() - p["time"]
 
     reason = None
-
     if pnl >= TAKE_PROFIT:
         reason = "TP"
     elif pnl <= STOP_LOSS:
@@ -203,21 +246,10 @@ async def check_sell(p):
     engine.positions.remove(p)
     engine.capital += p["size"] * (1 + pnl)
 
-    engine.trade_history.append({
-        "mint": p["mint"],
-        "pnl": pnl,
-        "reason": reason,
-        "timestamp": time.time(),
-        "meta": {"source": p.get("source")}
-    })
-
     if pnl > 0:
         engine.stats["wins"] += 1
     else:
         engine.stats["losses"] += 1
-
-    if engine.capital > engine.peak_capital:
-        engine.peak_capital = engine.capital
 
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
@@ -225,13 +257,7 @@ async def check_sell(p):
 async def trade(t):
     mint = t["mint"]
 
-    # 🚨 already holding
     if any(p["mint"] == mint for p in engine.positions):
-        return False
-
-    now = time.time()
-
-    if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
         return False
 
     if len(engine.positions) >= MAX_POSITIONS:
@@ -244,7 +270,7 @@ async def trade(t):
     if not f:
         return False
 
-    ok, th = adaptive_filter(f, None, engine.no_trade_cycles)
+    ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
     if not ok:
         return False
 
@@ -258,9 +284,7 @@ async def trade(t):
         {},
     )
 
-    # source threshold
     min_score = 0.22 if f["source"] == "pump" else 0.27
-
     if score < min_score:
         return False
 
@@ -274,28 +298,23 @@ async def trade(t):
         "mint": mint,
         "entry": f["price"],
         "size": s,
-        "time": now,
+        "time": time.time(),
         "peak": 0.0,
         "source": f["source"]
     })
-
-    LAST_TRADE[mint] = now
 
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
 
     log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
-
     return True
 
 # ===== MAIN =====
 async def main_loop():
     ensure_engine()
-    log("🔥 V27.1 FINAL START")
+    log("🔥 V27.1 INFRA FINAL START")
 
     while engine.running:
-        traded = False
-
         try:
             if not risk():
                 break
@@ -303,16 +322,10 @@ async def main_loop():
             tokens = await fetch_candidates()
 
             for t in tokens:
-                if await trade(t):
-                    traded = True
+                await trade(t)
 
             for p in list(engine.positions):
                 await check_sell(p)
-
-            if not traded:
-                engine.no_trade_cycles += 1
-            else:
-                engine.no_trade_cycles = 0
 
         except Exception as e:
             engine.stats["errors"] += 1
