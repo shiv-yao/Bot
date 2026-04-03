@@ -147,20 +147,20 @@ liq = sf(q.get("outAmount", 0)) / 1e5
 source_bonus = {
     "pump":      1.2,
     "dex":       1.0,
-    "dex_boost": 1.1,   # DexScreener boost 來源
-    "helius":    1.05,  # Helius DAS 來源
+    "dex_boost": 1.1,
+    "helius":    1.05,
     "jup":       0.85,
 }.get(source, 1.0)
 
 breakout *= source_bonus
 
-# breakout 門檻：第一次見到 token 沒有歷史價格，breakout=0 屬正常
-# 改為：沒歷史價格（prev 為 None）就跳過 breakout 檢查，用 liq 代替
+
+
 if prev is not None and breakout < 0.01:
     return None
 if liq < 0.002:
     return None
-# wallet 門檻放寬：Railway/Helius tracker 有時回傳 []，不應因此封殺整個 token
+
 if len(wallets) < 1:
     return None
 
