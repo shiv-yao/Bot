@@ -1,6 +1,7 @@
-# ================= V28 PRO + V29 MONEY MODE =================
+# ================= V29.2 HARDENED FINAL =================
 import asyncio
 import time
+import random
 from collections import defaultdict
 
 from app.state import engine
@@ -28,7 +29,7 @@ except Exception:
     async def update_token_wallets(m):
         return []
 
-
+# ===== CONFIG =====
 MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.45
 MAX_POSITION_SIZE = 0.18
@@ -46,7 +47,7 @@ AMOUNT = 1_000_000
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 
-
+# ===== INIT =====
 def ensure_engine():
     engine.positions = getattr(engine, "positions", [])
     engine.trade_history = getattr(engine, "trade_history", [])
@@ -70,20 +71,19 @@ def ensure_engine():
     engine.last_signal = getattr(engine, "last_signal", "")
     engine.last_trade = getattr(engine, "last_trade", "")
 
-
+# ===== LOG =====
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
-    engine.logs = engine.logs[-200:]
-
+    engine.logs = engine.logs[-200:]  # 防爆 RAM
 
 def sf(x):
     try:
         return float(x)
-    except Exception:
+    except:
         return 0.0
 
-
+# ===== RISK =====
 def risk():
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
@@ -93,36 +93,39 @@ def risk():
             return False
     return True
 
-
 def exposure():
     return sum(sf(p.get("size", 0)) for p in engine.positions)
 
-
+# ===== QUOTE（強化）=====
 async def safe_quote(input_mint, output_mint, amount):
-    try:
-        q = await get_quote(input_mint, output_mint, amount)
-        if q:
-            return q
-    except Exception as e:
-        log(f"QUOTE ERR {str(e)[:60]}")
+    for _ in range(2):
+        try:
+            q = await get_quote(input_mint, output_mint, amount)
+            if q and q.get("outAmount"):
+                return q
+        except Exception as e:
+            log(f"QUOTE_ERR {str(e)[:40]}")
+
+        await asyncio.sleep(0.2 + random.random() * 0.3)
+
     return None
 
-
+# ===== PRICE =====
 async def get_price(m):
     if not looks_like_solana_mint(m):
         return None
 
     q = await safe_quote(SOL, m, AMOUNT)
-    if not q or not q.get("outAmount"):
+    if not q:
         return None
 
-    out = sf(q["outAmount"])
+    out = sf(q.get("outAmount", 0))
     if out <= 0:
         return None
 
     return out / 1e6, q
 
-
+# ===== FEATURES =====
 async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
@@ -132,7 +135,7 @@ async def features(t):
 
     try:
         wallets = await update_token_wallets(mint)
-    except Exception:
+    except:
         wallets = []
 
     data = await get_price(mint)
@@ -143,7 +146,7 @@ async def features(t):
 
     prev = LAST_PRICE.get(mint)
     breakout = 0.0
-    if prev:
+    if prev and prev > 0:
         breakout = max((price - prev) / prev, 0)
 
     LAST_PRICE[mint] = price
@@ -158,6 +161,7 @@ async def features(t):
 
     breakout *= source_bonus
 
+    # 🔥 嚴格濾網（賺錢核心）
     if breakout < 0.01:
         return None
     if liq < 0.002:
@@ -176,14 +180,14 @@ async def features(t):
         "price": price,
     }
 
-
+# ===== SIZE =====
 def size(score):
     base = engine.capital * 0.08
     if score > 0.4:
         base *= 1.3
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
-
+# ===== EXIT =====
 async def check_sell(p):
     data = await get_price(p["mint"])
     if not data:
@@ -191,6 +195,10 @@ async def check_sell(p):
 
     price, _ = data
     entry = p["entry"]
+
+    if entry <= 0:
+        return
+
     pnl = (price - entry) / entry
     held = time.time() - p["time"]
 
@@ -214,14 +222,16 @@ async def check_sell(p):
     engine.positions.remove(p)
     engine.capital += p["size"] * (1 + pnl)
 
-    trade_row = {
+    engine.trade_history.append({
         "mint": p["mint"],
         "pnl": pnl,
         "reason": reason,
         "timestamp": time.time(),
         "meta": {"source": p.get("source")},
-    }
-    engine.trade_history.append(trade_row)
+    })
+
+    # 防 trade_history 爆炸
+    engine.trade_history = engine.trade_history[-500:]
 
     if pnl > 0:
         engine.stats["wins"] += 1
@@ -234,13 +244,9 @@ async def check_sell(p):
     engine.last_trade = f"{p['mint'][:6]} {reason} pnl={pnl:.4f}"
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
-
+# ===== TRADE =====
 async def trade(t):
     mint = t["mint"]
-
-    if not looks_like_solana_mint(mint):
-        log(f"BAD_MINT {mint}")
-        return False
 
     if any(p["mint"] == mint for p in engine.positions):
         return False
@@ -302,10 +308,10 @@ async def trade(t):
     log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
     return True
 
-
+# ===== MAIN =====
 async def main_loop():
     ensure_engine()
-    log("🔥 V28 PRO + V29 MONEY MODE START")
+    log("🔥 V29.2 HARDENED START")
 
     while engine.running:
         traded = False
@@ -318,7 +324,7 @@ async def main_loop():
 
             if not tokens:
                 engine.no_trade_cycles += 1
-                log("NO_CANDIDATES_USE_CACHE_OR_WAIT")
+                log("NO_CANDIDATES_WAIT")
                 await asyncio.sleep(5)
                 continue
 
@@ -329,10 +335,7 @@ async def main_loop():
             for p in list(engine.positions):
                 await check_sell(p)
 
-            if not traded:
-                engine.no_trade_cycles += 1
-            else:
-                engine.no_trade_cycles = 0
+            engine.no_trade_cycles = 0 if traded else engine.no_trade_cycles + 1
 
         except Exception as e:
             engine.stats["errors"] += 1
