@@ -5,6 +5,8 @@ import socket
 import time
 import httpx
 
+from app.utils.net import resolve_host
+
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
 JUP_ENDPOINTS = [
@@ -20,10 +22,7 @@ QUOTE_CACHE_TTL = 3
 
 def _headers():
     api_key = os.getenv("JUP_API_KEY", "").strip()
-    h = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    }
+    h = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
     if api_key:
         h["x-api-key"] = api_key
     return h
@@ -39,62 +38,56 @@ def looks_like_solana_mint(addr: str) -> bool:
     return bool(_BASE58_RE.fullmatch(addr))
 
 
-def _normalize_amount(amount) -> str | None:
+def _normalize_amount(amount):
     try:
         v = int(amount)
-        if v <= 0:
-            return None
-        return str(v)
-    except Exception:
+        return str(v) if v > 0 else None
+    except:
         return None
 
 
-async def _http_get(url: str, params: dict):
+async def _http_get(url, params):
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-            return await client.get(url, params=params, headers=_headers())
-    except Exception as e:
-        print("MARKET HTTP ERR:", repr(e))
+        async with httpx.AsyncClient(timeout=8) as c:
+            return await c.get(url, params=params, headers=_headers())
+    except:
         return None
 
 
-async def _http_get_dns_fallback(url: str, params: dict):
+async def _http_get_dns(url, params):
     try:
         host = url.split("/")[2]
-        ip = socket.gethostbyname(host)
+        ip = resolve_host(host)
+        if not ip:
+            return None
+
         new_url = url.replace(host, ip, 1)
 
         headers = _headers()
         headers["Host"] = host
 
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
-            print(f"MARKET DNS FIX: {host} -> {ip}")
-            return await client.get(new_url, params=params, headers=headers)
-    except Exception as e:
-        print("MARKET DNS FAIL:", repr(e))
+        async with httpx.AsyncClient(timeout=8, verify=False) as c:
+            return await c.get(new_url, params=params, headers=headers)
+    except:
         return None
 
 
 async def get_quote(input_mint, output_mint, amount):
     if not looks_like_solana_mint(input_mint):
-        print("MARKET INVALID INPUT_MINT:", input_mint)
         return None
-
     if not looks_like_solana_mint(output_mint):
-        print("MARKET INVALID OUTPUT_MINT:", output_mint)
         return None
 
     amt = _normalize_amount(amount)
-    if amt is None:
-        print("MARKET INVALID AMOUNT:", amount)
+    if not amt:
         return None
 
     key = f"{input_mint}:{output_mint}:{amt}"
     now = time.time()
 
-    cached = QUOTE_CACHE.get(key)
-    if cached and now - cached["ts"] < QUOTE_CACHE_TTL:
-        return cached["data"]
+    if key in QUOTE_CACHE:
+        if now - QUOTE_CACHE[key]["ts"] < QUOTE_CACHE_TTL:
+            return QUOTE_CACHE[key]["data"]
 
     params = {
         "inputMint": input_mint,
@@ -106,41 +99,19 @@ async def get_quote(input_mint, output_mint, amount):
 
     for url in JUP_ENDPOINTS:
         r = await _http_get(url, params)
-        if r is None:
-            r = await _http_get_dns_fallback(url, params)
+        if not r:
+            r = await _http_get_dns(url, params)
 
-        if r is None:
-            await asyncio.sleep(0.3)
-            continue
-
-        if r.status_code != 200:
-            print("MARKET QUOTE ERROR STATUS:", r.status_code)
-            print("MARKET QUOTE ERROR URL:", url)
-            print("MARKET QUOTE ERROR BODY:", r.text[:300])
-            await asyncio.sleep(0.3)
+        if not r or r.status_code != 200:
             continue
 
         try:
             data = r.json()
-        except Exception as e:
-            print("MARKET JSON ERR:", repr(e))
-            await asyncio.sleep(0.3)
+        except:
             continue
 
-        if not isinstance(data, dict):
-            print("MARKET INVALID JSON:", data)
-            await asyncio.sleep(0.3)
-            continue
-
-        if not data.get("outAmount"):
-            print("MARKET NO ROUTE:", data)
-            await asyncio.sleep(0.3)
-            continue
-
-        QUOTE_CACHE[key] = {
-            "ts": now,
-            "data": data,
-        }
-        return data
+        if data.get("outAmount"):
+            QUOTE_CACHE[key] = {"ts": now, "data": data}
+            return data
 
     return None
