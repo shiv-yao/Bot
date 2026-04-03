@@ -1,26 +1,26 @@
-# ================= V26.3 + V27 FINAL =================
+# ================= V27.1 HARDENED FINAL =================
 import asyncio
 import time
 from collections import defaultdict
 
 from app.state import engine
-from app.metrics import compute_metrics
 from app.alpha.combiner import combine_scores
 from app.alpha.adaptive_filter import adaptive_filter
 
-# ===== NEW：多資料源 =====
+# ===== DATA =====
 try:
     from app.sources.fusion import fetch_candidates
 except:
     async def fetch_candidates():
         return []
 
-# ===== SAFE IMPORT =====
 try:
-    from app.data.market import get_quote
+    from app.data.market import get_quote, looks_like_solana_mint
 except:
     async def get_quote(a, b, c):
         return None
+    def looks_like_solana_mint(x):
+        return True
 
 try:
     from app.alpha.helius_wallet_tracker import update_token_wallets
@@ -95,18 +95,27 @@ def exposure():
 
 # ===== PRICE =====
 async def get_price(m):
+    if not looks_like_solana_mint(m):
+        return None
+
     q = await get_quote(SOL, m, AMOUNT)
     if not q or not q.get("outAmount"):
         return None
+
     out = sf(q["outAmount"])
     if out <= 0:
         return None
+
     return out / 1e6, q
 
-# ===== FEATURES（V27核心）=====
+# ===== FEATURES =====
 async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
+
+    # 🚨 HARD FILTER
+    if not looks_like_solana_mint(mint):
+        return None
 
     try:
         wallets = await update_token_wallets(mint)
@@ -128,7 +137,7 @@ async def features(t):
 
     liq = sf(q.get("outAmount", 0)) / 1e5
 
-    # 🚨 source weighting（V27）
+    # source weighting
     source_bonus = {
         "pump": 1.2,
         "dex": 1.0,
@@ -137,7 +146,7 @@ async def features(t):
 
     breakout *= source_bonus
 
-    # 🚨 嚴格過濾（V26.2 + V27）
+    # 🚨 強過濾（關鍵）
     if breakout < 0.01:
         return None
     if liq < 0.002:
@@ -216,6 +225,10 @@ async def check_sell(p):
 async def trade(t):
     mint = t["mint"]
 
+    # 🚨 already holding
+    if any(p["mint"] == mint for p in engine.positions):
+        return False
+
     now = time.time()
 
     if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
@@ -245,11 +258,8 @@ async def trade(t):
         {},
     )
 
-    # 🚨 source 分級門檻
-    if f["source"] == "pump":
-        min_score = 0.22
-    else:
-        min_score = 0.27
+    # source threshold
+    min_score = 0.22 if f["source"] == "pump" else 0.27
 
     if score < min_score:
         return False
@@ -278,10 +288,10 @@ async def trade(t):
 
     return True
 
-# ===== MAIN LOOP =====
+# ===== MAIN =====
 async def main_loop():
     ensure_engine()
-    log("🔥 V26.3 + V27 ENGINE START")
+    log("🔥 V27.1 FINAL START")
 
     while engine.running:
         traded = False
