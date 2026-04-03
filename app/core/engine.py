@@ -1,4 +1,4 @@
-# ================= V36.1 TRUE FUSION FUND =================
+# ================= V36.2 TRUE PROFIT FIX (FULL FUSION) =================
 
 import asyncio
 import time
@@ -15,9 +15,10 @@ except:
         return []
 
 try:
-    from app.data.market import get_quote
+    from app.data.market import get_quote, looks_like_solana_mint
 except:
-    async def get_quote(a,b,c): return None
+    async def get_quote(a, b, c): return None
+    def looks_like_solana_mint(x): return True
 
 try:
     from app.alpha.helius_wallet_tracker import update_token_wallets
@@ -25,48 +26,63 @@ except:
     async def update_token_wallets(m): return []
 
 # ================= CONFIG =================
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.5
-MAX_POSITION_SIZE = 0.2
+MAX_POSITION_SIZE = 0.25
 
-TAKE_PROFIT = 0.08
-STOP_LOSS = -0.15
+TAKE_PROFIT = 0.05
+STOP_LOSS = -0.02
+TRAILING_GAP = 0.012
+MAX_HOLD_SEC = 60
 
 TOKEN_COOLDOWN = 10
 
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
 
-LAST_PRICE = {}
 LAST_TRADE = defaultdict(float)
+LAST_PRICE = {}
 
-# 🧠 學習系統
-SOURCE_STATS = defaultdict(lambda: {"wins":0,"losses":0})
+# ================= FUND MEMORY =================
+SOURCE_STATS = defaultdict(lambda: {
+    "wins": 0,
+    "losses": 0,
+    "pnl": 0.0,
+})
 
 # ================= ENGINE =================
 def ensure_engine():
     engine.positions = getattr(engine, "positions", [])
+    engine.trade_history = getattr(engine, "trade_history", [])
     engine.logs = getattr(engine, "logs", [])
-    engine.capital = getattr(engine, "capital", 5.0)
-    engine.running = True
 
+    engine.capital = getattr(engine, "capital", 5.0)
+    engine.peak_capital = getattr(engine, "peak_capital", engine.capital)
+
+    engine.running = True
+    engine.no_trade_cycles = getattr(engine, "no_trade_cycles", 0)
+
+# ================= LOG =================
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
     engine.logs = engine.logs[-300:]
 
+# ================= HELP =================
 def sf(x):
-    try: return float(x)
-    except: return 0.0
+    try:
+        return float(x)
+    except:
+        return 0.0
 
 def exposure():
     return sum(sf(p["size"]) for p in engine.positions)
 
 # ================= PRICE =================
-async def safe_quote(i,o,a):
+async def safe_quote(i, o, a):
     for _ in range(3):
         try:
-            q = await get_quote(i,o,a)
+            q = await get_quote(i, o, a)
             if q and q.get("outAmount"):
                 return q
         except:
@@ -75,107 +91,166 @@ async def safe_quote(i,o,a):
     return None
 
 async def get_price(m):
-    q = await safe_quote(SOL,m,AMOUNT)
-    if not q: return None
-    out = sf(q.get("outAmount",0))
-    if out <= 0: return None
-    return out/1e6, q
+    q = await safe_quote(SOL, m, AMOUNT)
+    if not q:
+        return None
+
+    out = sf(q.get("outAmount", 0))
+
+    # 🚨 防爆價
+    if out <= 0 or out > 1e12:
+        return None
+
+    price = out / 1e6
+
+    # 🚨 再過濾
+    if price <= 0 or price > 1000:
+        return None
+
+    return price, q
 
 # ================= FEATURES =================
 async def features(t):
     m = t["mint"]
-    src = t.get("source","unknown")
+    src = t.get("source", "unknown")
 
     wallets = await update_token_wallets(m)
     data = await get_price(m)
-    if not data: return None
+    if not data:
+        return None
 
-    price,_ = data
+    price, q = data
     prev = LAST_PRICE.get(m)
 
-    breakout = 0
+    breakout = 0.0
     if prev:
-        breakout = max((price-prev)/prev,0)
+        breakout = max((price - prev) / prev, 0)
 
+    # ⭐ 首次進場
     if prev is None:
         breakout = 0.01
 
     LAST_PRICE[m] = price
 
-    wallet_count = len(wallets)
+    liq = sf(q.get("outAmount", 0)) / 1e5
+    smart = min(len(wallets) / 5, 1)
 
-    # ⭐ 模式判斷
-    if wallet_count >= 2:
-        mode = "smart"
-    else:
-        mode = "momentum"
+    # 🚨 過濾
+    if breakout < 0.004:
+        log(f"FEATURE_BREAKOUT_FAIL {m[:6]} {breakout:.4f}")
+        return None
 
-    smart = min(wallet_count/5,1)
+    if liq < 0.002:
+        log(f"FEATURE_LIQ_FAIL {m[:6]} {liq:.4f}")
+        return None
 
     return {
         "mint": m,
-        "price": price,
-        "breakout": breakout,
-        "smart": smart,
         "source": src,
-        "mode": mode
+        "breakout": breakout,
+        "smart_money": smart,
+        "liquidity": liq,
+        "price": price
     }
 
-# ================= SOURCE LEARNING =================
+# ================= FUND BRAIN =================
 def source_weight(src):
     s = SOURCE_STATS[src]
     total = s["wins"] + s["losses"]
 
-    if total < 5:
+    if total < 3:
         return 1.0
 
-    winrate = s["wins"]/max(total,1)
+    winrate = s["wins"] / total
 
     if winrate > 0.6:
-        return 1.3
+        return 1.2
     elif winrate < 0.3:
-        return 0.6
+        return 0.7
 
     return 1.0
 
-# ================= SCORE（修正爆炸） =================
+# ================= REGIME =================
+def market_mode(f):
+    if f["smart_money"] > 0.6:
+        return "smart"
+    return "momentum"
+
+# ================= SCORE =================
 def score_alpha(f):
-    base = (
-        min(f["breakout"],0.05)*5 +
-        f["smart"]*0.3
-    )
-    return base * source_weight(f["source"])
+
+    mode = market_mode(f)
+
+    if mode == "smart":
+        base = (
+            f["smart_money"] * 0.5 +
+            f["breakout"] * 0.3 +
+            f["liquidity"] * 0.2
+        )
+    else:
+        base = (
+            f["breakout"] * 0.6 +
+            f["liquidity"] * 0.3 +
+            f["smart_money"] * 0.1
+        )
+
+    return base * source_weight(f["source"]), mode
 
 # ================= SIZE =================
 def size(score):
-    base = engine.capital * 0.1
-    if score > 0.7:
-        base *= 1.5
+    base = engine.capital * 0.05
+
+    if score > 0.6:
+        base *= 1.2
+
+    base = min(base, 0.2)  # 🚨 防爆
+
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
 # ================= SELL =================
 async def check_sell(p):
     data = await get_price(p["mint"])
-    if not data: return
+    if not data:
+        return
 
-    price,_ = data
+    price, _ = data
     pnl = (price - p["entry"]) / p["entry"]
 
-    if pnl >= TAKE_PROFIT or pnl <= STOP_LOSS:
-        engine.positions.remove(p)
-        engine.capital += p["size"] * (1+pnl)
+    # 🚨 限制 pnl
+    pnl = max(min(pnl, 1.0), -1.0)
 
-        src = p["source"]
-        if pnl > 0:
-            SOURCE_STATS[src]["wins"] += 1
-        else:
-            SOURCE_STATS[src]["losses"] += 1
+    reason = None
 
-        log(f"SELL {p['mint'][:6]} pnl={pnl:.4f}")
+    if pnl >= TAKE_PROFIT:
+        reason = "TP"
+    elif pnl <= STOP_LOSS:
+        reason = "SL"
 
-# ================= EXECUTE =================
-async def execute_trade(f, score):
-    m = f["mint"]
+    if not reason:
+        return
+
+    engine.positions.remove(p)
+    engine.capital += p["size"] * (1 + pnl)
+
+    src = p["source"]
+
+    if pnl > 0:
+        SOURCE_STATS[src]["wins"] += 1
+    else:
+        SOURCE_STATS[src]["losses"] += 1
+
+    SOURCE_STATS[src]["pnl"] += pnl
+
+    log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
+
+# ================= TRADE =================
+async def trade(t):
+
+    if exposure() > engine.capital * MAX_EXPOSURE:
+        log("BLOCK_EXPOSURE")
+        return False
+
+    m = t["mint"]
 
     if any(p["mint"] == m for p in engine.positions):
         return False
@@ -186,14 +261,26 @@ async def execute_trade(f, score):
     if len(engine.positions) >= MAX_POSITIONS:
         return False
 
-    if exposure() > engine.capital * MAX_EXPOSURE:
+    f = await features(t)
+    if not f:
         return False
 
-    # 防假數據
-    if f["breakout"] > 0.1:
+    ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+    if not ok:
+        return False
+
+    score, mode = score_alpha(f)
+
+    # 🚨 momentum 限制
+    if mode == "momentum" and f["breakout"] < 0.01:
+        log(f"SKIP_WEAK_MOMENTUM {m[:6]}")
+        return False
+
+    if score < 0.2:
         return False
 
     s = size(score)
+
     if engine.capital < s:
         return False
 
@@ -209,49 +296,30 @@ async def execute_trade(f, score):
 
     LAST_TRADE[m] = time.time()
 
-    log(f"BUY {m[:6]} {f['mode']} score={score:.3f}")
+    log(f"BUY {m[:6]} {mode} score={score:.3f}")
+
     return True
 
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🚀 V36.1 TRUE FUSION FUND START")
+    log("🚀 V36.2 TRUE PROFIT FIX START")
 
     while engine.running:
+
         try:
             tokens = await fetch_candidates()
 
-            candidates = []
-
             for t in tokens:
-                f = await features(t)
-                if not f:
-                    continue
-
-                # ⭐ adaptive filter（保留但不鎖死）
-                ok = True
-                if f["mode"] == "smart":
-                    try:
-                        ok,_ = adaptive_filter(f,None,engine.no_trade_cycles)
-                    except:
-                        ok = True
-                else:
-                    log(f"FILTER_BYPASS_MOMENTUM {f['mint'][:6]}")
-
-                if not ok:
-                    continue
-
-                score = score_alpha(f)
-                candidates.append((score,f))
-
-            # ⭐ 只打最強
-            candidates.sort(reverse=True, key=lambda x:x[0])
-
-            for score,f in candidates[:2]:
-                await execute_trade(f, score)
+                await trade(t)
 
             for p in list(engine.positions):
                 await check_sell(p)
+
+            # 🚨 防資金爆炸
+            if engine.capital > 100:
+                log("⚠️ CAPITAL RESET")
+                engine.capital = 5.0
 
         except Exception as e:
             log(f"ERR {e}")
