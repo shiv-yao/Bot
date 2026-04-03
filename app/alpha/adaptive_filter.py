@@ -1,113 +1,84 @@
-def compute_market_state(metrics: dict | None):
-    if not metrics:
-        return "neutral"
+def adaptive_filter(features, metrics, no_trade_cycles=0):
+    """
+    return:
+        ok: bool
+        th: dict
+    """
 
-    perf = metrics.get("performance", {}) or {}
-    summary = metrics.get("summary", {}) or {}
+    # ===== default =====
+    state = "neutral"
+    score_min = 0.20
+    score_boost = 1.0
 
-    win_rate = float(perf.get("win_rate", 0) or 0)
-    pf = float(perf.get("profit_factor", 0) or 0)
-    dd = float(summary.get("drawdown", 0) or 0)
+    # ===== metrics-based regime =====
+    if metrics and isinstance(metrics, dict):
+        perf = metrics.get("performance", {})
+        summary = metrics.get("summary", {})
 
-    # ⭐ aggressive：只有真的健康才進
-    if win_rate > 0.62 and pf > 1.60 and dd > -0.08:
-        return "aggressive"
+        win_rate = float(perf.get("win_rate", 0.0))
+        pf = float(perf.get("profit_factor", 1.0))
+        dd = float(summary.get("drawdown", 0.0))
 
-    # ⭐ defensive：只要 DD 偏深或品質下降就進防守
-    if win_rate < 0.48 or pf < 1.05 or dd < -0.12:
-        return "defensive"
+        # ===== GOOD REGIME =====
+        if win_rate > 0.55 and pf > 1.2:
+            state = "aggressive"
+            score_min = 0.15
+            score_boost = 1.2
 
-    return "neutral"
+        # ===== BAD REGIME =====
+        elif win_rate < 0.35 or pf < 0.8 or dd < -0.2:
+            state = "defensive"
+            score_min = 0.28
+            score_boost = 0.85
 
+    # ===== NO TRADE RELAX =====
+    loosen_factor = 1.0
 
-def adaptive_thresholds(metrics: dict | None, no_trade_cycles: int = 0):
-    state = compute_market_state(metrics)
+    if no_trade_cycles > 3:
+        loosen_factor *= 0.9
+        state += "_loosen1"
 
-    if state == "aggressive":
-        th = {
-            "wallet_min": 2,
-            "liquidity_min": 0.006,
-            "max_price_impact": 0.060,
-            "score_boost": 1.05,
-            "score_min": 0.18,
-            "state": state,
-        }
+    if no_trade_cycles > 6:
+        loosen_factor *= 0.8
+        state += "_loosen2"
 
-    elif state == "defensive":
-        th = {
-            "wallet_min": 3,
-            "liquidity_min": 0.015,
-            "max_price_impact": 0.025,
-            "score_boost": 0.90,
-            "score_min": 0.24,
-            "state": state,
-        }
+    if no_trade_cycles > 10:
+        loosen_factor *= 0.7
+        state += "_loosen3"
 
-    else:
-        th = {
-            "wallet_min": 2,
-            "liquidity_min": 0.008,
-            "max_price_impact": 0.040,
-            "score_boost": 1.00,
-            "score_min": 0.20,
-            "state": state,
-        }
+    score_min *= loosen_factor
 
-    # ===== 平滑放寬，不一次放太多 =====
-    if no_trade_cycles >= 4:
-        th["wallet_min"] = max(1, th["wallet_min"] - 1)
-        th["liquidity_min"] *= 0.85
-        th["max_price_impact"] *= 1.15
-        th["score_min"] *= 0.92
-        th["state"] = f"{th['state']}_loosen1"
+    # ===== feature checks =====
+    wallet_ok = features.get("wallet_count", 0) >= 2
+    liquidity_ok = features.get("liquidity", 0) > 0.0005
+    impact_ok = features.get("price_impact", 1) < 0.03
 
-    if no_trade_cycles >= 8:
-        th["liquidity_min"] *= 0.85
-        th["max_price_impact"] *= 1.12
-        th["score_min"] *= 0.94
-        th["state"] = f"{th['state']}_loosen2"
-
-    if no_trade_cycles >= 12:
-        th["wallet_min"] = 1
-        th["liquidity_min"] *= 0.85
-        th["max_price_impact"] *= 1.10
-        th["score_min"] *= 0.95
-        th["state"] = f"{th['state']}_loosen3"
-
-    # ===== 安全上下限 =====
-    th["wallet_min"] = max(1, int(th["wallet_min"]))
-    th["liquidity_min"] = max(0.0015, float(th["liquidity_min"]))
-    th["max_price_impact"] = min(max(0.01, float(th["max_price_impact"])), 0.12)
-    th["score_boost"] = min(max(0.75, float(th["score_boost"])), 1.15)
-    th["score_min"] = min(max(0.10, float(th["score_min"])), 0.30)
-
-    return th
-
-
-def adaptive_filter(features: dict | None, metrics: dict | None, no_trade_cycles: int = 0):
-    if not features:
+    # ===== HARD FILTER =====
+    if not liquidity_ok or not impact_ok:
         return False, {
-            "wallet_min": 999,
-            "liquidity_min": 999,
-            "max_price_impact": 999,
-            "score_boost": 0.0,
-            "score_min": 999,
-            "state": "invalid",
+            "state": state,
+            "score_min": score_min,
+            "score_boost": score_boost,
         }
 
-    th = adaptive_thresholds(metrics, no_trade_cycles=no_trade_cycles)
+    # ===== SOFT FILTER =====
+    if wallet_ok:
+        return True, {
+            "state": state,
+            "score_min": score_min,
+            "score_boost": score_boost,
+        }
 
-    wallet_count = float(features.get("wallet_count", 0) or 0)
-    liquidity = float(features.get("liquidity", 0) or 0)
-    price_impact = float(features.get("price_impact", 999) or 999)
+    # ===== fallback allow =====
+    if no_trade_cycles > 5:
+        return True, {
+            "state": state + "_force",
+            "score_min": score_min,
+            "score_boost": score_boost,
+        }
 
-    if wallet_count < th["wallet_min"]:
-        return False, th
-
-    if liquidity < th["liquidity_min"]:
-        return False, th
-
-    if price_impact > th["max_price_impact"]:
-        return False, th
-
-    return True, th
+    return False, {
+        "state": state,
+        "score_min": score_min,
+        "score_boost": score_boost,
+    }
