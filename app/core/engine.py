@@ -29,7 +29,6 @@ except Exception:
     async def update_token_wallets(m):
         return []
 
-# ===== CONFIG =====
 MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.45
 MAX_POSITION_SIZE = 0.18
@@ -47,7 +46,7 @@ AMOUNT = 1_000_000
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 
-# ===== INIT =====
+
 def ensure_engine():
     engine.positions = getattr(engine, "positions", [])
     engine.trade_history = getattr(engine, "trade_history", [])
@@ -71,11 +70,12 @@ def ensure_engine():
     engine.last_signal = getattr(engine, "last_signal", "")
     engine.last_trade = getattr(engine, "last_trade", "")
 
-# ===== LOG =====
+
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
-    engine.logs = engine.logs[-200:]  # 防爆 RAM
+    engine.logs = engine.logs[-200:]
+
 
 def sf(x):
     try:
@@ -83,7 +83,7 @@ def sf(x):
     except:
         return 0.0
 
-# ===== RISK =====
+
 def risk():
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
@@ -93,10 +93,11 @@ def risk():
             return False
     return True
 
+
 def exposure():
     return sum(sf(p.get("size", 0)) for p in engine.positions)
 
-# ===== QUOTE（強化）=====
+
 async def safe_quote(input_mint, output_mint, amount):
     for _ in range(2):
         try:
@@ -110,7 +111,7 @@ async def safe_quote(input_mint, output_mint, amount):
 
     return None
 
-# ===== PRICE =====
+
 async def get_price(m):
     if not looks_like_solana_mint(m):
         return None
@@ -125,7 +126,7 @@ async def get_price(m):
 
     return out / 1e6, q
 
-# ===== FEATURES =====
+
 async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
@@ -156,12 +157,10 @@ async def features(t):
     source_bonus = {
         "pump": 1.2,
         "dex": 1.0,
-        "jup": 0.85,
     }.get(source, 1.0)
 
     breakout *= source_bonus
 
-    # 🔥 嚴格濾網（賺錢核心）
     if breakout < 0.01:
         return None
     if liq < 0.002:
@@ -180,14 +179,14 @@ async def features(t):
         "price": price,
     }
 
-# ===== SIZE =====
+
 def size(score):
     base = engine.capital * 0.08
     if score > 0.4:
         base *= 1.3
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
-# ===== EXIT =====
+
 async def check_sell(p):
     data = await get_price(p["mint"])
     if not data:
@@ -230,7 +229,6 @@ async def check_sell(p):
         "meta": {"source": p.get("source")},
     })
 
-    # 防 trade_history 爆炸
     engine.trade_history = engine.trade_history[-500:]
 
     if pnl > 0:
@@ -244,9 +242,13 @@ async def check_sell(p):
     engine.last_trade = f"{p['mint'][:6]} {reason} pnl={pnl:.4f}"
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
-# ===== TRADE =====
+
 async def trade(t):
     mint = t["mint"]
+
+    if not looks_like_solana_mint(mint):
+        log(f"BAD_MINT {mint}")
+        return False
 
     if any(p["mint"] == mint for p in engine.positions):
         return False
@@ -308,7 +310,7 @@ async def trade(t):
     log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
     return True
 
-# ===== MAIN =====
+
 async def main_loop():
     ensure_engine()
     log("🔥 V29.2 HARDENED START")
