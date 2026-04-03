@@ -7,6 +7,7 @@ from app.state import engine
 from app.metrics import compute_metrics
 from app.alpha.combiner import combine_scores
 from app.alpha.adaptive_filter import adaptive_filter
+from app.portfolio.portfolio_manager import portfolio
 
 
 # ===== SAFE IMPORT =====
@@ -31,25 +32,21 @@ except:
 
 # ===== CONFIG =====
 MAX_POSITIONS = 4
-MAX_EXPOSURE = 0.5
+MAX_EXPOSURE = 0.8
 MAX_POSITION_SIZE = 0.2
 
 TAKE_PROFIT = 0.04
 STOP_LOSS = -0.02
-TRAILING_GAP = 0.015
-MAX_HOLD_SEC = 40
 
 TOKEN_COOLDOWN = 10
-FORCE_TRADE_INTERVAL = 15
+FORCE_LIMIT = 2
 
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
 
 LAST_TRADE = defaultdict(float)
-LAST_EXEC = 0
 LAST_PRICE = {}
 
-# ⭐ NEW（學習用）
 SCORE_HISTORY = []
 FORCED_HISTORY = []
 
@@ -118,36 +115,51 @@ async def build_features(mint):
     }
 
 
-# ===== SCORE NORMALIZATION ⭐核心 =====
-def normalize_score(raw_score):
-    SCORE_HISTORY.append(raw_score)
+# ===== STRATEGY =====
+def detect_strategy(f):
+    if f["breakout"] > 0.03:
+        return "momentum"
+    if f["smart_money"] > 0.2:
+        return "smart_money"
+    if f["liquidity"] > 0.02:
+        return "liquidity"
+    return "fusion"
+
+
+# ===== SCORE NORMALIZE =====
+def normalize_score(raw):
+    SCORE_HISTORY.append(raw)
     if len(SCORE_HISTORY) > 100:
         SCORE_HISTORY.pop(0)
 
-    avg = mean(SCORE_HISTORY)
+    avg = mean(SCORE_HISTORY) if SCORE_HISTORY else 0
     if avg == 0:
-        return raw_score * 6
+        return raw * 6
 
-    # ⭐ 自動 scaling
-    scale = 0.2 / avg
-    return raw_score * scale
+    return raw * (0.2 / avg)
 
 
-# ===== DYNAMIC THRESHOLD =====
 def dynamic_score_min():
     if len(SCORE_HISTORY) < 10:
         return 0.18
-
-    avg = mean(SCORE_HISTORY)
-    return max(0.12, avg * 0.8)
+    return max(0.12, mean(SCORE_HISTORY) * 0.8)
 
 
 # ===== SIZE =====
-def get_size(score):
+def get_size(score, forced):
     base = engine.capital * 0.08
+
     if score > 0.6:
         base *= 1.5
+
+    if forced:
+        base *= 0.4  # ⭐ forced 降風險
+
     return min(base, engine.capital * MAX_POSITION_SIZE)
+
+
+def exposure():
+    return sum(p["size"] for p in engine.positions)
 
 
 # ===== SELL =====
@@ -163,11 +175,14 @@ async def try_sell(p):
         engine.positions.remove(p)
         engine.capital += p["size"] * (1 + pnl)
 
-        engine.trade_history.append({
+        trade = {
             "mint": p["mint"],
             "pnl": pnl,
             "meta": p["meta"]
-        })
+        }
+
+        engine.trade_history.append(trade)
+        portfolio.record_trade(trade)
 
         if p["meta"].get("forced"):
             FORCED_HISTORY.append(pnl)
@@ -182,18 +197,35 @@ async def try_sell(p):
 
 # ===== TRADE =====
 async def try_trade(mint):
-    global LAST_EXEC
-
     now = time.time()
 
+    # ===== HARD RISK LIMIT =====
+    if len(engine.positions) >= MAX_POSITIONS:
+        return False
+
+    if exposure() >= engine.capital * MAX_EXPOSURE:
+        return False
+
+    if any(p["mint"] == mint for p in engine.positions):
+        return False
+
     if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
-        return
+        return False
 
     f = await build_features(mint)
     if not f:
-        return
+        return False
 
-    ok, th = adaptive_filter(
+    strategy = detect_strategy(f)
+
+    # ===== portfolio control =====
+    if portfolio.get_weight(strategy) == 0:
+        return False
+
+    if portfolio.source_exposure_ratio(engine, strategy) > 0.4:
+        return False
+
+    ok, _ = adaptive_filter(
         f,
         compute_metrics(engine),
         engine.no_trade_cycles
@@ -210,30 +242,36 @@ async def try_trade(mint):
     )
 
     score = normalize_score(raw_score)
+    score *= portfolio.get_weight(strategy)
 
     score_min = dynamic_score_min()
 
-    # ⭐ forced trade 自動學習
-    force_allowed = True
-    if len(FORCED_HISTORY) > 10:
-        avg = mean(FORCED_HISTORY[-10:])
-        if avg < -0.01:
-            force_allowed = False
+    # ===== forced 控制 =====
+    forced = False
 
-    if not ok and force_allowed:
-        if f["wallet_count"] >= 1 and f["liquidity"] > 0.003:
-            forced = True
+    if not ok:
+        forced_count = sum(1 for p in engine.positions if p["meta"].get("forced"))
+
+        force_allowed = True
+        if len(FORCED_HISTORY) > 10:
+            if mean(FORCED_HISTORY[-10:]) < -0.01:
+                force_allowed = False
+
+        if force_allowed and forced_count < FORCE_LIMIT:
+            if f["wallet_count"] >= 1 and f["liquidity"] > 0.003:
+                forced = True
+            else:
+                return False
         else:
-            return
-    else:
-        forced = False
+            return False
 
     if score < score_min and not forced:
-        return
+        return False
 
-    size = get_size(score)
+    size = get_size(score, forced)
+
     if engine.capital < size:
-        return
+        return False
 
     engine.capital -= size
 
@@ -245,20 +283,25 @@ async def try_trade(mint):
         "time": now,
         "meta": {
             **f,
+            "strategy": strategy,
             "forced": forced
         }
     })
 
     LAST_TRADE[mint] = now
-    LAST_EXEC = now
 
-    log(f"BUY {mint[:6]} score={score:.3f} forced={forced}")
+    engine.stats["signals"] += 1
+    engine.stats["executed"] += 1
+
+    log(f"BUY {mint[:6]} strat={strategy} score={score:.3f} forced={forced}")
+
+    return True
 
 
-# ===== MAIN =====
+# ===== MAIN LOOP =====
 async def main_loop():
     ensure_engine()
-    log("🔥 V25.2 FINAL START")
+    log("🔥 V26 FINAL ENGINE START")
 
     while engine.running:
         traded = False
@@ -272,6 +315,8 @@ async def main_loop():
 
             for p in list(engine.positions):
                 await try_sell(p)
+
+            portfolio.update_weights()
 
             if traded:
                 engine.no_trade_cycles = 0
