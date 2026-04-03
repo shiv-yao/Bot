@@ -1,25 +1,21 @@
 # ================= V28 PRO + V29 MONEY MODE =================
 import asyncio
 import time
-import socket
-import random
 from collections import defaultdict
 
 from app.state import engine
 from app.alpha.combiner import combine_scores
 from app.alpha.adaptive_filter import adaptive_filter
 
-# ===== MULTI SOURCE =====
 try:
     from app.sources.fusion import fetch_candidates
-except:
+except Exception:
     async def fetch_candidates():
         return []
 
-# ===== SAFE IMPORT =====
 try:
     from app.data.market import get_quote, looks_like_solana_mint
-except:
+except Exception:
     async def get_quote(a, b, c):
         return None
     def looks_like_solana_mint(x):
@@ -27,11 +23,10 @@ except:
 
 try:
     from app.alpha.helius_wallet_tracker import update_token_wallets
-except:
+except Exception:
     async def update_token_wallets(m):
         return []
 
-# ===== CONFIG =====
 MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.45
 MAX_POSITION_SIZE = 0.18
@@ -49,7 +44,7 @@ AMOUNT = 1_000_000
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 
-# ===== INIT =====
+
 def ensure_engine():
     engine.positions = getattr(engine, "positions", [])
     engine.trade_history = getattr(engine, "trade_history", [])
@@ -71,19 +66,20 @@ def ensure_engine():
     engine.running = getattr(engine, "running", True)
     engine.no_trade_cycles = getattr(engine, "no_trade_cycles", 0)
 
-# ===== LOG =====
+
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
     engine.logs = engine.logs[-200:]
 
+
 def sf(x):
     try:
         return float(x)
-    except:
+    except Exception:
         return 0.0
 
-# ===== RISK =====
+
 def risk():
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
@@ -93,36 +89,21 @@ def risk():
             return False
     return True
 
+
 def exposure():
     return sum(sf(p.get("size", 0)) for p in engine.positions)
 
-# =========================
-# 🔥 V28 INFRA FIX（核心）
-# =========================
+
 async def safe_quote(input_mint, output_mint, amount):
     try:
         q = await get_quote(input_mint, output_mint, amount)
         if q:
             return q
     except Exception as e:
-        log(f"QUOTE ERR {str(e)[:40]}")
-
-    # 🚨 DNS fallback
-    try:
-        host = "lite-api.jup.ag"
-        ip = socket.gethostbyname(host)
-
-        log(f"DNS FIX {host}->{ip}")
-
-        return await get_quote(input_mint, output_mint, amount)
-
-    except Exception as e:
-        log(f"DNS FAIL {str(e)[:40]}")
-
-    await asyncio.sleep(0.2)
+        log(f"QUOTE ERR {str(e)[:60]}")
     return None
 
-# ===== PRICE =====
+
 async def get_price(m):
     if not looks_like_solana_mint(m):
         return None
@@ -137,7 +118,7 @@ async def get_price(m):
 
     return out / 1e6, q
 
-# ===== FEATURES =====
+
 async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
@@ -147,7 +128,7 @@ async def features(t):
 
     try:
         wallets = await update_token_wallets(mint)
-    except:
+    except Exception:
         wallets = []
 
     data = await get_price(mint)
@@ -165,7 +146,6 @@ async def features(t):
 
     liq = sf(q.get("outAmount", 0)) / 1e5
 
-    # 🚀 source weighting
     source_bonus = {
         "pump": 1.2,
         "dex": 1.0,
@@ -174,7 +154,6 @@ async def features(t):
 
     breakout *= source_bonus
 
-    # 🔥 嚴格過濾（賺錢關鍵）
     if breakout < 0.01:
         return None
     if liq < 0.002:
@@ -186,21 +165,21 @@ async def features(t):
         "mint": mint,
         "source": source,
         "breakout": breakout,
-        "smart_money": min(len(wallets)/8, 1),
+        "smart_money": min(len(wallets) / 8, 1),
         "liquidity": liq,
         "insider": 0.05,
         "wallet_count": len(wallets),
         "price": price,
     }
 
-# ===== SIZE =====
+
 def size(score):
     base = engine.capital * 0.08
     if score > 0.4:
         base *= 1.3
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
-# ===== EXIT =====
+
 async def check_sell(p):
     data = await get_price(p["mint"])
     if not data:
@@ -236,7 +215,7 @@ async def check_sell(p):
         "pnl": pnl,
         "reason": reason,
         "timestamp": time.time(),
-        "meta": {"source": p.get("source")}
+        "meta": {"source": p.get("source")},
     })
 
     if pnl > 0:
@@ -249,9 +228,13 @@ async def check_sell(p):
 
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
-# ===== TRADE =====
+
 async def trade(t):
     mint = t["mint"]
+
+    if not looks_like_solana_mint(mint):
+        log(f"BAD_MINT {mint}")
+        return False
 
     if any(p["mint"] == mint for p in engine.positions):
         return False
@@ -271,7 +254,7 @@ async def trade(t):
     if not f:
         return False
 
-    ok, th = adaptive_filter(f, None, engine.no_trade_cycles)
+    ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
     if not ok:
         return False
 
@@ -285,9 +268,7 @@ async def trade(t):
         {},
     )
 
-    # 🔥 source threshold
     min_score = 0.22 if f["source"] == "pump" else 0.27
-
     if score < min_score:
         return False
 
@@ -303,7 +284,7 @@ async def trade(t):
         "size": s,
         "time": now,
         "peak": 0.0,
-        "source": f["source"]
+        "source": f["source"],
     })
 
     LAST_TRADE[mint] = now
@@ -312,10 +293,9 @@ async def trade(t):
     engine.stats["executed"] += 1
 
     log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
-
     return True
 
-# ===== MAIN =====
+
 async def main_loop():
     ensure_engine()
     log("🔥 V28 PRO + V29 MONEY MODE START")
