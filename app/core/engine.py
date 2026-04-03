@@ -1,4 +1,4 @@
-# ================= V34.1 FULL FUSION FUND MODE =================
+# ================= V35 FULL FUSION ADAPTIVE MODE =================
 
 import asyncio
 import time
@@ -32,8 +32,8 @@ except Exception:
 
 # ================= CONFIG =================
 MAX_POSITIONS = 3
-MAX_EXPOSURE = 0.40
-MAX_POSITION_SIZE = 0.15
+MAX_EXPOSURE = 0.45
+MAX_POSITION_SIZE = 0.18
 
 TAKE_PROFIT = 0.08
 STOP_LOSS = -0.03
@@ -47,7 +47,8 @@ GLOBAL_COOLDOWN = 3
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
 
-MIN_SCORE = 0.55
+MIN_SCORE_SMART = 0.50
+MIN_SCORE_MOMENTUM = 0.58
 MIN_BREAKOUT = 0.01
 MIN_LIQUIDITY = 0.01
 
@@ -125,8 +126,8 @@ def risk():
             return False
 
         if dd < -0.15:
-            log("⚠️ RISK MODE")
             engine.regime = "risk_off"
+            log("⚠️ RISK MODE")
         else:
             engine.regime = "normal"
 
@@ -134,8 +135,6 @@ def risk():
 
 
 def market_ok():
-    # 保留之前 no_trade_cycles 狀態，同時避免過度頻繁出手
-    # 這裡不做過度封鎖，只在冷機啟動時稍微保守
     if engine.stats.get("executed", 0) == 0 and engine.no_trade_cycles < 2:
         return False
     return True
@@ -175,24 +174,15 @@ def source_total(src):
     return s["wins"] + s["losses"]
 
 
-def source_winrate(src):
-    total = source_total(src)
-    if total <= 0:
-        return 0.0
-    return SOURCE_STATS[src]["wins"] / total
-
-
 def source_ok(src):
     s = SOURCE_STATS[src]
     total = s["wins"] + s["losses"]
 
-    # 冷啟動先允許
     if total < 5:
         return True
 
     winrate = s["wins"] / total
 
-    # V34：虧損來源自動停用
     if winrate < 0.4 and s["pnl"] < -0.05:
         s["disabled"] = True
 
@@ -245,19 +235,16 @@ async def features(t):
     price, q = data
     prev = LAST_PRICE.get(m)
 
-    # ===== 防垃圾價格 =====
     if price < 1e-8:
         log(f"FEATURE_BAD_PRICE {m[:6]} price={price}")
         return None
 
-    # ===== breakout / momentum =====
     if prev and prev > 0:
         raw = (price - prev) / prev
         breakout = min(max(raw * 4.0, 0.0), 1.0)
     else:
         breakout = 0.01
 
-    # ===== 防假跳動 / 極端 impact =====
     if prev and prev > 0:
         impact = abs(price - prev) / prev
         if impact > 0.5:
@@ -267,22 +254,34 @@ async def features(t):
 
     LAST_PRICE[m] = price
 
-    # ===== liquidity 正規化 =====
     liq_raw = sf(q.get("outAmount", 0))
     liquidity = min(liq_raw / 1e6, 1.0)
 
-    # Dex fallback 額外防呆
     if q.get("source") == "dexscreener":
         if sf(q.get("liquidityUsd", 0)) < 20000:
             log(f"FEATURE_DEX_LIQUSD_FAIL {m[:6]} liqUsd={q.get('liquidityUsd', 0)}")
             return None
 
-    smart = min(len(wallets) / 5, 1.0)
+    wallet_count = len(wallets)
+    smart_money = min(wallet_count / 5, 1.0)
 
-    # V34：對弱 source 再嚴一點
-    if src == "dex" and smart < 0.3:
-        log(f"FEATURE_SOURCE_SMART_FAIL {m[:6]} smart={smart:.3f}")
-        return None
+    # ===== V35 自適應模式 =====
+    # 有 wallet 資料 -> smart
+    # 沒 wallet 資料 / 很少 -> momentum
+    if wallet_count >= 2:
+        strategy_mode = "smart"
+    else:
+        strategy_mode = "momentum"
+
+    # fallback source 不再硬卡 smart
+    if strategy_mode == "smart":
+        if smart_money < 0.3:
+            log(f"FEATURE_SMART_FAIL {m[:6]} smart={smart_money:.3f}")
+            return None
+    else:
+        # momentum 模式時，用 breakout 補 smart 權重，不硬擋
+        smart_money = max(smart_money, min(breakout * 1.5, 0.5))
+        log(f"LOW_SMART_USE_MOMENTUM {m[:6]} smart={smart_money:.3f}")
 
     if breakout < MIN_BREAKOUT:
         log(f"FEATURE_BREAKOUT_FAIL {m[:6]} breakout={breakout:.4f}")
@@ -296,26 +295,37 @@ async def features(t):
         "mint": m,
         "source": src,
         "breakout": breakout,
-        "smart_money": smart,
+        "smart_money": smart_money,
         "liquidity": liquidity,
         "price": price,
+        "wallet_count": wallet_count,
+        "strategy_mode": strategy_mode,
     }
 
 
 # ================= SCORE =================
 def score_alpha(f):
-    base = (
-        f["breakout"] * 0.5 +
-        f["smart_money"] * 0.3 +
-        f["liquidity"] * 0.2
-    )
+    mode = f.get("strategy_mode", "momentum")
+
+    if mode == "smart":
+        base = (
+            f["breakout"] * 0.35 +
+            f["smart_money"] * 0.45 +
+            f["liquidity"] * 0.20
+        )
+    else:
+        base = (
+            f["breakout"] * 0.60 +
+            f["smart_money"] * 0.15 +
+            f["liquidity"] * 0.25
+        )
+
     score = base * source_weight(f["source"])
     return min(score, 1.0)
 
 
 # ================= SIZE / ALLOCATOR =================
-def size(score, src):
-    # V29.6 風控 + V34 allocator
+def size(score, src, mode):
     base = engine.capital * 0.06
 
     if score > 0.7:
@@ -325,11 +335,14 @@ def size(score, src):
     elif score > 0.55:
         base *= 1.2
 
-    # source 績效好的多配一點
-    sw = source_weight(src)
-    base *= sw
+    base *= source_weight(src)
 
-    # risk off 模式縮倉
+    # momentum 模式縮一點，smart 模式可以大一些
+    if mode == "momentum":
+        base *= 0.9
+    else:
+        base *= 1.05
+
     if getattr(engine, "regime", "normal") == "risk_off":
         base *= 0.5
 
@@ -392,7 +405,10 @@ async def check_sell(p):
             "pnl": pnl,
             "reason": reason,
             "timestamp": time.time(),
-            "meta": {"source": src},
+            "meta": {
+                "source": src,
+                "strategy_mode": p.get("strategy_mode", "unknown"),
+            },
         }
     )
     engine.trade_history = engine.trade_history[-500:]
@@ -401,7 +417,10 @@ async def check_sell(p):
         engine.peak_capital = engine.capital
 
     engine.last_trade = f"{p['mint'][:6]} {reason} pnl={pnl:.4f}"
-    log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
+    log(
+        f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f} "
+        f"mode={p.get('strategy_mode','unknown')}"
+    )
 
 
 # ================= TRADE =================
@@ -445,7 +464,6 @@ async def trade(t):
         log(f"FILTER_ERR {str(e)[:80]}")
         ok = True
 
-    # 保留舊功能：冷啟動時不被 filter 卡死
     if not ok and engine.no_trade_cycles < 10:
         ok = True
         log(f"FILTER_BYPASS {m[:6]}")
@@ -456,11 +474,14 @@ async def trade(t):
 
     score = score_alpha(f)
 
-    if score < MIN_SCORE:
-        log(f"SKIP_SCORE {m[:6]} score={score:.3f}")
+    mode = f.get("strategy_mode", "momentum")
+    min_score = MIN_SCORE_SMART if mode == "smart" else MIN_SCORE_MOMENTUM
+
+    if score < min_score:
+        log(f"SKIP_SCORE {m[:6]} score={score:.3f} need={min_score:.3f} mode={mode}")
         return False
 
-    s = size(score, src)
+    s = size(score, src, mode)
     if engine.capital < s:
         log("SKIP_CAPITAL")
         return False
@@ -475,6 +496,7 @@ async def trade(t):
             "time": now,
             "peak": 0.0,
             "source": src,
+            "strategy_mode": mode,
         }
     )
 
@@ -483,16 +505,16 @@ async def trade(t):
 
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
-    engine.last_signal = f"{m[:6]} score={score:.3f} src={src}"
+    engine.last_signal = f"{m[:6]} score={score:.3f} src={src} mode={mode}"
 
-    log(f"BUY {m[:6]} score={score:.3f} src={src}")
+    log(f"BUY {m[:6]} score={score:.3f} src={src} mode={mode}")
     return True
 
 
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🔥 V34.1 FULL FUSION FUND MODE START")
+    log("🔥 V35 FULL FUSION ADAPTIVE MODE START")
 
     while engine.running:
         try:
