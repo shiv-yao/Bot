@@ -1,13 +1,14 @@
 import os
 import re
 import asyncio
-import time
+import socket
+import random
 import httpx
-
-from app.utils.net import resolve_host
+import time
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# 🔥 多 endpoint（防炸）
 JUP_ENDPOINTS = [
     "https://lite-api.jup.ag/swap/v1/quote",
     "https://quote-api.jup.ag/v6/quote",
@@ -15,8 +16,9 @@ JUP_ENDPOINTS = [
 
 _BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
 
+# ===== QUOTE CACHE（關鍵）=====
 QUOTE_CACHE = {}
-QUOTE_CACHE_TTL = 3
+CACHE_TTL = 3
 
 
 def _headers():
@@ -43,21 +45,31 @@ def looks_like_solana_mint(addr: str) -> bool:
 def _normalize_amount(amount):
     try:
         v = int(amount)
-        return str(v) if v > 0 else None
-    except Exception:
+        if v <= 0:
+            return None
+        return str(v)
+    except:
         return None
 
 
-async def _http_get(url: str, params: dict):
+# ===== DNS FIX =====
+def resolve_host(host):
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        return socket.gethostbyname(host)
+    except:
+        return None
+
+
+async def _http_get(url, params):
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
             return await client.get(url, params=params, headers=_headers())
     except Exception as e:
         print("MARKET HTTP ERR:", repr(e))
         return None
 
 
-async def _http_get_dns(url: str, params: dict):
+async def _http_get_dns(url, params):
     try:
         host = url.split("/")[2]
         ip = resolve_host(host)
@@ -65,82 +77,81 @@ async def _http_get_dns(url: str, params: dict):
             return None
 
         new_url = url.replace(host, ip, 1)
+
         headers = _headers()
         headers["Host"] = host
 
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(timeout=6, verify=False) as client:
+            print(f"DNS FIX {host}->{ip}")
             return await client.get(new_url, params=params, headers=headers)
+
     except Exception as e:
-        print("MARKET DNS FAIL:", repr(e))
+        print("DNS FAIL:", repr(e))
         return None
 
 
+# ===== 主邏輯 =====
 async def get_quote(input_mint, output_mint, amount):
+
     if not looks_like_solana_mint(input_mint):
-        print("MARKET INVALID INPUT_MINT:", input_mint)
         return None
 
     if not looks_like_solana_mint(output_mint):
-        print("MARKET INVALID OUTPUT_MINT:", output_mint)
         return None
 
     amt = _normalize_amount(amount)
     if not amt:
-        print("MARKET INVALID AMOUNT:", amount)
         return None
 
-    key = f"{input_mint}:{output_mint}:{amt}"
+    # 🔥 cache key
+    key = f"{input_mint}-{output_mint}-{amt}"
     now = time.time()
 
-    cached = QUOTE_CACHE.get(key)
-    if cached and now - cached["ts"] < QUOTE_CACHE_TTL:
-        return cached["data"]
+    if key in QUOTE_CACHE:
+        data, ts = QUOTE_CACHE[key]
+        if now - ts < CACHE_TTL:
+            return data
 
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": amt,
         "slippageBps": "80",
-        "swapMode": "ExactIn",
     }
 
-    for url in JUP_ENDPOINTS:
+    for url in random.sample(JUP_ENDPOINTS, len(JUP_ENDPOINTS)):
+
+        # ===== normal =====
         r = await _http_get(url, params)
+
+        # ===== DNS fallback =====
         if r is None:
             r = await _http_get_dns(url, params)
 
         if r is None:
-            await asyncio.sleep(0.3)
+            continue
+
+        # ===== rate limit =====
+        if r.status_code == 429:
+            print("⚠️ RATE LIMITED")
+            await asyncio.sleep(0.5)
             continue
 
         if r.status_code != 200:
-            print("MARKET QUOTE ERROR STATUS:", r.status_code)
-            print("MARKET QUOTE ERROR URL:", url)
-            print("MARKET QUOTE ERROR BODY:", r.text[:300])
-            await asyncio.sleep(0.3)
+            print("QUOTE ERR:", r.status_code)
             continue
 
         try:
             data = r.json()
-        except Exception as e:
-            print("MARKET JSON ERR:", repr(e))
-            await asyncio.sleep(0.3)
-            continue
-
-        if not isinstance(data, dict):
-            print("MARKET INVALID JSON:", data)
-            await asyncio.sleep(0.3)
+        except:
             continue
 
         if not data.get("outAmount"):
-            print("MARKET NO ROUTE:", data)
-            await asyncio.sleep(0.3)
             continue
 
-        QUOTE_CACHE[key] = {
-            "ts": now,
-            "data": data,
-        }
+        # 🔥 cache write
+        QUOTE_CACHE[key] = (data, now)
+
         return data
 
     return None
