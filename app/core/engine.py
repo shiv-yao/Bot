@@ -1,4 +1,4 @@
-# ================= V28 PRO + V29 MONEY MODE =================
+# V28 PRO + V29 MONEY MODE
 
 import asyncio
 import time
@@ -83,7 +83,7 @@ def risk():
 if engine.peak_capital > 0:
 dd = (engine.capital - engine.peak_capital) / engine.peak_capital
 if dd < -0.30:
-log(“🛑 HARD STOP”)
+log(“HARD STOP”)
 engine.running = False
 return False
 return True
@@ -97,7 +97,7 @@ q = await get_quote(input_mint, output_mint, amount)
 if q:
 return q
 except Exception as e:
-log(f”QUOTE ERR {str(e)[:60]}”)
+log(“QUOTE ERR “ + str(e)[:60])
 return None
 
 async def get_price(m):
@@ -145,22 +145,19 @@ LAST_PRICE[mint] = price
 liq = sf(q.get("outAmount", 0)) / 1e5
 
 source_bonus = {
-    "pump":      1.2,
-    "dex":       1.0,
+    "pump": 1.2,
+    "dex": 1.0,
     "dex_boost": 1.1,
-    "helius":    1.05,
-    "jup":       0.85,
+    "helius": 1.05,
+    "jup": 0.85,
 }.get(source, 1.0)
 
 breakout *= source_bonus
-
-
 
 if prev is not None and breakout < 0.01:
     return None
 if liq < 0.002:
     return None
-
 if len(wallets) < 1:
     return None
 
@@ -229,7 +226,7 @@ else:
 if engine.capital > engine.peak_capital:
     engine.peak_capital = engine.capital
 
-log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
+log("SELL " + p["mint"][:6] + " " + reason + " pnl=" + str(round(pnl, 4)))
 ```
 
 async def trade(t):
@@ -237,7 +234,7 @@ mint = t[“mint”]
 
 ```
 if not looks_like_solana_mint(mint):
-    log(f"BAD_MINT {mint}")
+    log("BAD_MINT " + mint)
     return False
 
 if any(p["mint"] == mint for p in engine.positions):
@@ -296,13 +293,13 @@ LAST_TRADE[mint] = now
 engine.stats["signals"] += 1
 engine.stats["executed"] += 1
 
-log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
+log("BUY " + mint[:6] + " src=" + f["source"] + " score=" + str(round(score, 3)))
 return True
 ```
 
 async def main_loop():
 ensure_engine()
-log(“🔥 V28 PRO + V29 MONEY MODE START”)
+log(“V28 PRO + V29 MONEY MODE START”)
 
 ```
 while engine.running:
@@ -328,7 +325,7 @@ while engine.running:
 
     except Exception as e:
         engine.stats["errors"] += 1
-        log(f"ERR {e}")
+        log("ERR " + str(e))
 
     await asyncio.sleep(2)
 ```
