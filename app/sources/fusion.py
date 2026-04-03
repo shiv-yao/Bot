@@ -32,6 +32,7 @@ async def _get_dns_fallback(url: str):
         host = url.split("/")[2]
         ip = socket.gethostbyname(host)
         new_url = url.replace(host, ip, 1)
+
         headers = dict(HEADERS)
         headers["Host"] = host
 
@@ -152,7 +153,6 @@ async def fetch_candidates():
         seen.add(mint)
         out.append(item)
 
-    # fallback to cache if all providers failed
     if out:
         CACHE = out[:60]
 
