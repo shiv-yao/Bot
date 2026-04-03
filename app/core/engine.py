@@ -18,6 +18,7 @@ try:
 except Exception:
     async def get_quote(a, b, c):
         return None
+
     def looks_like_solana_mint(x):
         return True
 
@@ -26,6 +27,7 @@ try:
 except Exception:
     async def update_token_wallets(m):
         return []
+
 
 MAX_POSITIONS = 3
 MAX_EXPOSURE = 0.45
@@ -65,6 +67,8 @@ def ensure_engine():
 
     engine.running = getattr(engine, "running", True)
     engine.no_trade_cycles = getattr(engine, "no_trade_cycles", 0)
+    engine.last_signal = getattr(engine, "last_signal", "")
+    engine.last_trade = getattr(engine, "last_trade", "")
 
 
 def log(msg):
@@ -149,7 +153,7 @@ async def features(t):
     source_bonus = {
         "pump": 1.2,
         "dex": 1.0,
-        "jup": 0.85
+        "jup": 0.85,
     }.get(source, 1.0)
 
     breakout *= source_bonus
@@ -210,13 +214,14 @@ async def check_sell(p):
     engine.positions.remove(p)
     engine.capital += p["size"] * (1 + pnl)
 
-    engine.trade_history.append({
+    trade_row = {
         "mint": p["mint"],
         "pnl": pnl,
         "reason": reason,
         "timestamp": time.time(),
         "meta": {"source": p.get("source")},
-    })
+    }
+    engine.trade_history.append(trade_row)
 
     if pnl > 0:
         engine.stats["wins"] += 1
@@ -226,6 +231,7 @@ async def check_sell(p):
     if engine.capital > engine.peak_capital:
         engine.peak_capital = engine.capital
 
+    engine.last_trade = f"{p['mint'][:6]} {reason} pnl={pnl:.4f}"
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
 
@@ -291,6 +297,7 @@ async def trade(t):
 
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
+    engine.last_signal = f"{mint[:6]} src={f['source']} score={score:.3f}"
 
     log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
     return True
@@ -308,6 +315,12 @@ async def main_loop():
                 break
 
             tokens = await fetch_candidates()
+
+            if not tokens:
+                engine.no_trade_cycles += 1
+                log("NO_CANDIDATES_USE_CACHE_OR_WAIT")
+                await asyncio.sleep(5)
+                continue
 
             for t in tokens:
                 if await trade(t):
