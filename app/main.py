@@ -33,6 +33,15 @@ def safe_float(x, default=0.0):
         return default
 
 
+def safe_int(x, default=0):
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
 # =========================
 # ROOT
 # =========================
@@ -44,7 +53,13 @@ def root():
             "status": "RUNNING",
             "running": getattr(engine, "running", False),
             "capital": safe_float(getattr(engine, "capital", 0.0)),
+            "start_capital": safe_float(getattr(engine, "start_capital", 0.0)),
+            "peak_capital": safe_float(getattr(engine, "peak_capital", 0.0)),
             "positions": len(getattr(engine, "positions", []) or []),
+            "trade_history": len(getattr(engine, "trade_history", []) or []),
+            "no_trade_cycles": safe_int(getattr(engine, "no_trade_cycles", 0)),
+            "last_signal": getattr(engine, "last_signal", ""),
+            "last_trade": getattr(engine, "last_trade", ""),
         }
     except Exception as e:
         return {
@@ -94,7 +109,16 @@ def _source_stats(trade_history: list[dict]) -> dict:
 
 
 def _score_component_stats(trade_history: list[dict]) -> dict:
-    keys = ["breakout", "smart_money", "liquidity", "momentum", "insider"]
+    keys = [
+        "breakout",
+        "smart_money",
+        "liquidity",
+        "momentum",
+        "insider",
+        "wallet_count",
+        "price_impact",
+        "price",
+    ]
 
     rows = {k: {"count": 0, "avg_score": 0.0} for k in keys}
     sums = {k: 0.0 for k in keys}
@@ -187,6 +211,86 @@ def _insider_vs_non_insider_performance(
     return buckets
 
 
+def _forced_vs_normal_performance(trade_history: list[dict]) -> dict:
+    buckets = {
+        "forced": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+        "normal": {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+        },
+    }
+
+    for t in trade_history:
+        if not isinstance(t, dict):
+            continue
+
+        meta = t.get("meta", {}) or {}
+        pnl = safe_float(t.get("pnl", 0.0))
+        bucket_name = "forced" if bool(meta.get("forced", False)) else "normal"
+        bucket = buckets[bucket_name]
+
+        bucket["count"] += 1
+        bucket["total_pnl"] += pnl
+        if pnl >= 0:
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+
+    for bucket in buckets.values():
+        count = max(bucket["count"], 1)
+        bucket["avg_pnl"] = bucket["total_pnl"] / count
+        bucket["win_rate"] = bucket["wins"] / count
+
+    return buckets
+
+
+def _filter_state_stats(trade_history: list[dict]) -> dict:
+    out = {}
+
+    for t in trade_history:
+        if not isinstance(t, dict):
+            continue
+
+        meta = t.get("meta", {}) or {}
+        state = meta.get("filter_state", "unknown")
+        pnl = safe_float(t.get("pnl", 0.0))
+
+        if state not in out:
+            out[state] = {
+                "count": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "win_rate": 0.0,
+            }
+
+        out[state]["count"] += 1
+        out[state]["total_pnl"] += pnl
+        if pnl >= 0:
+            out[state]["wins"] += 1
+        else:
+            out[state]["losses"] += 1
+
+    for _, row in out.items():
+        c = max(row["count"], 1)
+        row["avg_pnl"] = row["total_pnl"] / c
+        row["win_rate"] = row["wins"] / c
+
+    return out
+
+
 def _wallet_metrics():
     try:
         from app.alpha.helius_wallet_tracker import token_wallets
@@ -256,8 +360,8 @@ def debug():
         from app.state import engine
 
         now = time.time()
-
         positions_view = []
+
         for p in getattr(engine, "positions", []) or []:
             if not isinstance(p, dict):
                 continue
@@ -269,11 +373,17 @@ def debug():
                 "size": p.get("size"),
                 "score": p.get("score"),
                 "source": meta.get("source"),
+                "filter_state": meta.get("filter_state"),
+                "forced": meta.get("forced", False),
                 "breakout": meta.get("breakout"),
                 "smart_money": meta.get("smart_money"),
                 "liquidity": meta.get("liquidity"),
                 "momentum": meta.get("momentum"),
                 "insider": meta.get("insider"),
+                "wallet_count": meta.get("wallet_count"),
+                "price_impact": meta.get("price_impact"),
+                "price": meta.get("price"),
+                "peak_pnl": p.get("peak_pnl"),
                 "held_sec": round(now - safe_float(p.get("time", now), now), 2),
                 "added": p.get("added", False),
                 "tp_done": p.get("tp_done", False),
@@ -295,9 +405,13 @@ def debug():
             },
             "last_signal": getattr(engine, "last_signal", ""),
             "last_trade": getattr(engine, "last_trade", ""),
+            "no_trade_cycles": safe_int(getattr(engine, "no_trade_cycles", 0)),
             "smart_wallet": _wallet_metrics(),
             "insider": _insider_metrics(),
             "insider_vs_non_insider": _insider_vs_non_insider_performance(
+                getattr(engine, "trade_history", []) or []
+            ),
+            "forced_vs_normal": _forced_vs_normal_performance(
                 getattr(engine, "trade_history", []) or []
             ),
             "logs": (getattr(engine, "logs", []) or [])[-120:],
@@ -329,16 +443,25 @@ def metrics():
         best_source, worst_source = _best_worst_source(source_stats)
         score_component_stats = _score_component_stats(safe_history)
         insider_perf = _insider_vs_non_insider_performance(safe_history)
+        forced_perf = _forced_vs_normal_performance(safe_history)
+        filter_state_stats = _filter_state_stats(safe_history)
 
         base_metrics = compute_metrics(engine) or {}
 
         positions = getattr(engine, "positions", []) or []
         positions_by_source = {}
+        positions_by_filter_state = {}
+
         for p in positions:
             if not isinstance(p, dict):
                 continue
-            src = (p.get("meta", {}) or {}).get("source", "unknown")
+
+            meta = (p.get("meta", {}) or {})
+            src = meta.get("source", "unknown")
+            fstate = meta.get("filter_state", "unknown")
+
             positions_by_source[src] = positions_by_source.get(src, 0) + 1
+            positions_by_filter_state[fstate] = positions_by_filter_state.get(fstate, 0) + 1
 
         partial_trades = [t for t in safe_history if t.get("reason") == "PARTIAL"]
         full_exit_trades = [t for t in safe_history if t.get("reason") != "PARTIAL"]
@@ -352,6 +475,7 @@ def metrics():
 
         portfolio_block = {
             "positions_by_source": positions_by_source,
+            "positions_by_filter_state": positions_by_filter_state,
             "total_exposure_ratio": None,
             "source_exposure_ratio": {},
         }
@@ -377,6 +501,7 @@ def metrics():
                 "closed_trades": len(full_exit_trades),
                 "partial_trades": len(partial_trades),
                 "total_trade_events": len(safe_history),
+                "no_trade_cycles": safe_int(getattr(engine, "no_trade_cycles", 0)),
             },
             "positions": base_metrics.get("positions", []),
             "equity_curve": base_metrics.get("equity_curve", []),
@@ -387,6 +512,8 @@ def metrics():
             "worst_source": worst_source,
             "score_component_stats": score_component_stats,
             "insider_vs_non_insider_performance": insider_perf,
+            "forced_vs_normal_performance": forced_perf,
+            "filter_state_stats": filter_state_stats,
             "dynamic_weights": dynamic_weights,
             "portfolio": portfolio_block,
             "smart_wallet": _wallet_metrics(),
@@ -420,6 +547,7 @@ def health():
             "regime": getattr(engine, "regime", "unknown"),
             "win_streak": getattr(engine, "win_streak", 0),
             "loss_streak": getattr(engine, "loss_streak", 0),
+            "no_trade_cycles": safe_int(getattr(engine, "no_trade_cycles", 0)),
         }
 
         try:
@@ -449,12 +577,9 @@ def kill():
     try:
         from app.state import engine
         engine.running = False
-        if hasattr(engine, "log"):
-            engine.log("🔴 MANUAL KILL")
-        else:
-            logs = getattr(engine, "logs", None)
-            if isinstance(logs, list):
-                logs.append("🔴 MANUAL KILL")
+        logs = getattr(engine, "logs", None)
+        if isinstance(logs, list):
+            logs.append("🔴 MANUAL KILL")
         return {"ok": True, "running": False}
     except Exception as e:
         return JSONResponse(
@@ -468,12 +593,9 @@ def resume():
     try:
         from app.state import engine
         engine.running = True
-        if hasattr(engine, "log"):
-            engine.log("🟢 MANUAL RESUME")
-        else:
-            logs = getattr(engine, "logs", None)
-            if isinstance(logs, list):
-                logs.append("🟢 MANUAL RESUME")
+        logs = getattr(engine, "logs", None)
+        if isinstance(logs, list):
+            logs.append("🟢 MANUAL RESUME")
         return {"ok": True, "running": True}
     except Exception as e:
         return JSONResponse(
