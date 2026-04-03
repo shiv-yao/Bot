@@ -52,14 +52,18 @@ def ensure_engine():
     engine.trade_history = getattr(engine, "trade_history", [])
     engine.logs = getattr(engine, "logs", [])
 
-    engine.stats = getattr(engine, "stats", {
-        "signals": 0,
-        "executed": 0,
-        "wins": 0,
-        "losses": 0,
-        "errors": 0,
-        "rejected": 0,
-    })
+    engine.stats = getattr(
+        engine,
+        "stats",
+        {
+            "signals": 0,
+            "executed": 0,
+            "wins": 0,
+            "losses": 0,
+            "errors": 0,
+            "rejected": 0,
+        },
+    )
 
     engine.capital = getattr(engine, "capital", 5.0)
     engine.start_capital = getattr(engine, "start_capital", engine.capital)
@@ -147,13 +151,11 @@ async def features(t):
         return None
 
     price, q = data
-
     prev = LAST_PRICE.get(mint)
+
     breakout = 0.0
     if prev and prev > 0:
         breakout = max((price - prev) / prev, 0.0)
-
-    LAST_PRICE[mint] = price
 
     liq = sf(q.get("outAmount", 0)) / 1e5
 
@@ -168,7 +170,24 @@ async def features(t):
 
     breakout *= source_bonus
 
-    if prev is not None and breakout < 0.01:
+    # ===== 關鍵修正：讓 fallback / 首輪資料可以進場 =====
+    if prev is None:
+        # 第一次看到這顆幣時，給一個初始 breakout
+        if source == "pump":
+            breakout = max(breakout, 0.020)
+        elif source in ("dex_boost", "helius"):
+            breakout = max(breakout, 0.010)
+        else:
+            breakout = max(breakout, 0.006)
+    else:
+        # 對非即時價格源放寬 breakout 條件
+        if source in ("dex", "dex_boost", "helius") and breakout < 0.003:
+            breakout = 0.003
+
+    LAST_PRICE[mint] = price
+
+    # breakout 最終過濾
+    if breakout < 0.005:
         log(f"FEATURE_BREAKOUT_FAIL {mint[:6]} breakout={breakout:.6f}")
         return None
 
@@ -235,13 +254,15 @@ async def check_sell(p):
 
     engine.capital += p["size"] * (1 + pnl)
 
-    engine.trade_history.append({
-        "mint": p["mint"],
-        "pnl": pnl,
-        "reason": reason,
-        "timestamp": time.time(),
-        "meta": {"source": p.get("source")},
-    })
+    engine.trade_history.append(
+        {
+            "mint": p["mint"],
+            "pnl": pnl,
+            "reason": reason,
+            "timestamp": time.time(),
+            "meta": {"source": p.get("source")},
+        }
+    )
     engine.trade_history = engine.trade_history[-500:]
 
     if pnl > 0:
@@ -307,7 +328,8 @@ async def trade(t):
         {},
     )
 
-    min_score = 0.22 if f["source"] == "pump" else 0.27
+    # 非 pump 放寬一點，讓 dex / helius 有機會進
+    min_score = 0.22 if f["source"] == "pump" else 0.20
     if score < min_score:
         log(f"SKIP_SCORE {mint[:6]} score={score:.4f} need={min_score:.4f}")
         return False
@@ -319,14 +341,16 @@ async def trade(t):
 
     engine.capital -= s
 
-    engine.positions.append({
-        "mint": mint,
-        "entry": f["price"],
-        "size": s,
-        "time": now,
-        "peak": 0.0,
-        "source": f["source"],
-    })
+    engine.positions.append(
+        {
+            "mint": mint,
+            "entry": f["price"],
+            "size": s,
+            "time": now,
+            "peak": 0.0,
+            "source": f["source"],
+        }
+    )
 
     LAST_TRADE[mint] = now
     engine.stats["signals"] += 1
@@ -339,7 +363,7 @@ async def trade(t):
 
 async def main_loop():
     ensure_engine()
-    log("V29.2 HARDENED START")
+    log("V29.3 BREAKOUT FIX START")
 
     while engine.running:
         traded = False
