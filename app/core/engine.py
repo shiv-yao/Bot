@@ -1,4 +1,4 @@
-# ================= V35.2 TRUE FUND ENGINE =================
+# ================= V36.1 TRUE FUSION FUND =================
 
 import asyncio
 import time
@@ -15,10 +15,9 @@ except:
         return []
 
 try:
-    from app.data.market import get_quote, looks_like_solana_mint
+    from app.data.market import get_quote
 except:
     async def get_quote(a,b,c): return None
-    def looks_like_solana_mint(x): return True
 
 try:
     from app.alpha.helius_wallet_tracker import update_token_wallets
@@ -26,45 +25,39 @@ except:
     async def update_token_wallets(m): return []
 
 # ================= CONFIG =================
-MAX_POSITIONS = 3
+MAX_POSITIONS = 2
 MAX_EXPOSURE = 0.5
-MAX_POSITION_SIZE = 0.25
+MAX_POSITION_SIZE = 0.2
 
-TAKE_PROFIT = 0.06
-STOP_LOSS = -0.025
-TRAILING_GAP = 0.015
-MAX_HOLD_SEC = 60
+TAKE_PROFIT = 0.08
+STOP_LOSS = -0.15
 
 TOKEN_COOLDOWN = 10
 
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
 
-LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
+LAST_TRADE = defaultdict(float)
+
+# 🧠 學習系統
+SOURCE_STATS = defaultdict(lambda: {"wins":0,"losses":0})
 
 # ================= ENGINE =================
 def ensure_engine():
     engine.positions = getattr(engine, "positions", [])
-    engine.trade_history = getattr(engine, "trade_history", [])
     engine.logs = getattr(engine, "logs", [])
     engine.capital = getattr(engine, "capital", 5.0)
-    engine.peak_capital = getattr(engine, "peak_capital", engine.capital)
     engine.running = True
-    engine.no_trade_cycles = getattr(engine, "no_trade_cycles", 0)
 
-# ================= LOG =================
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
     engine.logs = engine.logs[-300:]
 
-# ================= HELP =================
 def sf(x):
-    try:
-        return float(x)
-    except:
-        return 0.0
+    try: return float(x)
+    except: return 0.0
 
 def exposure():
     return sum(sf(p["size"]) for p in engine.positions)
@@ -95,111 +88,94 @@ async def features(t):
 
     wallets = await update_token_wallets(m)
     data = await get_price(m)
-    if not data:
-        return None
+    if not data: return None
 
-    price, q = data
+    price,_ = data
     prev = LAST_PRICE.get(m)
 
-    # ===== strategy mode =====
-    wallet_count = len(wallets)
-    if wallet_count >= 2:
-        mode = "smart"
-    else:
-        mode = "momentum"
-
-    breakout = 0.0
-
+    breakout = 0
     if prev:
         breakout = max((price-prev)/prev,0)
 
-    # ⭐ 首次進場修正
     if prev is None:
         breakout = 0.01
 
     LAST_PRICE[m] = price
 
-    liq = sf(q.get("outAmount",0)) / 1e5
+    wallet_count = len(wallets)
 
-    # ===== liquidity 分模式 =====
-    if mode == "momentum":
-        liq = max(liq, 0.002)
-        MIN_LIQ = 0.0005
+    # ⭐ 模式判斷
+    if wallet_count >= 2:
+        mode = "smart"
     else:
-        MIN_LIQ = 0.003
+        mode = "momentum"
 
-    if liq < MIN_LIQ:
-        log(f"FEATURE_LIQ_FAIL {m[:6]} liq={liq:.6f}")
-        return None
-
-    # ===== breakout =====
-    if mode == "momentum":
-        if breakout < 0.003:
-            breakout = 0.006
-    else:
-        if breakout < 0.005:
-            log(f"FEATURE_BREAKOUT_FAIL {m[:6]} breakout={breakout:.6f}")
-            return None
-
-    # ===== impact（只對 smart）=====
-    if mode == "smart" and q.get("source") != "dexscreener":
-        if prev and prev > 0:
-            impact = abs(price-prev)/prev
-            if impact > 0.5:
-                log(f"FEATURE_IMPACT_FAIL {m[:6]} impact={impact:.4f}")
-                return None
+    smart = min(wallet_count/5,1)
 
     return {
         "mint": m,
-        "source": src,
-        "breakout": breakout,
-        "smart_money": min(wallet_count/5,1),
-        "liquidity": liq,
         "price": price,
-        "strategy_mode": mode
+        "breakout": breakout,
+        "smart": smart,
+        "source": src,
+        "mode": mode
     }
 
-# ================= SCORE =================
+# ================= SOURCE LEARNING =================
+def source_weight(src):
+    s = SOURCE_STATS[src]
+    total = s["wins"] + s["losses"]
+
+    if total < 5:
+        return 1.0
+
+    winrate = s["wins"]/max(total,1)
+
+    if winrate > 0.6:
+        return 1.3
+    elif winrate < 0.3:
+        return 0.6
+
+    return 1.0
+
+# ================= SCORE（修正爆炸） =================
 def score_alpha(f):
-    return (
-        f["breakout"] * 0.5 +
-        f["smart_money"] * 0.3 +
-        f["liquidity"] * 0.2
+    base = (
+        min(f["breakout"],0.05)*5 +
+        f["smart"]*0.3
     )
+    return base * source_weight(f["source"])
 
 # ================= SIZE =================
 def size(score):
     base = engine.capital * 0.1
-    if score > 0.5:
+    if score > 0.7:
         base *= 1.5
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
 # ================= SELL =================
 async def check_sell(p):
     data = await get_price(p["mint"])
-    if not data:
-        return
+    if not data: return
 
     price,_ = data
     pnl = (price - p["entry"]) / p["entry"]
 
-    reason = None
-    if pnl >= TAKE_PROFIT:
-        reason = "TP"
-    elif pnl <= STOP_LOSS:
-        reason = "SL"
+    if pnl >= TAKE_PROFIT or pnl <= STOP_LOSS:
+        engine.positions.remove(p)
+        engine.capital += p["size"] * (1+pnl)
 
-    if not reason:
-        return
+        src = p["source"]
+        if pnl > 0:
+            SOURCE_STATS[src]["wins"] += 1
+        else:
+            SOURCE_STATS[src]["losses"] += 1
 
-    engine.positions.remove(p)
-    engine.capital += p["size"] * (1+pnl)
+        log(f"SELL {p['mint'][:6]} pnl={pnl:.4f}")
 
-    log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
-
-# ================= TRADE =================
-async def trade(t):
-    m = t["mint"]
+# ================= EXECUTE =================
+async def execute_trade(f, score):
+    m = f["mint"]
 
     if any(p["mint"] == m for p in engine.positions):
         return False
@@ -210,38 +186,14 @@ async def trade(t):
     if len(engine.positions) >= MAX_POSITIONS:
         return False
 
-    f = await features(t)
-    if not f:
+    if exposure() > engine.capital * MAX_EXPOSURE:
         return False
 
-    mode = f.get("strategy_mode","momentum")
-
-    # ===== adaptive filter =====
-    ok = True
-    if mode == "smart":
-        try:
-            ok,_ = adaptive_filter(f,None,engine.no_trade_cycles)
-        except:
-            ok = True
-    else:
-        ok = True
-        log(f"FILTER_BYPASS_MOMENTUM {m[:6]}")
-
-    if not ok:
-        return False
-
-    score = score_alpha(f)
-
-    if mode == "momentum":
-        MIN_SCORE = 0.45
-    else:
-        MIN_SCORE = 0.22
-
-    if score < MIN_SCORE:
+    # 防假數據
+    if f["breakout"] > 0.1:
         return False
 
     s = size(score)
-
     if engine.capital < s:
         return False
 
@@ -257,22 +209,46 @@ async def trade(t):
 
     LAST_TRADE[m] = time.time()
 
-    log(f"BUY {m[:6]} {mode} score={score:.3f}")
-
+    log(f"BUY {m[:6]} {f['mode']} score={score:.3f}")
     return True
 
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🚀 V35.2 FUND ENGINE START")
+    log("🚀 V36.1 TRUE FUSION FUND START")
 
     while engine.running:
-
         try:
             tokens = await fetch_candidates()
 
+            candidates = []
+
             for t in tokens:
-                await trade(t)
+                f = await features(t)
+                if not f:
+                    continue
+
+                # ⭐ adaptive filter（保留但不鎖死）
+                ok = True
+                if f["mode"] == "smart":
+                    try:
+                        ok,_ = adaptive_filter(f,None,engine.no_trade_cycles)
+                    except:
+                        ok = True
+                else:
+                    log(f"FILTER_BYPASS_MOMENTUM {f['mint'][:6]}")
+
+                if not ok:
+                    continue
+
+                score = score_alpha(f)
+                candidates.append((score,f))
+
+            # ⭐ 只打最強
+            candidates.sort(reverse=True, key=lambda x:x[0])
+
+            for score,f in candidates[:2]:
+                await execute_trade(f, score)
 
             for p in list(engine.positions):
                 await check_sell(p)
