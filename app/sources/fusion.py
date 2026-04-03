@@ -55,11 +55,17 @@ async def _safe_get(url: str):
 
 async def fetch_pump():
     r = await _safe_get(PUMP_URL)
+
     if r is None:
         return []
 
     if r.status_code != 200:
         print("PUMP HTTP ERR:", r.status_code)
+
+        # 403 / 429 / 530 代表來源被擋或限流，直接當不可用
+        if r.status_code in [403, 429, 530]:
+            return []
+
         return []
 
     try:
@@ -73,11 +79,13 @@ async def fetch_pump():
         mint = x.get("mint")
         if looks_like_solana_mint(mint):
             out.append({"mint": mint, "source": "pump"})
+
     return out
 
 
 async def fetch_dex():
     r = await _safe_get(DEX_URL)
+
     if r is None:
         return []
 
@@ -110,9 +118,11 @@ async def fetch_candidates():
 
     now = time.time()
 
+    # 冷卻期內直接回 cache
     if now < COOLDOWN_UNTIL:
         return CACHE
 
+    # 限制抓取頻率
     if now - LAST_FETCH < 3:
         return CACHE
 
@@ -123,7 +133,11 @@ async def fetch_candidates():
         fetch_dex(),
     )
 
-    merged = pump + dex
+    # pump 掛掉也不影響整體
+    if not pump:
+        print("⚠️ PUMP DOWN -> USE DEX ONLY")
+
+    merged = pump + dex if pump else dex
 
     seen = set()
     out = []
@@ -135,14 +149,22 @@ async def fetch_candidates():
         seen.add(mint)
         out.append(item)
 
+    # 有新資料就更新 cache
     if out:
         CACHE = out[:60]
         FAIL_STREAK = 0
         return CACHE
 
     FAIL_STREAK += 1
+
+    # 完全沒資料但手上有舊 cache，先用 cache 撐著
+    if CACHE:
+        print("⚠️ USING CACHE FALLBACK")
+        return CACHE
+
+    # 連續失敗才進冷卻
     if FAIL_STREAK >= 3:
         COOLDOWN_UNTIL = time.time() + 30
         print("FUSION COOLDOWN 30s")
 
-    return CACHE
+    return []
