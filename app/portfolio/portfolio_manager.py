@@ -1,89 +1,116 @@
+from collections import defaultdict
+from statistics import mean
+
+
 class PortfolioManager:
-    def source_exposure_ratio(self, engine, source: str) -> float:
-        capital = max(float(engine.capital), 1e-9)
-
-        exposure = sum(
-            float(p.get("size", 0.0) or 0.0)
-            for p in engine.positions
-            if p.get("meta", {}).get("source") == source
+    def __init__(self):
+        self.strategy_stats = defaultdict(
+            lambda: {
+                "pnls": [],
+                "enabled": True,
+                "weight": 1.0,
+            }
         )
 
-        return exposure / capital
+    # ===== 記錄策略績效 =====
+    def record_trade(self, trade: dict):
+        if not isinstance(trade, dict):
+            return
 
-    def total_exposure_ratio(self, engine) -> float:
-        capital = max(float(engine.capital), 1e-9)
+        meta = trade.get("meta", {}) or {}
+        strategy = meta.get("strategy") or meta.get("source") or "unknown"
+        pnl = float(trade.get("pnl", 0.0) or 0.0)
 
-        exposure = sum(
-            float(p.get("size", 0.0) or 0.0)
-            for p in engine.positions
-        )
+        row = self.strategy_stats[strategy]
+        row["pnls"].append(pnl)
 
-        return exposure / capital
+        if len(row["pnls"]) > 50:
+            row["pnls"].pop(0)
 
-    def can_add_more(self, engine, max_exposure: float = 0.75) -> bool:
-        return self.total_exposure_ratio(engine) < float(max_exposure)
+    # ===== 更新策略權重 =====
+    def update_weights(self):
+        for strategy, data in self.strategy_stats.items():
+            pnls = data["pnls"]
 
-    def allocated_exposure_for_source(self, engine, source: str) -> float:
-        return sum(
-            float(p.get("size", 0.0) or 0.0)
-            for p in engine.positions
-            if p.get("meta", {}).get("source") == source
-        )
+            if len(pnls) < 5:
+                data["enabled"] = True
+                data["weight"] = 1.0
+                continue
 
-    def weighted_position_size(
-        self,
-        engine,
-        source: str,
-        base_risk_pct: float = 0.08,
-        max_position_size: float = 0.12,
-        min_position_size: float = 0.02,
-    ) -> float:
-        capital = max(float(engine.capital), 0.0)
-        if capital <= 0:
+            avg_pnl = mean(pnls)
+
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+
+            if losses and sum(losses) != 0:
+                pf = abs(sum(wins) / sum(losses))
+            else:
+                pf = 2.0 if wins else 0.0
+
+            # ===== disable 條件 =====
+            if pf < 0.8 or avg_pnl < -0.01:
+                data["enabled"] = False
+                data["weight"] = 0.0
+                continue
+
+            data["enabled"] = True
+
+            # ===== 權重區間限制 =====
+            weight = min(max(pf, 0.5), 2.0)
+            data["weight"] = weight
+
+    # ===== 取得某策略權重 =====
+    def get_weight(self, strategy: str) -> float:
+        row = self.strategy_stats.get(strategy)
+        if not row:
+            return 1.0
+
+        if not row["enabled"]:
             return 0.0
 
-        base = capital * float(base_risk_pct)
+        return float(row["weight"])
 
-        source_weights = {
-            "breakout": 1.00,
-            "smart_money": 0.95,
-            "liquidity": 0.90,
-            "fusion": 1.00,
-            "auto_smart": 1.10,
-            "real_smart": 1.15,
-            "insider": 0.85,
-            "fallback": 0.50,
-            "unknown": 0.70,
-        }
+    # ===== 目前總曝險比例 =====
+    def total_exposure_ratio(self, engine) -> float:
+        capital = max(float(getattr(engine, "capital", 0.0) or 0.0), 1e-9)
 
-        source_weight = source_weights.get(source, 0.75)
-        size = base * source_weight
+        total = 0.0
+        for p in getattr(engine, "positions", []) or []:
+            if not isinstance(p, dict):
+                continue
+            total += float(p.get("size", 0.0) or 0.0)
 
-        total_exposure = self.total_exposure_ratio(engine)
+        return total / capital
 
-        if total_exposure > 0.60:
-            size *= 0.50
-        elif total_exposure > 0.40:
-            size *= 0.70
-        elif total_exposure > 0.25:
-            size *= 0.85
+    # ===== 某策略曝險比例 =====
+    def source_exposure_ratio(self, engine, strategy: str) -> float:
+        capital = max(float(getattr(engine, "capital", 0.0) or 0.0), 1e-9)
 
-        source_exposure = self.source_exposure_ratio(engine, source)
-        if source_exposure > 0.20:
-            size *= 0.50
-        elif source_exposure > 0.10:
-            size *= 0.75
+        total = 0.0
+        for p in getattr(engine, "positions", []) or []:
+            if not isinstance(p, dict):
+                continue
 
-        size = min(size, float(max_position_size))
-        size = max(size, 0.0)
+            meta = p.get("meta", {}) or {}
+            p_strategy = meta.get("strategy") or meta.get("source") or "unknown"
 
-        if 0 < size < float(min_position_size):
-            size = float(min_position_size)
+            if p_strategy == strategy:
+                total += float(p.get("size", 0.0) or 0.0)
 
-        if size > capital:
-            size = capital
+        return total / capital
 
-        return round(size, 4)
+    # ===== debug / metrics 用 =====
+    def snapshot(self):
+        out = {}
+        for strategy, data in self.strategy_stats.items():
+            pnls = data["pnls"]
+            out[strategy] = {
+                "enabled": data["enabled"],
+                "weight": round(float(data["weight"]), 4),
+                "trades": len(pnls),
+                "avg_pnl": round(mean(pnls), 4) if pnls else 0.0,
+            }
+        return out
 
 
 portfolio = PortfolioManager()
