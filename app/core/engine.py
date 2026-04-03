@@ -74,7 +74,7 @@ def ensure_engine():
 def log(msg):
     print(msg)
     engine.logs.append(str(msg))
-    engine.logs = engine.logs[-200:]
+    engine.logs = engine.logs[-300:]
 
 
 def sf(x):
@@ -130,6 +130,7 @@ async def features(t):
     source = t.get("source", "unknown")
 
     if not looks_like_solana_mint(mint):
+        log(f"FEATURE_BAD_MINT {mint}")
         return None
 
     try:
@@ -137,8 +138,12 @@ async def features(t):
     except Exception:
         wallets = []
 
+    if wallets is None:
+        wallets = []
+
     data = await get_price(mint)
     if not data:
+        log(f"FEATURE_PRICE_FAIL {mint[:6]}")
         return None
 
     price, q = data
@@ -163,15 +168,16 @@ async def features(t):
 
     breakout *= source_bonus
 
-    # 第一輪沒有 prev 時，不要直接過濾掉
     if prev is not None and breakout < 0.01:
+        log(f"FEATURE_BREAKOUT_FAIL {mint[:6]} breakout={breakout:.6f}")
         return None
 
     if liq < 0.002:
+        log(f"FEATURE_LIQ_FAIL {mint[:6]} liq={liq:.6f}")
         return None
 
-    # 保留你原本 smart money 邏輯，但不要過嚴
     if len(wallets) < 1:
+        log(f"FEATURE_WALLET_FAIL {mint[:6]} wallets={len(wallets)}")
         return None
 
     return {
@@ -196,11 +202,13 @@ def size(score):
 async def check_sell(p):
     data = await get_price(p["mint"])
     if not data:
+        log(f"SELL_PRICE_FAIL {p['mint'][:6]}")
         return
 
     price, _ = data
     entry = sf(p.get("entry", 0))
     if entry <= 0:
+        log(f"SELL_ENTRY_FAIL {p['mint'][:6]}")
         return
 
     pnl = (price - entry) / entry
@@ -256,21 +264,26 @@ async def trade(t):
         return False
 
     if any(p["mint"] == mint for p in engine.positions):
+        log(f"SKIP_HELD {mint[:6]}")
         return False
 
     now = time.time()
 
     if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
+        log(f"SKIP_COOLDOWN {mint[:6]}")
         return False
 
     if len(engine.positions) >= MAX_POSITIONS:
+        log("SKIP_MAX_POSITIONS")
         return False
 
     if exposure() > engine.capital * MAX_EXPOSURE:
+        log("SKIP_EXPOSURE")
         return False
 
     f = await features(t)
     if not f:
+        log(f"SKIP_FEATURES {mint[:6]}")
         return False
 
     try:
@@ -281,6 +294,7 @@ async def trade(t):
         return False
 
     if not ok:
+        log(f"SKIP_FILTER {mint[:6]}")
         return False
 
     score = combine_scores(
@@ -295,10 +309,12 @@ async def trade(t):
 
     min_score = 0.22 if f["source"] == "pump" else 0.27
     if score < min_score:
+        log(f"SKIP_SCORE {mint[:6]} score={score:.4f} need={min_score:.4f}")
         return False
 
     s = size(score)
     if engine.capital < s:
+        log("SKIP_CAPITAL")
         return False
 
     engine.capital -= s
