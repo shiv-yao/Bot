@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import socket
+import time
 import httpx
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -12,6 +13,10 @@ JUP_ENDPOINTS = [
 ]
 
 _BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
+
+# ===== NEW: quote cache =====
+QUOTE_CACHE = {}
+QUOTE_CACHE_TTL = 3
 
 
 def _headers():
@@ -85,6 +90,14 @@ async def get_quote(input_mint, output_mint, amount):
         print("MARKET INVALID AMOUNT:", amount)
         return None
 
+    # ===== NEW: cache lookup =====
+    key = f"{input_mint}:{output_mint}:{amt}"
+    now = time.time()
+
+    row = QUOTE_CACHE.get(key)
+    if row and now - row["ts"] < QUOTE_CACHE_TTL:
+        return row["data"]
+
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -125,6 +138,12 @@ async def get_quote(input_mint, output_mint, amount):
             print("MARKET NO ROUTE:", data)
             await asyncio.sleep(0.3)
             continue
+
+        # ===== NEW: cache save =====
+        QUOTE_CACHE[key] = {
+            "ts": now,
+            "data": data,
+        }
 
         return data
 
