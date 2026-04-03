@@ -33,7 +33,11 @@ def compute_metrics(engine):
 
     total_trades = len(pnls)
     total_return = sum(pnls)
-    win_rate = _safe_div(len(wins), total_trades, 0.0)
+
+    # ⭐ 這裡用實際 trade_history 算，不再混用 engine.stats 的 wins/losses
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = _safe_div(win_count, total_trades, 0.0)
 
     avg_win = mean(wins) if wins else 0.0
     avg_loss = mean(losses) if losses else 0.0
@@ -67,26 +71,37 @@ def compute_metrics(engine):
     positions_raw = getattr(engine, "positions", []) or []
     positions = []
     total_exposure = 0.0
+    forced_count = 0
 
     for p in positions_raw:
         if not isinstance(p, dict):
             continue
+
         size = _safe_float(p.get("size", 0.0), 0.0)
         total_exposure += size
+
+        meta = p.get("meta", {}) if isinstance(p.get("meta", {}), dict) else {}
+        if bool(meta.get("forced", False)):
+            forced_count += 1
+
         positions.append({
             "mint": p.get("mint", ""),
             "entry": _safe_float(p.get("entry", p.get("entry_out", 0.0)), 0.0),
             "size": size,
             "score": _safe_float(p.get("score", 0.0), 0.0),
+            "peak_pnl": _safe_float(p.get("peak_pnl", 0.0), 0.0),
             "added": bool(p.get("added", False)),
             "tp_done": bool(p.get("tp_done", False)),
-            "meta": p.get("meta", {}) if isinstance(p.get("meta", {}), dict) else {},
+            "meta": meta,
         })
 
     logs = getattr(engine, "logs", []) or []
-    logs = [str(x) for x in logs[-50:]]
+    logs = [str(x) for x in logs[-80:]]
 
     stats = getattr(engine, "stats", {}) or {}
+
+    partial_trades = [t for t in trades if t.get("reason") == "PARTIAL"]
+    full_exit_trades = [t for t in trades if t.get("reason") != "PARTIAL"]
 
     summary = {
         "capital": round(capital, 4),
@@ -100,8 +115,8 @@ def compute_metrics(engine):
 
     performance = {
         "trades": total_trades,
-        "wins": int(stats.get("wins", len(wins)) or 0),
-        "losses": int(stats.get("losses", len(losses)) or 0),
+        "wins": win_count,
+        "losses": loss_count,
         "win_rate": round(win_rate, 4),
         "avg_win": round(avg_win, 4),
         "avg_loss": round(avg_loss, 4),
@@ -117,6 +132,7 @@ def compute_metrics(engine):
             "mint": t.get("mint", ""),
             "pnl": round(_safe_float(t.get("pnl", 0.0), 0.0), 4),
             "reason": t.get("reason", ""),
+            "score": round(_safe_float(t.get("score", 0.0), 0.0), 4),
             "size": round(_safe_float(t.get("size", 0.0), 0.0), 4),
             "timestamp": _safe_float(t.get("timestamp", 0.0), 0.0),
             "meta": t.get("meta", {}) if isinstance(t.get("meta", {}), dict) else {},
@@ -136,9 +152,14 @@ def compute_metrics(engine):
             "errors": int(stats.get("errors", 0) or 0),
             "open_positions": len(positions),
             "open_exposure": round(total_exposure, 4),
+            "forced_open_positions": forced_count,
+            "closed_trades": len(full_exit_trades),
+            "partial_trades": len(partial_trades),
+            "total_trade_events": len(trades),
+            "no_trade_cycles": int(getattr(engine, "no_trade_cycles", 0) or 0),
         },
         "positions": positions,
-        "equity_curve": [round(x, 4) for x in equity_curve[-50:]],
+        "equity_curve": [round(x, 4) for x in equity_curve[-100:]],
         "recent_trades": recent_trades,
         "logs": logs,
     }
