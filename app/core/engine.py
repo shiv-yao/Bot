@@ -29,16 +29,17 @@ except Exception:
         return []
 
 
-MAX_POSITIONS = 3
-MAX_EXPOSURE = 0.45
-MAX_POSITION_SIZE = 0.18
+# ===== 🔥 風控強化 =====
+MAX_POSITIONS = 1
+MAX_EXPOSURE = 0.25
+MAX_POSITION_SIZE = 0.08
 
-TAKE_PROFIT = 0.05
-STOP_LOSS = -0.02
-TRAILING_GAP = 0.012
-MAX_HOLD_SEC = 45
+TAKE_PROFIT = 0.04
+STOP_LOSS = -0.01
+TRAILING_GAP = 0.008
+MAX_HOLD_SEC = 25
 
-TOKEN_COOLDOWN = 12
+TOKEN_COOLDOWN = 15
 
 SOL = "So11111111111111111111111111111111111111112"
 AMOUNT = 1_000_000
@@ -84,17 +85,26 @@ def log(msg):
 def sf(x):
     try:
         return float(x)
-    except Exception:
+    except:
         return 0.0
 
 
+# ===== 🔥 防爆倉（新增） =====
 def risk():
     if engine.peak_capital > 0:
         dd = (engine.capital - engine.peak_capital) / engine.peak_capital
+
+        # 🔴 硬停
         if dd < -0.30:
-            log("HARD STOP")
+            log("🛑 HARD STOP")
             engine.running = False
             return False
+
+        # 🟡 降風險模式
+        if dd < -0.15:
+            engine.no_trade_cycles += 2
+            log("⚠️ RISK MODE ACTIVE")
+
     return True
 
 
@@ -129,222 +139,133 @@ async def get_price(mint):
     return out / 1e6, q
 
 
+# ===== 🔥 特徵優化 =====
 async def features(t):
     mint = t["mint"]
     source = t.get("source", "unknown")
 
-    if not looks_like_solana_mint(mint):
-        log(f"FEATURE_BAD_MINT {mint}")
-        return None
-
     try:
         wallets = await update_token_wallets(mint)
-    except Exception:
-        wallets = []
-
-    if wallets is None:
+    except:
         wallets = []
 
     data = await get_price(mint)
     if not data:
-        log(f"FEATURE_PRICE_FAIL {mint[:6]}")
         return None
 
     price, q = data
     prev = LAST_PRICE.get(mint)
 
     breakout = 0.0
-    if prev and prev > 0:
-        breakout = max((price - prev) / prev, 0.0)
+    if prev:
+        breakout = max((price - prev) / prev, 0)
 
     liq = sf(q.get("outAmount", 0)) / 1e5
 
-    source_bonus = {
-        "pump": 1.20,
-        "dex": 1.00,
-        "dex_boost": 1.10,
-        "helius": 1.05,
-        "jup": 0.85,
-        "unknown": 1.00,
-    }.get(source, 1.0)
-
-    breakout *= source_bonus
-
+    # ===== 🔥 初始 momentum 注入 =====
     if prev is None:
-        if source == "pump":
-            breakout = max(breakout, 0.020)
-        elif source == "dex_boost":
-            breakout = max(breakout, 0.010)
-        elif source == "helius":
-            breakout = max(breakout, 0.008)
-        elif source == "dex":
-            breakout = max(breakout, 0.006)
-        else:
-            breakout = max(breakout, 0.006)
-    else:
-        if source == "pump":
-            breakout = max(breakout, 0.010)
-        elif source == "dex_boost":
-            breakout = max(breakout, 0.004)
-        elif source == "helius":
-            breakout = max(breakout, 0.003)
-        elif source == "dex":
-            breakout = max(breakout, 0.002)
-        else:
-            breakout = max(breakout, 0.003)
+        breakout = 0.008
 
     LAST_PRICE[mint] = price
 
-    if source == "pump":
-        min_breakout = 0.010
-    elif source == "dex_boost":
-        min_breakout = 0.003
-    elif source == "helius":
-        min_breakout = 0.003
-    elif source == "dex":
-        min_breakout = 0.002
-    else:
-        min_breakout = 0.003
-
-    if breakout < min_breakout:
-        log(
-            f"FEATURE_BREAKOUT_FAIL {mint[:6]} "
-            f"breakout={breakout:.6f} need={min_breakout:.6f}"
-        )
+    # ===== 🔥 過濾 =====
+    if breakout < 0.004:
         return None
 
     if liq < 0.002:
-        log(f"FEATURE_LIQ_FAIL {mint[:6]} liq={liq:.6f}")
         return None
 
-    if len(wallets) < 1:
-        log(f"FEATURE_WALLET_FAIL {mint[:6]} wallets={len(wallets)}")
-        return None
+    # 🔥 wallet 不再硬卡
+    smart_money = min(len(wallets) / 5, 1)
 
     return {
         "mint": mint,
         "source": source,
         "breakout": breakout,
-        "smart_money": min(len(wallets) / 8, 1.0),
+        "smart_money": smart_money,
         "liquidity": liq,
-        "insider": 0.05,
-        "wallet_count": len(wallets),
+        "insider": 0.02,
         "price": price,
     }
 
 
 def size(score):
-    base = engine.capital * 0.08
-    if score > 0.4:
-        base *= 1.3
+    base = engine.capital * 0.05
+    if score > 0.35:
+        base *= 1.2
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
 
 async def check_sell(p):
     data = await get_price(p["mint"])
     if not data:
-        log(f"SELL_PRICE_FAIL {p['mint'][:6]}")
         return
 
     price, _ = data
-    entry = sf(p.get("entry", 0))
-    if entry <= 0:
-        log(f"SELL_ENTRY_FAIL {p['mint'][:6]}")
-        return
+    entry = p["entry"]
 
     pnl = (price - entry) / entry
     held = time.time() - p["time"]
 
     reason = None
+
     if pnl >= TAKE_PROFIT:
         reason = "TP"
     elif pnl <= STOP_LOSS:
         reason = "SL"
-    elif pnl < p.get("peak", 0.0) - TRAILING_GAP:
+    elif pnl < p.get("peak", 0) - TRAILING_GAP:
         reason = "TRAIL"
-    elif held > MAX_HOLD_SEC and pnl < 0.01:
+    elif held > MAX_HOLD_SEC:
         reason = "TIME"
 
-    if pnl > p.get("peak", 0.0):
+    if pnl > p.get("peak", 0):
         p["peak"] = pnl
 
     if not reason:
         return
 
-    if p in engine.positions:
-        engine.positions.remove(p)
-
+    engine.positions.remove(p)
     engine.capital += p["size"] * (1 + pnl)
-
-    engine.trade_history.append(
-        {
-            "mint": p["mint"],
-            "pnl": pnl,
-            "reason": reason,
-            "timestamp": time.time(),
-            "meta": {"source": p.get("source")},
-        }
-    )
-    engine.trade_history = engine.trade_history[-500:]
 
     if pnl > 0:
         engine.stats["wins"] += 1
     else:
         engine.stats["losses"] += 1
 
-    if engine.capital > engine.peak_capital:
-        engine.peak_capital = engine.capital
-
-    engine.last_trade = f"{p['mint'][:6]} {reason} pnl={pnl:.4f}"
+    engine.last_trade = f"{p['mint'][:6]} {reason} {pnl:.4f}"
     log(f"SELL {p['mint'][:6]} {reason} pnl={pnl:.4f}")
 
 
 async def trade(t):
     mint = t["mint"]
 
-    if not looks_like_solana_mint(mint):
-        log(f"BAD_MINT {mint}")
-        return False
-
     if any(p["mint"] == mint for p in engine.positions):
-        log(f"SKIP_HELD {mint[:6]}")
         return False
 
     now = time.time()
 
     if now - LAST_TRADE[mint] < TOKEN_COOLDOWN:
-        log(f"SKIP_COOLDOWN {mint[:6]}")
         return False
 
     if len(engine.positions) >= MAX_POSITIONS:
-        log("SKIP_MAX_POSITIONS")
         return False
 
     if exposure() > engine.capital * MAX_EXPOSURE:
-        log("SKIP_EXPOSURE")
         return False
 
     f = await features(t)
     if not f:
-        log(f"SKIP_FEATURES {mint[:6]}")
         return False
 
-    # ===== 冷啟動 bypass + 長時間沒交易 override =====
+    # ===== 🔥 FILTER 放寬 =====
     ok = True
-    if engine.stats["executed"] >= 3:
+    if engine.stats["executed"] >= 5:
         try:
             ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
-        except Exception as e:
-            engine.stats["errors"] += 1
-            log(f"FILTER_ERR {str(e)[:60]}")
-            return False
-
-        if not ok and engine.no_trade_cycles > 5:
-            log(f"FILTER_OVERRIDE {mint[:6]}")
+        except:
             ok = True
 
     if not ok:
-        log(f"SKIP_FILTER {mint[:6]}")
         return False
 
     score = combine_scores(
@@ -357,41 +278,34 @@ async def trade(t):
         {},
     )
 
-    min_score = 0.22 if f["source"] == "pump" else 0.20
-    if score < min_score:
-        log(f"SKIP_SCORE {mint[:6]} score={score:.4f} need={min_score:.4f}")
+    if score < 0.18:
         return False
 
     s = size(score)
     if engine.capital < s:
-        log("SKIP_CAPITAL")
         return False
 
     engine.capital -= s
 
-    engine.positions.append(
-        {
-            "mint": mint,
-            "entry": f["price"],
-            "size": s,
-            "time": now,
-            "peak": 0.0,
-            "source": f["source"],
-        }
-    )
+    engine.positions.append({
+        "mint": mint,
+        "entry": f["price"],
+        "size": s,
+        "time": now,
+        "peak": 0,
+    })
 
     LAST_TRADE[mint] = now
     engine.stats["signals"] += 1
     engine.stats["executed"] += 1
-    engine.last_signal = f"{mint[:6]} src={f['source']} score={score:.3f}"
 
-    log(f"BUY {mint[:6]} src={f['source']} score={score:.3f}")
+    log(f"BUY {mint[:6]} score={score:.3f}")
     return True
 
 
 async def main_loop():
     ensure_engine()
-    log("V29.5 FILTER BYPASS START")
+    log("🔥 V29.6 RISK CONTROL START")
 
     while engine.running:
         traded = False
@@ -402,12 +316,6 @@ async def main_loop():
 
             tokens = await fetch_candidates()
 
-            if not tokens:
-                engine.no_trade_cycles += 1
-                log("NO_TOKENS_FROM_MARKET")
-                await asyncio.sleep(5)
-                continue
-
             for t in tokens:
                 if await trade(t):
                     traded = True
@@ -415,13 +323,8 @@ async def main_loop():
             for p in list(engine.positions):
                 await check_sell(p)
 
-            if traded:
-                engine.no_trade_cycles = 0
-            else:
-                engine.no_trade_cycles += 1
-
         except Exception as e:
             engine.stats["errors"] += 1
-            log(f"ERR {str(e)[:120]}")
+            log(f"ERR {e}")
 
         await asyncio.sleep(2)
