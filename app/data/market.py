@@ -1,17 +1,25 @@
 import os
 import re
+import asyncio
+import socket
 import httpx
 
-QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
-
 SOL_MINT = "So11111111111111111111111111111111111111112"
+
+JUP_ENDPOINTS = [
+    "https://lite-api.jup.ag/swap/v1/quote",
+    "https://quote-api.jup.ag/v6/quote",
+]
 
 _BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
 
 
 def _headers():
     api_key = os.getenv("JUP_API_KEY", "").strip()
-    h = {"Accept": "application/json"}
+    h = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
     if api_key:
         h["x-api-key"] = api_key
     return h
@@ -27,13 +35,45 @@ def looks_like_solana_mint(addr: str) -> bool:
     return bool(_BASE58_RE.fullmatch(addr))
 
 
-def normalize_amount(amount) -> str | None:
+def _normalize_amount(amount) -> str | None:
     try:
         v = int(amount)
         if v <= 0:
             return None
         return str(v)
     except Exception:
+        return None
+
+
+async def _http_get(url: str, params: dict):
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            return await client.get(url, params=params, headers=_headers())
+    except Exception as e:
+        print("MARKET HTTP ERR:", repr(e))
+        return None
+
+
+async def _http_get_dns_fallback(url: str, params: dict):
+    """
+    DNS fallback:
+    1) resolve host manually
+    2) request via IP
+    3) keep Host header
+    """
+    try:
+        host = url.split("/")[2]
+        ip = socket.gethostbyname(host)
+        new_url = url.replace(host, ip, 1)
+
+        headers = _headers()
+        headers["Host"] = host
+
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+            print(f"MARKET DNS FIX: {host} -> {ip}")
+            return await client.get(new_url, params=params, headers=headers)
+    except Exception as e:
+        print("MARKET DNS FAIL:", repr(e))
         return None
 
 
@@ -46,7 +86,7 @@ async def get_quote(input_mint, output_mint, amount):
         print("MARKET INVALID OUTPUT_MINT:", output_mint)
         return None
 
-    amt = normalize_amount(amount)
+    amt = _normalize_amount(amount)
     if amt is None:
         print("MARKET INVALID AMOUNT:", amount)
         return None
@@ -59,32 +99,40 @@ async def get_quote(input_mint, output_mint, amount):
         "swapMode": "ExactIn",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                QUOTE_URL,
-                params=params,
-                headers=_headers(),
-            )
+    for url in JUP_ENDPOINTS:
+        # normal try
+        r = await _http_get(url, params)
+        if r is None:
+            r = await _http_get_dns_fallback(url, params)
+
+        if r is None:
+            await asyncio.sleep(0.3)
+            continue
 
         if r.status_code != 200:
             print("MARKET QUOTE ERROR STATUS:", r.status_code)
-            print("MARKET QUOTE ERROR PARAMS:", params)
-            print("MARKET QUOTE ERROR BODY:", r.text[:500])
-            return None
+            print("MARKET QUOTE ERROR URL:", url)
+            print("MARKET QUOTE ERROR BODY:", r.text[:300])
+            await asyncio.sleep(0.3)
+            continue
 
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception as e:
+            print("MARKET JSON ERR:", repr(e))
+            await asyncio.sleep(0.3)
+            continue
 
         if not isinstance(data, dict):
-            print("MARKET QUOTE INVALID JSON:", data)
-            return None
+            print("MARKET INVALID JSON:", data)
+            await asyncio.sleep(0.3)
+            continue
 
         if not data.get("outAmount"):
             print("MARKET NO ROUTE:", data)
-            return None
+            await asyncio.sleep(0.3)
+            continue
 
         return data
 
-    except Exception as e:
-        print("MARKET QUOTE EXCEPTION:", repr(e))
-        return None
+    return None
