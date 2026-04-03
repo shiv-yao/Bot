@@ -55,12 +55,6 @@ async def _http_get(url: str, params: dict):
 
 
 async def _http_get_dns_fallback(url: str, params: dict):
-    """
-    DNS fallback:
-    1) resolve host manually
-    2) request via IP
-    3) keep Host header
-    """
     try:
         host = url.split("/")[2]
         ip = socket.gethostbyname(host)
@@ -100,7 +94,6 @@ async def get_quote(input_mint, output_mint, amount):
     }
 
     for url in JUP_ENDPOINTS:
-        # normal try
         r = await _http_get(url, params)
         if r is None:
             r = await _http_get_dns_fallback(url, params)
