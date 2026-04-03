@@ -170,25 +170,49 @@ async def features(t):
 
     breakout *= source_bonus
 
-    # ===== 關鍵修正：讓 fallback / 首輪資料可以進場 =====
+    # ===== 關鍵修正：不同 source 用不同 breakout 規則 =====
     if prev is None:
-        # 第一次看到這顆幣時，給一個初始 breakout
         if source == "pump":
             breakout = max(breakout, 0.020)
-        elif source in ("dex_boost", "helius"):
+        elif source == "dex_boost":
             breakout = max(breakout, 0.010)
+        elif source == "helius":
+            breakout = max(breakout, 0.008)
+        elif source == "dex":
+            breakout = max(breakout, 0.006)
         else:
             breakout = max(breakout, 0.006)
     else:
-        # 對非即時價格源放寬 breakout 條件
-        if source in ("dex", "dex_boost", "helius") and breakout < 0.003:
-            breakout = 0.003
+        if source == "pump":
+            breakout = max(breakout, 0.010)
+        elif source == "dex_boost":
+            breakout = max(breakout, 0.004)
+        elif source == "helius":
+            breakout = max(breakout, 0.003)
+        elif source == "dex":
+            breakout = max(breakout, 0.002)
+        else:
+            breakout = max(breakout, 0.003)
 
     LAST_PRICE[mint] = price
 
-    # breakout 最終過濾
-    if breakout < 0.005:
-        log(f"FEATURE_BREAKOUT_FAIL {mint[:6]} breakout={breakout:.6f}")
+    # ===== 動態 breakout threshold =====
+    if source == "pump":
+        min_breakout = 0.010
+    elif source == "dex_boost":
+        min_breakout = 0.003
+    elif source == "helius":
+        min_breakout = 0.003
+    elif source == "dex":
+        min_breakout = 0.002
+    else:
+        min_breakout = 0.003
+
+    if breakout < min_breakout:
+        log(
+            f"FEATURE_BREAKOUT_FAIL {mint[:6]} "
+            f"breakout={breakout:.6f} need={min_breakout:.6f}"
+        )
         return None
 
     if liq < 0.002:
@@ -328,7 +352,6 @@ async def trade(t):
         {},
     )
 
-    # 非 pump 放寬一點，讓 dex / helius 有機會進
     min_score = 0.22 if f["source"] == "pump" else 0.20
     if score < min_score:
         log(f"SKIP_SCORE {mint[:6]} score={score:.4f} need={min_score:.4f}")
@@ -363,7 +386,7 @@ async def trade(t):
 
 async def main_loop():
     ensure_engine()
-    log("V29.3 BREAKOUT FIX START")
+    log("V29.4 DYNAMIC BREAKOUT START")
 
     while engine.running:
         traded = False
