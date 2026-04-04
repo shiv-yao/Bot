@@ -1,4 +1,4 @@
-# ================= V38.7 TRUE TRADING FUND BRAIN (FULL FIXED) =================
+# ================= V39 TRUE ALPHA FUND BRAIN (FULL DIFFERENTIATION) =================
 
 import os
 import asyncio
@@ -52,16 +52,16 @@ BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
 FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.003"))
-SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.001"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.01"))
+SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.003"))
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))
 MAX_PRICE_JUPITER = float(os.getenv("MAX_PRICE_JUPITER", "0.1"))
 MAX_PRICE_FALLBACK = float(os.getenv("MAX_PRICE_FALLBACK", "10"))
 
-MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.05"))
-MAX_SCORE = float(os.getenv("MAX_SCORE", "0.1"))
+MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.20"))
+MAX_SCORE = float(os.getenv("MAX_SCORE", "1.0"))
 MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
 
@@ -71,14 +71,15 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
 MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "5"))
-BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true"
+BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true")
 
-ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.001"))
-ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.005"))
+ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.005"))
+ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
 
-# 修復：交易門控
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "true").lower() == "true"
-FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.05"))
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.10"))
+
+TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "3"))
 
 
 # ================= RUNTIME MEMORY =================
@@ -132,7 +133,7 @@ def ensure_engine():
 def log(x):
     print(x)
     engine.logs.append(str(x))
-    engine.logs = engine.logs[-400:]
+    engine.logs = engine.logs[-500:]
 
 
 # ================= HELPERS =================
@@ -202,15 +203,46 @@ def limit_token_frequency(tokens, max_per_token=2):
 
 def current_dynamic_threshold():
     base = ENTRY_THRESHOLD
-    if engine.no_trade_cycles > 20:
+
+    if engine.no_trade_cycles > 30:
         base *= 0.5
-    elif engine.no_trade_cycles > 10:
+    elif engine.no_trade_cycles > 15:
         base *= 0.7
 
     if engine.stats.get("executed", 0) == 0:
-        base *= 0.7
+        base *= 0.8
 
     return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
+
+
+def normalize_liq(liq: float) -> float:
+    liq = max(sf(liq), 0.0)
+    # log-ish compression without math.log to keep simple and stable
+    if liq <= 0:
+        return 0.0
+    if liq < 300:
+        return 0.01
+    if liq < 1000:
+        return 0.05
+    if liq < 3000:
+        return 0.10
+    if liq < 10000:
+        return 0.18
+    if liq < 30000:
+        return 0.28
+    return 0.35
+
+
+def normalize_wallets(n: int) -> float:
+    n = max(int(n), 0)
+    return min(n / 10.0, 1.0) * 0.20
+
+
+def breakout_strength(b: float) -> float:
+    b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+    if b <= 0:
+        return 0.0
+    return min(b / 0.05, 1.0) * 0.35
 
 
 # ================= HTTP =================
@@ -380,11 +412,11 @@ async def fetch_alpha_candidates():
 
 def source_quality(source: str) -> float:
     if source == "pumpfun":
-        return 1.15
+        return 1.20
     if source == "dexscreener":
         return 1.05
     if source == "fusion":
-        return 1.05
+        return 1.08
     if source == "jupiter":
         return 0.95
     if source == "synthetic":
@@ -568,9 +600,9 @@ async def features(t):
 
     sniper_boost = 0.0
     if t.get("source") == "pumpfun":
-        sniper_boost += 0.02
+        sniper_boost += 0.05
     if pinfo.get("source") == "jupiter":
-        sniper_boost += 0.01
+        sniper_boost += 0.02
 
     return {
         "mint": m,
@@ -599,37 +631,35 @@ def mode(f):
 def score_alpha(f):
     m = mode(f)
 
-    liq_bonus = 0.0
     liq = sf(f.get("liq", 0))
-    if liq > 0:
-        liq_bonus = 0.01
-    if liq > MIN_OUT_AMOUNT_STRICT:
-        liq_bonus += 0.01
+    liq_score = normalize_liq(liq)
+    wallet_score = normalize_wallets(f.get("wallet_count", 0))
+    breakout_score = breakout_strength(f.get("breakout", 0))
+
+    smart_score = clamp(sf(f.get("smart", 0)), 0.0, 1.0) * 0.25
+    sniper_score = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.10)
 
     if m == "sniper":
-        raw = f["breakout"] * 0.35 + f["smart"] * 0.45 + liq_bonus + f.get("sniper_boost", 0.0)
+        raw = breakout_score + smart_score + liq_score + wallet_score + sniper_score
     elif m == "smart":
-        raw = f["smart"] * 0.7 + f["breakout"] * 0.3 + liq_bonus
+        raw = smart_score * 1.4 + breakout_score * 0.6 + liq_score + wallet_score
     else:
-        raw = f["breakout"] * 0.8 + f["smart"] * 0.2 + liq_bonus
+        raw = breakout_score * 1.3 + smart_score * 0.7 + liq_score + wallet_score
 
-    raw = clamp(raw, 0.0, MAX_SCORE)
+    raw = max(raw, 0.0)
     return raw, m
 
 def source_weight(src):
     s = SOURCE_STATS[src]
     total = s["wins"] + s["losses"]
 
-    if total < 5:
-        mem = 1.0
-    else:
+    mem = 1.0
+    if total >= 5:
         winrate = s["wins"] / total if total else 0.0
         if winrate > 0.6:
             mem = 1.2
         elif winrate < 0.3:
             mem = 0.8
-        else:
-            mem = 1.0
 
     return mem * source_quality(src)
 
@@ -641,22 +671,24 @@ def score_with_allocator(f):
     if TOKEN_TRADE_COUNT[f["mint"]] > 2:
         base *= 0.7
 
-    base = clamp(base, 0.0, MAX_SCORE)
-    return base, m
+    return max(base, 0.0), m
 
 def allocate_size(score, n_candidates):
     if n_candidates <= 0:
         return 0.0
 
-    base = engine.capital / max(n_candidates * 2, 2)
+    # top candidates take more capital
+    bucket = engine.capital / max(n_candidates * 2, 2)
 
-    if score > 0.05:
-        base *= 1.25
-    elif score < 0.01:
-        base *= 0.5
+    if score > 0.60:
+        bucket *= 1.5
+    elif score > 0.35:
+        bucket *= 1.2
+    elif score < 0.10:
+        bucket *= 0.6
 
-    base = min(base, 0.2)
-    return min(base, engine.capital * MAX_POSITION_SIZE)
+    bucket = min(bucket, 0.2)
+    return min(bucket, engine.capital * MAX_POSITION_SIZE)
 
 
 # ================= BUY =================
@@ -692,6 +724,19 @@ async def buy(m, f, position_size, mtype, forced=False):
     engine.capital -= position_size
     engine.capital = max(engine.capital, 0.0)
 
+    meta = dict(f.get("meta", {}) or {})
+    meta.update({
+        "source": f.get("source"),
+        "strategy": mtype,
+        "forced": forced,
+        "breakout": f.get("breakout"),
+        "smart_money": f.get("smart"),
+        "liquidity": f.get("liq"),
+        "wallet_count": f.get("wallet_count"),
+        "price": f.get("price"),
+        "score": f.get("_score"),
+    })
+
     engine.positions.append({
         "mint": m,
         "entry": f["price"],
@@ -701,7 +746,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "time": now(),
         "mode": mtype,
         "source": f["source"],
-        "meta": f.get("meta", {}),
+        "meta": meta,
         "price_source": f.get("price_source"),
         "liq": f.get("liq", 0),
         "high": f["price"],
@@ -709,10 +754,12 @@ async def buy(m, f, position_size, mtype, forced=False):
         "tx_buy": tx_sig,
         "forced": forced,
         "paper": bool(res.get("paper")),
+        "score": f.get("_score", 0.0),
     })
 
     LAST_TRADE[m] = now()
     engine.stats["executed"] += 1
+    engine.stats["signals"] += 1
     if forced:
         engine.stats["forced_trades"] += 1
 
@@ -786,6 +833,7 @@ async def sell(p, reason, pnl, price):
         "time_open": p.get("time"),
         "time_close": now(),
         "tx_buy": p.get("tx_buy"),
+        "meta": p.get("meta", {}),
     })
 
     update_open_stats()
@@ -849,7 +897,15 @@ async def process_candidates(tokens):
         f["meta"] = t.get("meta", {})
 
         sc, mtype = score_with_allocator(f)
-        log(f"SCORE {m[:6]} {sc:.4f}")
+
+        log(
+            f"SCORE_DETAIL {m[:6]} "
+            f"breakout={f.get('breakout', 0):.4f} "
+            f"smart={f.get('smart', 0):.4f} "
+            f"liq={sf(f.get('liq', 0)):.2f} "
+            f"wallets={f.get('wallet_count', 0)} "
+            f"score={sc:.4f}"
+        )
 
         if sc < dyn_threshold:
             continue
@@ -866,6 +922,8 @@ async def execute_portfolio(ranked):
         return False
 
     traded = False
+
+    ranked = ranked[:TOP_N_TO_TRADE]
 
     for f in ranked:
         m = f["mint"]
@@ -886,7 +944,6 @@ async def execute_portfolio(ranked):
             log(f"SKIP_COOLDOWN {m[:6]}")
             continue
 
-        # ===== 完整修復：soft bypass filter =====
         if SOFT_DISABLE_FILTER:
             ok = True
         else:
@@ -897,6 +954,10 @@ async def execute_portfolio(ranked):
         log(f"FILTER_RESULT {m[:6]} ok={ok}")
 
         if not ok:
+            continue
+
+        if f["_score"] < 0.05:
+            log(f"SKIP_LOW_SCORE {m[:6]}")
             continue
 
         pos_size = allocate_size(f["_score"], len(ranked))
@@ -997,7 +1058,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V38.7 TRUE TRADING START")
+    log("🚀 V39 TRUE ALPHA DIFFERENTIATION START")
 
     while engine.running:
         try:
@@ -1037,7 +1098,7 @@ async def main_loop():
             ):
                 current_mints = {p["mint"] for p in engine.positions}
 
-                for f in ranked:
+                for f in ranked[:TOP_N_TO_TRADE]:
                     if f["mint"] in current_mints:
                         continue
 
@@ -1045,7 +1106,7 @@ async def main_loop():
                     ok = await buy(
                         f["mint"],
                         f,
-                        allocate_size(max(f["_score"], 0.01), 1),
+                        allocate_size(max(f["_score"], 0.05), 1),
                         f["_mode"],
                         forced=True,
                     )
