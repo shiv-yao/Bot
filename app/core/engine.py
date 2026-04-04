@@ -1,4 +1,4 @@
-# ================= V39.1 TRUE ALPHA DIFFERENTIATION FIXED =================
+# ================= V39.2 TRUE ALPHA FULL MARKET (KEEP ALL FEATURES) =================
 
 import os
 import asyncio
@@ -80,7 +80,8 @@ ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "true").lower() == "true"
 FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.10"))
 
-TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "3"))
+TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "2"))
+MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "25"))
 
 
 # ================= RUNTIME MEMORY =================
@@ -223,12 +224,10 @@ def normalize_liq(liq: float) -> float:
     x = math.log10(liq + 1.0)
     score = (x - 2.0) / 7.0
     score = clamp(score, 0.0, 1.0)
-
     return score * 0.55
 
 def normalize_wallets(n: int) -> float:
     n = max(int(n), 0)
-
     if n == 0:
         return 0.0
     if n == 1:
@@ -1080,7 +1079,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V39.1 TRUE ALPHA DIFFERENTIATION START")
+    log("🚀 V39.2 TRUE ALPHA FULL MARKET START")
 
     while engine.running:
         try:
@@ -1092,6 +1091,7 @@ async def main_loop():
             tokens = limit_token_frequency(tokens, max_per_token=2)
             tokens = dedup(tokens)
             random.shuffle(tokens)
+            tokens = tokens[:MAX_TOKENS_PER_CYCLE]
 
             log(f"UNIVERSE_SIZE {len(tokens)}")
 
@@ -1138,6 +1138,7 @@ async def main_loop():
                         engine.no_trade_cycles = 0
                         break
 
+            log("CYCLE_DONE")
             update_open_stats()
             update_peak_capital()
 
