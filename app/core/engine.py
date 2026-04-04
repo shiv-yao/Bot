@@ -1,4 +1,4 @@
-# ================= V40 TRUE ALPHA BOOST FULL MARKET =================
+# ================= V40.1 TRUE ALPHA BOOST FULL MARKET FIXED =================
 
 import os
 import asyncio
@@ -53,8 +53,8 @@ BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
 FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.45"))
-FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.60"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.05"))
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.08"))
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "false").lower() == "true"
 
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
@@ -473,7 +473,6 @@ async def birdeye_price(m):
         return None
 
     headers = {"X-API-KEY": BIRDEYE_API_KEY}
-
     token_res = await http_get(
         "https://public-api.birdeye.so/defi/price",
         params={"address": m},
@@ -585,9 +584,12 @@ async def features(t):
     if prev and prev > 0:
         breakout = (price - prev) / prev
     else:
-        breakout = random.uniform(0.001, 0.02)
+        breakout = random.uniform(0.003, 0.02)
 
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+
+    if abs(breakout) < 0.001:
+        breakout = 0.003
 
     momentum = 0.0
     try:
@@ -599,6 +601,10 @@ async def features(t):
         momentum = 0.0
 
     momentum = clamp(momentum, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+
+    if abs(momentum) < 0.001:
+        momentum = breakout * 0.5
+
     LAST_MOMENTUM[m] = momentum
     LAST_PRICE[m] = price
 
@@ -649,20 +655,29 @@ def score_alpha(f):
 
     bscore = breakout_strength(breakout)
     mscore = momentum_strength(momentum)
-    sscore = clamp(sf(smart), 0.0, 1.0) * 0.28
+    sscore = clamp(sf(smart), 0.0, 1.0) * 0.40
     lscore = min(liq / 1_000_000, 1.0) * 0.12
-    wscore = 0.05 if f.get("wallet_count", 0) >= 2 else 0.0
+
+    wc = f.get("wallet_count", 0)
+    if wc >= 3:
+        wscore = 0.08
+    elif wc >= 2:
+        wscore = 0.05
+    elif wc >= 1:
+        wscore = 0.02
+    else:
+        wscore = 0.0
+
     nscore = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
 
-    # fake breakout filter: breakout 有但 momentum 不跟
     if breakout > 0.01 and momentum <= 0:
         bscore *= 0.35
 
     score = (
-        bscore * 0.35 +
-        mscore * 0.25 +
+        bscore * 0.45 +
+        mscore * 0.10 +
         sscore * 0.20 +
-        lscore * 0.15 +
+        lscore * 0.20 +
         wscore +
         nscore * 0.05
     )
@@ -790,7 +805,6 @@ async def buy(m, f, position_size, mtype, forced=False):
         engine.stats["forced_trades"] += 1
 
     update_open_stats()
-
     engine.last_signal = f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f}"
     engine.last_trade = engine.last_signal
 
@@ -1092,7 +1106,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V40 TRUE ALPHA BOOST START")
+    log("🚀 V40.1 TRUE ALPHA BOOST FIX START")
 
     while engine.running:
         try:
