@@ -1,4 +1,4 @@
-# ================= V36.2 TRUE PROFIT FIX (FULL FUSION) =================
+# ================= V37 TRUE TRADING (FULL FUSION UPGRADE) =================
 
 import asyncio
 import time
@@ -96,14 +96,10 @@ async def get_price(m):
         return None
 
     out = sf(q.get("outAmount", 0))
-
-    # 🚨 防爆價
     if out <= 0 or out > 1e12:
         return None
 
     price = out / 1e6
-
-    # 🚨 再過濾
     if price <= 0 or price > 1000:
         return None
 
@@ -125,22 +121,20 @@ async def features(t):
     breakout = 0.0
     if prev:
         breakout = max((price - prev) / prev, 0)
-
-    # ⭐ 首次進場
-    if prev is None:
-        breakout = 0.01
+    else:
+        breakout = 0.008   # 🔥 V37：放寬初始進場
 
     LAST_PRICE[m] = price
 
     liq = sf(q.get("outAmount", 0)) / 1e5
     smart = min(len(wallets) / 5, 1)
 
-    # 🚨 過濾
-    if breakout < 0.004:
+    # 🔥 V37：放寬條件（原本太嚴）
+    if breakout < 0.002:
         log(f"FEATURE_BREAKOUT_FAIL {m[:6]} {breakout:.4f}")
         return None
 
-    if liq < 0.002:
+    if liq < 0.001:
         log(f"FEATURE_LIQ_FAIL {m[:6]} {liq:.4f}")
         return None
 
@@ -150,7 +144,8 @@ async def features(t):
         "breakout": breakout,
         "smart_money": smart,
         "liquidity": liq,
-        "price": price
+        "price": price,
+        "is_new": prev is None,
     }
 
 # ================= FUND BRAIN =================
@@ -170,8 +165,10 @@ def source_weight(src):
 
     return 1.0
 
-# ================= REGIME =================
-def market_mode(f):
+# ================= STRATEGY =================
+def detect_mode(f):
+    if f["is_new"]:
+        return "sniper"
     if f["smart_money"] > 0.6:
         return "smart"
     return "momentum"
@@ -179,14 +176,22 @@ def market_mode(f):
 # ================= SCORE =================
 def score_alpha(f):
 
-    mode = market_mode(f)
+    mode = detect_mode(f)
 
-    if mode == "smart":
+    if mode == "sniper":
+        base = (
+            f["breakout"] * 0.4 +
+            f["liquidity"] * 0.3 +
+            f["smart_money"] * 0.3
+        )
+
+    elif mode == "smart":
         base = (
             f["smart_money"] * 0.5 +
             f["breakout"] * 0.3 +
             f["liquidity"] * 0.2
         )
+
     else:
         base = (
             f["breakout"] * 0.6 +
@@ -200,10 +205,8 @@ def score_alpha(f):
 def size(score):
     base = engine.capital * 0.05
 
-    if score > 0.6:
-        base *= 1.2
-
-    base = min(base, 0.2)  # 🚨 防爆
+    if score > 0.01:
+        base *= 1.5
 
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
@@ -215,8 +218,6 @@ async def check_sell(p):
 
     price, _ = data
     pnl = (price - p["entry"]) / p["entry"]
-
-    # 🚨 限制 pnl
     pnl = max(min(pnl, 1.0), -1.0)
 
     reason = None
@@ -247,7 +248,6 @@ async def check_sell(p):
 async def trade(t):
 
     if exposure() > engine.capital * MAX_EXPOSURE:
-        log("BLOCK_EXPOSURE")
         return False
 
     m = t["mint"]
@@ -271,13 +271,15 @@ async def trade(t):
 
     score, mode = score_alpha(f)
 
-    # 🚨 momentum 限制
-    if mode == "momentum" and f["breakout"] < 0.01:
-        log(f"SKIP_WEAK_MOMENTUM {m[:6]}")
-        return False
+    # 🔥 V37：降低門檻（核心）
+    threshold = 0.003
 
-    if score < 0.2:
-        return False
+    # 🔥 fallback（保證會下單）
+    if score < threshold:
+        if mode == "sniper" and score > 0.001:
+            pass
+        else:
+            return False
 
     s = size(score)
 
@@ -296,27 +298,39 @@ async def trade(t):
 
     LAST_TRADE[m] = time.time()
 
-    log(f"BUY {m[:6]} {mode} score={score:.3f}")
+    log(f"BUY {m[:6]} {mode} score={score:.4f}")
 
     return True
 
 # ================= LOOP =================
 async def main_loop():
     ensure_engine()
-    log("🚀 V36.2 TRUE PROFIT FIX START")
+    log("🚀 V37 TRUE TRADING START")
 
     while engine.running:
 
         try:
             tokens = await fetch_candidates()
 
-            for t in tokens:
-                await trade(t)
+            # 🔥 V37：打亂（避免固定順序卡死）
+            random.shuffle(tokens)
+
+            traded = False
+
+            for t in tokens[:20]:
+                ok = await trade(t)
+                if ok:
+                    traded = True
 
             for p in list(engine.positions):
                 await check_sell(p)
 
-            # 🚨 防資金爆炸
+            if not traded:
+                engine.no_trade_cycles += 1
+            else:
+                engine.no_trade_cycles = 0
+
+            # 🔥 防爆
             if engine.capital > 100:
                 log("⚠️ CAPITAL RESET")
                 engine.capital = 5.0
