@@ -1,9 +1,10 @@
-# ================= V39 TRUE ALPHA DIFFERENTIATION (BASED ON V38.7 MARKET) =================
+# ================= V39.1 TRUE ALPHA DIFFERENTIATION FIXED =================
 
 import os
 import asyncio
 import time
 import random
+import math
 from collections import defaultdict, Counter
 
 import httpx
@@ -218,21 +219,27 @@ def normalize_liq(liq: float) -> float:
     liq = max(sf(liq), 0.0)
     if liq <= 0:
         return 0.0
-    if liq < 300:
-        return 0.01
-    if liq < 1000:
-        return 0.05
-    if liq < 3000:
-        return 0.10
-    if liq < 10000:
-        return 0.18
-    if liq < 30000:
-        return 0.28
-    return 0.35
+
+    x = math.log10(liq + 1.0)
+    score = (x - 2.0) / 7.0
+    score = clamp(score, 0.0, 1.0)
+
+    return score * 0.55
 
 def normalize_wallets(n: int) -> float:
     n = max(int(n), 0)
-    return min(n / 10.0, 1.0) * 0.20
+
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 0.02
+    if n <= 3:
+        return 0.06
+    if n <= 5:
+        return 0.12
+    if n <= 10:
+        return 0.20
+    return 0.30
 
 def breakout_strength(b: float) -> float:
     b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
@@ -578,7 +585,7 @@ async def features(t):
     if prev and prev > 0:
         breakout = (price - prev) / prev
     else:
-        breakout = 0.005
+        breakout = random.uniform(0.001, 0.03)
 
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
 
@@ -627,20 +634,34 @@ def mode(f):
 def score_alpha(f):
     m = mode(f)
 
-    liq = sf(f.get("liq", 0))
-    liq_score = normalize_liq(liq)
+    liq_score = normalize_liq(f.get("liq", 0))
     wallet_score = normalize_wallets(f.get("wallet_count", 0))
     breakout_score = breakout_strength(f.get("breakout", 0))
-
-    smart_score = clamp(sf(f.get("smart", 0)), 0.0, 1.0) * 0.25
-    sniper_score = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.10)
+    smart_score = clamp(sf(f.get("smart", 0)), 0.0, 1.0) * 0.35
+    sniper_score = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
 
     if m == "sniper":
-        raw = breakout_score + smart_score + liq_score + wallet_score + sniper_score
+        raw = (
+            breakout_score * 1.5
+            + smart_score * 0.9
+            + liq_score * 1.0
+            + wallet_score * 0.8
+            + sniper_score
+        )
     elif m == "smart":
-        raw = smart_score * 1.4 + breakout_score * 0.6 + liq_score + wallet_score
+        raw = (
+            smart_score * 1.6
+            + breakout_score * 0.6
+            + liq_score * 0.9
+            + wallet_score * 1.0
+        )
     else:
-        raw = breakout_score * 1.3 + smart_score * 0.7 + liq_score + wallet_score
+        raw = (
+            breakout_score * 1.7
+            + smart_score * 0.5
+            + liq_score * 0.8
+            + wallet_score * 0.7
+        )
 
     return max(raw, 0.0), m
 
@@ -894,9 +915,13 @@ async def process_candidates(tokens):
         log(
             f"SCORE_DETAIL {m[:6]} "
             f"breakout={f.get('breakout', 0):.4f} "
+            f"bscore={breakout_strength(f.get('breakout', 0)):.4f} "
             f"smart={f.get('smart', 0):.4f} "
+            f"sscore={clamp(sf(f.get('smart', 0)), 0.0, 1.0) * 0.35:.4f} "
             f"liq={sf(f.get('liq', 0)):.2f} "
+            f"lscore={normalize_liq(f.get('liq', 0)):.4f} "
             f"wallets={f.get('wallet_count', 0)} "
+            f"wscore={normalize_wallets(f.get('wallet_count', 0)):.4f} "
             f"score={sc:.4f}"
         )
 
@@ -908,6 +933,11 @@ async def process_candidates(tokens):
         ranked.append(f)
 
     ranked.sort(key=lambda x: x["_score"], reverse=True)
+
+    top_preview = [f"{x['mint'][:6]}:{x['_score']:.4f}" for x in ranked[:5]]
+    if top_preview:
+        log(f"TOP_RANKED {' | '.join(top_preview)}")
+
     return ranked[:10]
 
 async def execute_portfolio(ranked):
@@ -1050,7 +1080,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V39 TRUE ALPHA DIFFERENTIATION START")
+    log("🚀 V39.1 TRUE ALPHA DIFFERENTIATION START")
 
     while engine.running:
         try:
