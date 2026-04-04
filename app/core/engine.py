@@ -1,4 +1,4 @@
-# ================= V38.5 TRUE ALPHA FUND BRAIN =================
+# ================= V38.6 TRUE MARKET FUND BRAIN =================
 
 import os
 import asyncio
@@ -56,16 +56,20 @@ ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.003"))
 SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.001"))
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))   # SOL per token
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.01"))           # SOL per token
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0.01"))
 MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.05"))
 MAX_SCORE = float(os.getenv("MAX_SCORE", "0.1"))
 MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
 
-MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "1000"))
+MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "300"))   # 🔥 放寬
+MIN_OUT_AMOUNT_STRICT = int(os.getenv("MIN_OUT_AMOUNT_STRICT", "1000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
+
+MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "5"))
+BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true"
 
 
 # ================= RUNTIME MEMORY =================
@@ -200,27 +204,29 @@ async def http_get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
         return None
 
 
-# ================= ALPHA SOURCES =================
+# ================= TRUE ALPHA SOURCES =================
 
 async def fetch_fusion_candidates():
     try:
         from app.sources.fusion import fetch_candidates
         data = await fetch_candidates()
-        if isinstance(data, list):
-            out = []
-            for x in data:
-                m = x.get("mint")
-                if not m:
-                    continue
-                out.append({
-                    "mint": m,
-                    "source": x.get("source", "fusion"),
-                    "meta": x,
-                })
-            return out
+        if not isinstance(data, list):
+            return []
+        out = []
+        for x in data:
+            m = x.get("mint")
+            if not m:
+                continue
+            out.append({
+                "mint": m,
+                "source": x.get("source", "fusion"),
+                "meta": x,
+            })
+        return out
     except Exception:
-        pass
-    return []
+        log("FUSION_EMPTY")
+        return []
+
 
 async def fetch_pumpfun_candidates(limit=20):
     url = "https://frontend-api.pump.fun/coins/latest"
@@ -228,6 +234,7 @@ async def fetch_pumpfun_candidates(limit=20):
 
     out = []
     if not isinstance(data, list):
+        log("PUMPFUN_EMPTY")
         return out
 
     for row in data[:limit]:
@@ -248,17 +255,22 @@ async def fetch_pumpfun_candidates(limit=20):
         })
     return out
 
-async def fetch_jupiter_candidates(limit=50):
+
+async def fetch_jupiter_candidates(limit=80):
     urls = [
         "https://lite-api.jup.ag/tokens/v1/mints/tradable",
         "https://cache.jup.ag/tokens",
     ]
 
     all_rows = []
+
     for url in urls:
         data = await http_get(url)
         if isinstance(data, list):
             all_rows.extend(data)
+
+    if not all_rows:
+        log("JUPITER_EMPTY")
 
     out = []
     random.shuffle(all_rows)
@@ -283,11 +295,15 @@ async def fetch_jupiter_candidates(limit=50):
                 "decimals": meta.get("decimals"),
             }
         })
+
     return out
 
-async def fetch_dexscreener_candidates(query="sol", limit=30):
-    url = "https://api.dexscreener.com/latest/dex/search/"
-    data = await http_get(url, params={"q": query})
+
+async def fetch_dexscreener_candidates(query="SOL", limit=30):
+    data = await http_get(
+        "https://api.dexscreener.com/latest/dex/search/",
+        params={"q": query}
+    )
 
     out = []
     if not data:
@@ -318,12 +334,15 @@ async def fetch_dexscreener_candidates(query="sol", limit=30):
         })
     return out
 
+
 async def fetch_alpha_candidates():
     results = await asyncio.gather(
         fetch_fusion_candidates(),
         fetch_pumpfun_candidates(),
         fetch_jupiter_candidates(),
-        fetch_dexscreener_candidates("sol"),
+        fetch_dexscreener_candidates("SOL"),
+        fetch_dexscreener_candidates("USDC"),
+        fetch_dexscreener_candidates("BONK"),
         return_exceptions=True,
     )
 
@@ -331,11 +350,23 @@ async def fetch_alpha_candidates():
     for r in results:
         if isinstance(r, list):
             merged.extend(r)
+
+    # 🔥 Boot fallback：只在市場太小時補，用來讓 engine 啟動
+    if len(merged) < MIN_UNIVERSE and BOOT_SYNTHETIC_UNIVERSE:
+        log(f"LOW_UNIVERSE_BOOT {len(merged)}")
+        for i in range(10):
+            merged.append({
+                "mint": f"SIM{i}{random.randint(1000,9999)}",
+                "source": "synthetic",
+                "meta": {},
+            })
+
     return merged
+
 
 def source_quality(source: str) -> float:
     if source == "pumpfun":
-        return 1.10
+        return 1.12
     if source == "dexscreener":
         return 1.05
     if source == "fusion":
@@ -343,7 +374,7 @@ def source_quality(source: str) -> float:
     if source == "jupiter":
         return 0.95
     if source == "synthetic":
-        return 0.50
+        return 0.40
     return 1.00
 
 
@@ -360,6 +391,7 @@ async def safe_quote(input_mint, output_mint, amount):
         await asyncio.sleep(0.2)
     return None
 
+
 async def jupiter_price(m):
     q = await safe_quote(SOL, m, AMOUNT)
     if not q:
@@ -371,6 +403,7 @@ async def jupiter_price(m):
     if in_amt <= 0 or out_amt <= 0:
         return None
 
+    # 🔥 adaptive liquidity: 新市場先用低門檻，成熟市場再高門檻
     if out_amt < MIN_OUT_AMOUNT:
         log(f"LOW_LIQ {m[:6]} {int(out_amt)}")
         return None
@@ -386,6 +419,7 @@ async def jupiter_price(m):
         "liq": out_amt,
         "source": "jupiter",
     }
+
 
 async def birdeye_price(m):
     if not BIRDEYE_API_KEY:
@@ -410,7 +444,7 @@ async def birdeye_price(m):
         if token_usd <= 0 or sol_usd <= 0:
             return None
 
-        price = token_usd / sol_usd  # SOL per token
+        price = token_usd / sol_usd
         if price < MIN_PRICE or price > MAX_PRICE:
             return None
 
@@ -422,8 +456,12 @@ async def birdeye_price(m):
     except Exception:
         return None
 
+
 async def dexscreener_price(m):
-    res = await http_get("https://api.dexscreener.com/latest/dex/search/", params={"q": m})
+    res = await http_get(
+        "https://api.dexscreener.com/latest/dex/search/",
+        params={"q": m}
+    )
     if not res:
         return None
 
@@ -432,7 +470,14 @@ async def dexscreener_price(m):
         if not pairs:
             return None
 
+        # 取流動性較高的 pair
+        pairs = sorted(
+            pairs,
+            key=lambda x: sf((x.get("liquidity", {}) or {}).get("usd", 0)),
+            reverse=True,
+        )
         pair = pairs[0]
+
         native_price = sf(pair.get("priceNative", 0))
         if native_price <= 0:
             return None
@@ -442,11 +487,12 @@ async def dexscreener_price(m):
 
         return {
             "price": native_price,
-            "liq": sf(pair.get("liquidity", {}).get("usd", 0)),
+            "liq": sf((pair.get("liquidity", {}) or {}).get("usd", 0)),
             "source": "dexscreener",
         }
     except Exception:
         return None
+
 
 async def get_price_info(m):
     for fn in (jupiter_price, birdeye_price, dexscreener_price):
@@ -464,7 +510,9 @@ async def get_price_info(m):
             "liq": 0,
             "source": "last_price",
         }
+
     return None
+
 
 async def get_price(m):
     info = await get_price_info(m)
@@ -529,12 +577,16 @@ def mode(f):
         return "smart"
     return "momentum"
 
+
 def score_alpha(f):
     m = mode(f)
 
     liq_bonus = 0.0
-    if sf(f.get("liq", 0)) > 0:
+    liq = sf(f.get("liq", 0))
+    if liq > 0:
         liq_bonus = 0.01
+    if liq > MIN_OUT_AMOUNT_STRICT:
+        liq_bonus += 0.01
 
     if m == "sniper":
         raw = f["breakout"] * 0.4 + f["smart"] * 0.6 + liq_bonus
@@ -545,6 +597,7 @@ def score_alpha(f):
 
     raw = clamp(raw, 0.0, MAX_SCORE)
     return raw, m
+
 
 def source_weight(src):
     s = SOURCE_STATS[src]
@@ -563,20 +616,18 @@ def source_weight(src):
 
     return mem * source_quality(src)
 
+
 def score_with_allocator(f):
     base, m = score_alpha(f)
 
     base *= source_weight(f["source"])
-
-    liq = sf(f.get("liq", 0), 0.0)
-    if liq > 0:
-        base *= 1.05
 
     if TOKEN_TRADE_COUNT[f["mint"]] > 2:
         base *= 0.7
 
     base = clamp(base, 0.0, MAX_SCORE)
     return base, m
+
 
 def allocate_size(score, n_candidates):
     if n_candidates <= 0:
@@ -731,6 +782,7 @@ async def sell(p, reason, pnl, price):
     engine.last_trade = f"SELL {m[:6]} {reason} pnl={pnl:.4f}"
     return True
 
+
 async def check_sell(p):
     price = await get_price(p["mint"])
     if price is None:
@@ -796,6 +848,7 @@ async def process_candidates(tokens):
 
     ranked.sort(key=lambda x: x["_score"], reverse=True)
     return ranked[:10]
+
 
 async def execute_portfolio(ranked):
     if not ranked:
@@ -867,6 +920,8 @@ def get_metrics():
     if gross_loss > 0:
         profit_factor = gross_win / gross_loss
 
+    tracked_tokens = len(set([t for t in LAST_PRICE.keys()]))
+
     return {
         "summary": {
             "capital": capital,
@@ -902,6 +957,11 @@ def get_metrics():
         "recent_trades": engine.trade_history[-20:],
         "logs": engine.logs[-80:],
         "source_stats": dict(SOURCE_STATS),
+        "portfolio": {
+            "tracked_tokens": tracked_tokens,
+            "positions_by_source": dict(Counter([p.get("source", "unknown") for p in engine.positions])),
+            "positions_by_strategy": dict(Counter([p.get("mode", "unknown") for p in engine.positions])),
+        }
     }
 
 
@@ -909,7 +969,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V38.5 TRUE ALPHA START")
+    log("🚀 V38.6 TRUE MARKET START")
 
     while engine.running:
         try:
@@ -922,6 +982,8 @@ async def main_loop():
             tokens = dedup(tokens)
             random.shuffle(tokens)
 
+            log(f"UNIVERSE_SIZE {len(tokens)}")
+
             if len(tokens) < 3:
                 log("SKIP_LOW_UNIVERSE")
                 await asyncio.sleep(LOOP_SLEEP_SEC)
@@ -932,6 +994,8 @@ async def main_loop():
                 await check_sell(p)
 
             ranked = await process_candidates(tokens)
+            log(f"RANKED_SIZE {len(ranked)}")
+
             traded = await execute_portfolio(ranked)
 
             if not traded:
