@@ -1,5 +1,4 @@
-# ================= V37.5 FULL FUSION PRESERVE VERSION =================
-# 保留功能完整版：scanner + alpha + risk + paper/real execution + sell engine
+# ================= V37.6 FULL FUSION TRUE EXECUTION =================
 
 import os
 import asyncio
@@ -9,8 +8,6 @@ from collections import defaultdict
 
 from app.state import engine
 from app.alpha.adaptive_filter import adaptive_filter
-
-# ================= OPTIONAL IMPORTS =================
 
 try:
     from app.sources.fusion import fetch_candidates
@@ -24,19 +21,18 @@ except Exception:
     async def update_token_wallets(mint):
         return []
 
-# 你自己的真實執行模組
-# 介面預期：
-#   await execute_swap(input_mint, output_mint, amount_atomic)
-# 回傳：
-#   {"paper": True}
-#   or {"result": "<tx_sig>"}
-#   or {"signature": "<tx_sig>"}
-#   or {"error": "..."}
 try:
     from app.execution.jupiter_exec import execute_swap
 except Exception:
     async def execute_swap(input_mint, output_mint, amount_atomic):
         return {"paper": True}
+
+try:
+    from app.data.market import get_quote
+except Exception:
+    async def get_quote(input_mint, output_mint, amount):
+        return None
+
 
 # ================= CONFIG =================
 
@@ -45,33 +41,34 @@ REAL_TRADING = os.getenv("REAL_TRADING", "false").lower() == "true"
 SOL = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 1_000_000_000
 
-# quote 用的基礎量
 AMOUNT = 1_000_000
 
-MAX_POSITIONS = 3
-MAX_EXPOSURE = 0.50
-MAX_POSITION_SIZE = 0.25
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.50"))
+MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.25"))
 
-TAKE_PROFIT = 0.05
-STOP_LOSS = -0.02
-TRAILING_GAP = 0.012
-MAX_HOLD_SEC = 60
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))
+TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.012"))
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "60"))
 
-TOKEN_COOLDOWN = 10
-LOOP_SLEEP_SEC = 2
-FORCE_TRADE_AFTER = 15
+TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "10"))
+LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
+FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
 
-ENTRY_THRESHOLD = 0.003
-SNIPER_FALLBACK_THRESHOLD = 0.001
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.003"))
+SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.001"))
 
-MIN_ORDER_SOL = 0.01  # 真單最小額，避免 0 或過小
-MAX_FAKE_PNL_ABS = 0.50  # 超過視為價格單位異常，直接跳過
+MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
+MAX_FAKE_PNL_ABS = float(os.getenv("MAX_FAKE_PNL_ABS", "0.50"))
+
 
 # ================= RUNTIME MEMORY =================
 
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 SOURCE_STATS = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
+
 
 # ================= ENGINE INIT =================
 
@@ -103,6 +100,7 @@ def ensure_engine():
         "forced_trades": 0,
     })
 
+
 # ================= LOG =================
 
 def log(msg: str):
@@ -110,7 +108,8 @@ def log(msg: str):
     engine.logs.append(str(msg))
     engine.logs = engine.logs[-500:]
 
-# ================= SAFE HELPERS =================
+
+# ================= HELPERS =================
 
 def sf(x, default=0.0):
     try:
@@ -136,16 +135,8 @@ def push_trade_history(row: dict):
     engine.trade_history = engine.trade_history[-1000:]
     engine.stats["trades"] = len(engine.trade_history)
 
-# ================= PRICE =================
-# 這裡保守處理：你應該只用「同一單位」來源
-# 目前假設 get_price 回傳同一尺度價格
-# 若你已有更穩定 price adapter，可直接替換這一段
 
-try:
-    from app.data.market import get_quote
-except Exception:
-    async def get_quote(input_mint, output_mint, amount):
-        return None
+# ================= PRICE =================
 
 async def safe_quote(input_mint, output_mint, amount):
     for _ in range(3):
@@ -159,11 +150,6 @@ async def safe_quote(input_mint, output_mint, amount):
     return None
 
 async def get_price(mint):
-    """
-    回傳統一單位價格。
-    這裡延續你原來的模式：SOL -> mint quote 導出一個相對價格。
-    若你有更嚴謹的 pricing adapter，建議直接改這個函式，不要動其他邏輯。
-    """
     q = await safe_quote(SOL, mint, AMOUNT)
     if not q:
         log(f"NO_QUOTE {mint[:6]}")
@@ -180,6 +166,7 @@ async def get_price(mint):
         return None
 
     return price
+
 
 # ================= FEATURES =================
 
@@ -202,7 +189,6 @@ async def features(token_row):
     else:
         breakout = 0.005
 
-    # 避免永遠 0
     if breakout == 0:
         breakout = random.uniform(0.001, 0.003)
 
@@ -210,7 +196,6 @@ async def features(token_row):
 
     smart_money = min(len(wallets) / 5.0, 1.0)
 
-    # 沒有更穩定流動性來源前，用保守 fallback
     liquidity = sf(token_row.get("liquidity", 0.0))
     if liquidity <= 0:
         liquidity = random.uniform(0.001, 0.01)
@@ -225,6 +210,7 @@ async def features(token_row):
         "wallet_count": len(wallets),
         "is_new": prev is None,
     }
+
 
 # ================= SOURCE MEMORY =================
 
@@ -241,6 +227,7 @@ def source_weight(src: str):
     if winrate < 0.3:
         return 0.7
     return 1.0
+
 
 # ================= MODE / SCORE =================
 
@@ -275,6 +262,7 @@ def score_alpha(f):
 
     return base * source_weight(f["source"]), mode
 
+
 # ================= POSITION SIZE =================
 
 def size(score):
@@ -286,7 +274,8 @@ def size(score):
     base = min(base, 0.20)
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
-# ================= BUY EXECUTION =================
+
+# ================= BUY =================
 
 async def buy_position(mint, f, mode, score, s, forced=False):
     order_sol = max(s, MIN_ORDER_SOL)
@@ -319,6 +308,13 @@ async def buy_position(mint, f, mode, score, s, forced=False):
     elif isinstance(res.get("signature"), str):
         tx_sig = res["signature"]
 
+    quote_meta = res.get("quote", {}) if isinstance(res, dict) else {}
+    token_amount_atomic = 0
+    try:
+        token_amount_atomic = int(quote_meta.get("outAmount") or 0)
+    except Exception:
+        token_amount_atomic = 0
+
     engine.capital -= s
     update_peak_capital()
 
@@ -328,6 +324,7 @@ async def buy_position(mint, f, mode, score, s, forced=False):
         "size": s,
         "order_sol": order_sol,
         "amount_atomic": order_amount_atomic,
+        "token_amount_atomic": token_amount_atomic,
         "time": now_ts(),
         "source": f["source"],
         "mode": mode,
@@ -341,6 +338,7 @@ async def buy_position(mint, f, mode, score, s, forced=False):
 
     engine.positions.append(pos)
     LAST_TRADE[mint] = now_ts()
+
     engine.stats["executed"] += 1
     if forced:
         engine.stats["forced_trades"] += 1
@@ -358,6 +356,7 @@ async def buy_position(mint, f, mode, score, s, forced=False):
         f"{'PAPER' if is_paper else f'tx={tx_sig}'}"
     )
     return True
+
 
 # ================= TRADE =================
 
@@ -417,25 +416,86 @@ async def trade(token_row, forced=False):
 
     return await buy_position(mint, f, mode, score, s, forced=forced)
 
-# ================= SELL EXECUTION =================
 
-async def close_position(pos, reason, pnl, price_now):
+# ================= SELL HELPERS =================
+
+def should_sell_reason(pos, price_now):
+    mint = pos["mint"]
+    entry = sf(pos.get("entry", 0))
+    if entry <= 0:
+        return None, None
+
+    pos["high_water"] = max(sf(pos.get("high_water", entry)), price_now)
+
+    pnl = (price_now - entry) / entry
+
+    if abs(pnl) > MAX_FAKE_PNL_ABS:
+        log(f"INVALID_PNL {mint[:6]} pnl={pnl:.4f}")
+        return None, None
+
+    age = now_ts() - sf(pos.get("time", now_ts()))
+    trailing_trigger = (
+        price_now <= pos["high_water"] * (1 - TRAILING_GAP)
+        and pos["high_water"] > entry
+    )
+
+    reason = None
+    if pnl >= TAKE_PROFIT:
+        reason = "TP"
+    elif pnl <= STOP_LOSS:
+        reason = "SL"
+    elif trailing_trigger:
+        reason = "TRAIL"
+    elif age >= MAX_HOLD_SEC:
+        reason = "TIME"
+
+    return reason, pnl
+
+async def execute_sell_position(pos):
     mint = pos["mint"]
 
-    # 這裡示意賣出 amount 使用原 order_sol
-    # 真實情況應改成你實際持有 token amount
-    # 若你的 execute_swap 支援 token exact-in，請改成實際 token 數量
     if pos.get("paper"):
-        res = {"paper": True}
-    else:
-        # 保守做法：這裡先不猜 token amount，避免亂賣
-        # 你若已有真 token balance / amount_in，可替換這段
-        res = {"paper": True}
+        return {"paper": True}
 
-    if res.get("error"):
-        log(f"SELL_FAIL {mint[:6]} {res.get('error')}")
+    token_amount_atomic = int(pos.get("token_amount_atomic") or 0)
+    if token_amount_atomic <= 0:
+        return {"error": "NO_TOKEN_AMOUNT"}
+
+    return await execute_swap(mint, SOL, token_amount_atomic)
+
+
+# ================= SELL =================
+
+async def check_sell(pos):
+    mint = pos["mint"]
+
+    price_now = await get_price(mint)
+    if price_now is None:
+        return False
+
+    reason, pnl = should_sell_reason(pos, price_now)
+    if not reason:
+        return False
+
+    sell_res = await execute_sell_position(pos)
+
+    if not sell_res:
+        log(f"SELL_EMPTY {mint[:6]}")
         engine.stats["errors"] += 1
         return False
+
+    if sell_res.get("error"):
+        log(f"SELL_FAIL {mint[:6]} {sell_res.get('error')}")
+        engine.stats["errors"] += 1
+        return False
+
+    is_paper = bool(sell_res.get("paper"))
+    tx_sig = None
+
+    if isinstance(sell_res.get("result"), str):
+        tx_sig = sell_res["result"]
+    elif isinstance(sell_res.get("signature"), str):
+        tx_sig = sell_res["signature"]
 
     if pos in engine.positions:
         engine.positions.remove(pos)
@@ -456,17 +516,19 @@ async def close_position(pos, reason, pnl, price_now):
 
     row = {
         "mint": mint,
-        "entry": pos["entry"],
+        "entry": pos.get("entry"),
         "exit": price_now,
-        "size": pos["size"],
+        "size": pos.get("size"),
         "pnl": pnl,
         "reason": reason,
         "mode": pos.get("mode"),
         "source": src,
         "time_open": pos.get("time"),
         "time_close": now_ts(),
-        "paper": bool(pos.get("paper", False)),
+        "paper": is_paper,
         "tx_buy": pos.get("tx_buy"),
+        "tx_sell": tx_sig,
+        "token_amount_atomic": pos.get("token_amount_atomic", 0),
     }
     push_trade_history(row)
     update_open_stats()
@@ -474,52 +536,14 @@ async def close_position(pos, reason, pnl, price_now):
     engine.last_trade = (
         f"SELL {mint[:6]} reason={reason} pnl={pnl:.4f} exit={price_now:.8f}"
     )
-    log(f"SELL {mint[:6]} {reason} pnl={pnl:.4f}")
+
+    log(
+        f"SELL {mint[:6]} {reason} pnl={pnl:.4f} "
+        f"{'PAPER' if is_paper else f'tx={tx_sig}'}"
+    )
 
     return True
 
-# ================= CHECK SELL =================
-
-async def check_sell(pos):
-    mint = pos["mint"]
-    price_now = await get_price(mint)
-    if price_now is None:
-        return False
-
-    entry = sf(pos["entry"])
-    if entry <= 0:
-        return False
-
-    # 更新 high water
-    pos["high_water"] = max(sf(pos.get("high_water", entry)), price_now)
-
-    pnl = (price_now - entry) / entry
-
-    # 防止單位錯亂造成假暴利
-    if abs(pnl) > MAX_FAKE_PNL_ABS:
-        log(f"INVALID_PNL {mint[:6]} pnl={pnl:.4f}")
-        return False
-
-    age = now_ts() - sf(pos.get("time", now_ts()))
-    trailing_trigger = (
-        price_now <= pos["high_water"] * (1 - TRAILING_GAP)
-        and pos["high_water"] > entry
-    )
-
-    reason = None
-    if pnl >= TAKE_PROFIT:
-        reason = "TP"
-    elif pnl <= STOP_LOSS:
-        reason = "SL"
-    elif trailing_trigger:
-        reason = "TRAIL"
-    elif age >= MAX_HOLD_SEC:
-        reason = "TIME"
-
-    if not reason:
-        return False
-
-    return await close_position(pos, reason, pnl, price_now)
 
 # ================= METRICS =================
 
@@ -545,6 +569,7 @@ def get_metrics():
             "return_pct": return_pct,
             "drawdown": drawdown,
             "running": bool(engine.running),
+            "mode": "REAL" if REAL_TRADING else "PAPER",
         },
         "performance": {
             "trades": trades,
@@ -568,11 +593,12 @@ def get_metrics():
         "source_stats": dict(SOURCE_STATS),
     }
 
+
 # ================= LOOP =================
 
 async def main_loop():
     ensure_engine()
-    log(f"🚀 V37.5 FULL FUSION START {'REAL' if REAL_TRADING else 'PAPER'}")
+    log(f"🚀 V37.6 FULL FUSION START {'REAL' if REAL_TRADING else 'PAPER'}")
 
     while engine.running:
         try:
