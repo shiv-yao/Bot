@@ -1,4 +1,4 @@
-# ================= V39.2 TRUE ALPHA FULL MARKET (KEEP ALL FEATURES) =================
+# ================= V40 TRUE ALPHA BOOST FULL MARKET =================
 
 import os
 import asyncio
@@ -39,22 +39,24 @@ SOL = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 1_000_000_000
 AMOUNT = int(os.getenv("AMOUNT", "1000000"))
 
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.50"))
-MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.15"))
+MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.05"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.02"))
-TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.012"))
-MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "120"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.01"))
+TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.008"))
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "90"))
 
 TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "10"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
 FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.02"))
-SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.005"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.45"))
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.60"))
+SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "false").lower() == "true"
+
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))
@@ -62,7 +64,7 @@ MAX_PRICE_JUPITER = float(os.getenv("MAX_PRICE_JUPITER", "0.1"))
 MAX_PRICE_FALLBACK = float(os.getenv("MAX_PRICE_FALLBACK", "10"))
 
 MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.20"))
-MAX_SCORE = float(os.getenv("MAX_SCORE", "1.0"))
+MAX_SCORE = float(os.getenv("MAX_SCORE", "1.5"))
 MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
 
@@ -77,10 +79,7 @@ BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() =
 ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.005"))
 ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
 
-SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "true").lower() == "true"
-FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.10"))
-
-TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "2"))
+TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "1"))
 MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "25"))
 
 
@@ -88,6 +87,7 @@ MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "25"))
 
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
+LAST_MOMENTUM = {}
 
 TOKEN_TRADE_COUNT = defaultdict(int)
 BLACKLIST = {}
@@ -135,7 +135,7 @@ def ensure_engine():
 def log(x):
     print(x)
     engine.logs.append(str(x))
-    engine.logs = engine.logs[-500:]
+    engine.logs = engine.logs[-600:]
 
 
 # ================= HELPERS =================
@@ -205,22 +205,18 @@ def limit_token_frequency(tokens, max_per_token=2):
 
 def current_dynamic_threshold():
     base = ENTRY_THRESHOLD
-
     if engine.no_trade_cycles > 30:
         base *= 0.5
     elif engine.no_trade_cycles > 15:
         base *= 0.7
-
     if engine.stats.get("executed", 0) == 0:
-        base *= 0.8
-
+        base *= 0.9
     return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
 
 def normalize_liq(liq: float) -> float:
     liq = max(sf(liq), 0.0)
     if liq <= 0:
         return 0.0
-
     x = math.log10(liq + 1.0)
     score = (x - 2.0) / 7.0
     score = clamp(score, 0.0, 1.0)
@@ -233,18 +229,24 @@ def normalize_wallets(n: int) -> float:
     if n == 1:
         return 0.02
     if n <= 3:
-        return 0.06
+        return 0.08
     if n <= 5:
-        return 0.12
+        return 0.15
     if n <= 10:
-        return 0.20
-    return 0.30
+        return 0.24
+    return 0.32
 
 def breakout_strength(b: float) -> float:
     b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if b <= 0:
         return 0.0
     return min(b / 0.05, 1.0) * 0.35
+
+def momentum_strength(m: float) -> float:
+    m = clamp(sf(m), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+    if m <= 0:
+        return 0.0
+    return min(m / 0.05, 1.0) * 0.30
 
 
 # ================= HTTP =================
@@ -436,7 +438,7 @@ async def safe_quote(input_mint, output_mint, amount):
                 return q
         except Exception:
             pass
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
     return None
 
 async def jupiter_price(m):
@@ -490,7 +492,6 @@ async def birdeye_price(m):
             return None
 
         price = token_usd / sol_usd
-
         if price <= 0 or price > MAX_PRICE_FALLBACK:
             return None
 
@@ -584,13 +585,21 @@ async def features(t):
     if prev and prev > 0:
         breakout = (price - prev) / prev
     else:
-        breakout = random.uniform(0.001, 0.03)
+        breakout = random.uniform(0.001, 0.02)
 
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
 
-    if breakout == 0:
-        breakout = random.uniform(0.001, 0.003)
+    momentum = 0.0
+    try:
+        await asyncio.sleep(0.4)
+        p2 = await get_price(m)
+        if price and p2:
+            momentum = (p2 - price) / price
+    except Exception:
+        momentum = 0.0
 
+    momentum = clamp(momentum, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+    LAST_MOMENTUM[m] = momentum
     LAST_PRICE[m] = price
 
     try:
@@ -598,7 +607,8 @@ async def features(t):
     except Exception:
         wallets = []
 
-    smart = min(len(wallets) / 5.0, 1.0)
+    wallet_count = len(wallets)
+    smart = min(wallet_count / 3.0, 1.0)
 
     sniper_boost = 0.0
     if t.get("source") == "pumpfun":
@@ -610,10 +620,11 @@ async def features(t):
         "mint": m,
         "price": price,
         "breakout": breakout,
+        "momentum": momentum,
         "smart": smart,
         "sniper_boost": sniper_boost,
         "is_new": prev is None,
-        "wallet_count": len(wallets),
+        "wallet_count": wallet_count,
         "source": t.get("source", "unknown"),
         "meta": t.get("meta", {}),
         "price_source": pinfo.get("source", "unknown"),
@@ -631,38 +642,39 @@ def mode(f):
     return "momentum"
 
 def score_alpha(f):
-    m = mode(f)
+    breakout = f.get("breakout", 0)
+    momentum = f.get("momentum", 0)
+    smart = f.get("smart", 0)
+    liq = f.get("liq", 0)
 
-    liq_score = normalize_liq(f.get("liq", 0))
-    wallet_score = normalize_wallets(f.get("wallet_count", 0))
-    breakout_score = breakout_strength(f.get("breakout", 0))
-    smart_score = clamp(sf(f.get("smart", 0)), 0.0, 1.0) * 0.35
-    sniper_score = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
+    bscore = breakout_strength(breakout)
+    mscore = momentum_strength(momentum)
+    sscore = clamp(sf(smart), 0.0, 1.0) * 0.28
+    lscore = min(liq / 1_000_000, 1.0) * 0.12
+    wscore = 0.05 if f.get("wallet_count", 0) >= 2 else 0.0
+    nscore = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
 
-    if m == "sniper":
-        raw = (
-            breakout_score * 1.5
-            + smart_score * 0.9
-            + liq_score * 1.0
-            + wallet_score * 0.8
-            + sniper_score
-        )
-    elif m == "smart":
-        raw = (
-            smart_score * 1.6
-            + breakout_score * 0.6
-            + liq_score * 0.9
-            + wallet_score * 1.0
-        )
-    else:
-        raw = (
-            breakout_score * 1.7
-            + smart_score * 0.5
-            + liq_score * 0.8
-            + wallet_score * 0.7
-        )
+    # fake breakout filter: breakout 有但 momentum 不跟
+    if breakout > 0.01 and momentum <= 0:
+        bscore *= 0.35
 
-    return max(raw, 0.0), m
+    score = (
+        bscore * 0.35 +
+        mscore * 0.25 +
+        sscore * 0.20 +
+        lscore * 0.15 +
+        wscore +
+        nscore * 0.05
+    )
+
+    return clamp(score, 0.0, MAX_SCORE), {
+        "bscore": bscore,
+        "mscore": mscore,
+        "sscore": sscore,
+        "lscore": lscore,
+        "wscore": wscore,
+        "nscore": nscore,
+    }
 
 def source_weight(src):
     s = SOURCE_STATS[src]
@@ -672,20 +684,20 @@ def source_weight(src):
     if total >= 5:
         winrate = s["wins"] / total if total else 0.0
         if winrate > 0.6:
-            mem = 1.2
+            mem = 1.15
         elif winrate < 0.3:
-            mem = 0.8
+            mem = 0.85
 
     return mem * source_quality(src)
 
 def score_with_allocator(f):
-    base, m = score_alpha(f)
+    base, detail = score_alpha(f)
     base *= source_weight(f["source"])
 
     if TOKEN_TRADE_COUNT[f["mint"]] > 2:
         base *= 0.7
 
-    return max(base, 0.0), m
+    return max(base, 0.0), mode(f), detail
 
 def allocate_size(score, n_candidates):
     if n_candidates <= 0:
@@ -693,12 +705,12 @@ def allocate_size(score, n_candidates):
 
     bucket = engine.capital / max(n_candidates * 2, 2)
 
-    if score > 0.60:
-        bucket *= 1.5
-    elif score > 0.35:
-        bucket *= 1.2
-    elif score < 0.10:
-        bucket *= 0.6
+    if score > 0.75:
+        bucket *= 1.20
+    elif score > 0.60:
+        bucket *= 1.00
+    else:
+        bucket *= 0.70
 
     bucket = min(bucket, 0.05)
     return min(bucket, engine.capital * MAX_POSITION_SIZE)
@@ -743,6 +755,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "strategy": mtype,
         "forced": forced,
         "breakout": f.get("breakout"),
+        "momentum": f.get("momentum"),
         "smart_money": f.get("smart"),
         "liquidity": f.get("liq"),
         "wallet_count": f.get("wallet_count"),
@@ -778,9 +791,7 @@ async def buy(m, f, position_size, mtype, forced=False):
 
     update_open_stats()
 
-    engine.last_signal = (
-        f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f} entry={f['price']:.10f}"
-    )
+    engine.last_signal = f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f}"
     engine.last_trade = engine.last_signal
 
     log(f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f}")
@@ -909,18 +920,20 @@ async def process_candidates(tokens):
         f["source"] = t.get("source", f.get("source", "unknown"))
         f["meta"] = t.get("meta", {})
 
-        sc, mtype = score_with_allocator(f)
+        sc, mtype, detail = score_with_allocator(f)
 
         log(
             f"SCORE_DETAIL {m[:6]} "
             f"breakout={f.get('breakout', 0):.4f} "
-            f"bscore={breakout_strength(f.get('breakout', 0)):.4f} "
+            f"momentum={f.get('momentum', 0):.4f} "
+            f"bscore={detail['bscore']:.4f} "
+            f"mscore={detail['mscore']:.4f} "
             f"smart={f.get('smart', 0):.4f} "
-            f"sscore={clamp(sf(f.get('smart', 0)), 0.0, 1.0) * 0.35:.4f} "
+            f"sscore={detail['sscore']:.4f} "
             f"liq={sf(f.get('liq', 0)):.2f} "
-            f"lscore={normalize_liq(f.get('liq', 0)):.4f} "
+            f"lscore={detail['lscore']:.4f} "
             f"wallets={f.get('wallet_count', 0)} "
-            f"wscore={normalize_wallets(f.get('wallet_count', 0)):.4f} "
+            f"wscore={detail['wscore']:.4f} "
             f"score={sc:.4f}"
         )
 
@@ -1079,7 +1092,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V39.2 TRUE ALPHA FULL MARKET START")
+    log("🚀 V40 TRUE ALPHA BOOST START")
 
     while engine.running:
         try:
