@@ -1,4 +1,4 @@
-# ================= V38.6 TRUE MARKET FUND BRAIN =================
+# ================= V38.7 TRUE TRADING FUND BRAIN =================
 
 import os
 import asyncio
@@ -57,19 +57,24 @@ SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.001"
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.01"))
+MAX_PRICE_JUPITER = float(os.getenv("MAX_PRICE_JUPITER", "0.1"))
+MAX_PRICE_FALLBACK = float(os.getenv("MAX_PRICE_FALLBACK", "10"))
+
 MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.05"))
 MAX_SCORE = float(os.getenv("MAX_SCORE", "0.1"))
 MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
 
-MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "300"))   # 🔥 放寬
+MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "300"))
 MIN_OUT_AMOUNT_STRICT = int(os.getenv("MIN_OUT_AMOUNT_STRICT", "1000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
 MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "5"))
 BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true"
+
+ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.001"))
+ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.005"))
 
 
 # ================= RUNTIME MEMORY =================
@@ -191,6 +196,21 @@ def limit_token_frequency(tokens, max_per_token=2):
         out.append(t)
     return out
 
+def current_dynamic_threshold():
+    """
+    市場越冷、越久沒下單，門檻越低
+    """
+    base = ENTRY_THRESHOLD
+    if engine.no_trade_cycles > 20:
+        base *= 0.5
+    elif engine.no_trade_cycles > 10:
+        base *= 0.7
+
+    if engine.stats.get("executed", 0) == 0:
+        base *= 0.7
+
+    return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
+
 
 # ================= HTTP =================
 
@@ -211,6 +231,7 @@ async def fetch_fusion_candidates():
         from app.sources.fusion import fetch_candidates
         data = await fetch_candidates()
         if not isinstance(data, list):
+            log("FUSION: 0")
             return []
         out = []
         for x in data:
@@ -222,11 +243,11 @@ async def fetch_fusion_candidates():
                 "source": x.get("source", "fusion"),
                 "meta": x,
             })
+        log(f"FUSION: {len(out)}")
         return out
     except Exception:
-        log("FUSION_EMPTY")
+        log("FUSION: 0")
         return []
-
 
 async def fetch_pumpfun_candidates(limit=20):
     url = "https://frontend-api.pump.fun/coins/latest"
@@ -241,7 +262,6 @@ async def fetch_pumpfun_candidates(limit=20):
         mint = row.get("mint")
         if not mint:
             continue
-
         out.append({
             "mint": mint,
             "source": "pumpfun",
@@ -255,7 +275,6 @@ async def fetch_pumpfun_candidates(limit=20):
         })
     return out
 
-
 async def fetch_jupiter_candidates(limit=80):
     urls = [
         "https://lite-api.jup.ag/tokens/v1/mints/tradable",
@@ -263,7 +282,6 @@ async def fetch_jupiter_candidates(limit=80):
     ]
 
     all_rows = []
-
     for url in urls:
         data = await http_get(url)
         if isinstance(data, list):
@@ -295,9 +313,7 @@ async def fetch_jupiter_candidates(limit=80):
                 "decimals": meta.get("decimals"),
             }
         })
-
     return out
-
 
 async def fetch_dexscreener_candidates(query="SOL", limit=30):
     data = await http_get(
@@ -334,7 +350,6 @@ async def fetch_dexscreener_candidates(query="SOL", limit=30):
         })
     return out
 
-
 async def fetch_alpha_candidates():
     results = await asyncio.gather(
         fetch_fusion_candidates(),
@@ -351,7 +366,6 @@ async def fetch_alpha_candidates():
         if isinstance(r, list):
             merged.extend(r)
 
-    # 🔥 Boot fallback：只在市場太小時補，用來讓 engine 啟動
     if len(merged) < MIN_UNIVERSE and BOOT_SYNTHETIC_UNIVERSE:
         log(f"LOW_UNIVERSE_BOOT {len(merged)}")
         for i in range(10):
@@ -363,18 +377,17 @@ async def fetch_alpha_candidates():
 
     return merged
 
-
 def source_quality(source: str) -> float:
     if source == "pumpfun":
-        return 1.12
+        return 1.15
     if source == "dexscreener":
         return 1.05
     if source == "fusion":
-        return 1.00
+        return 1.05
     if source == "jupiter":
         return 0.95
     if source == "synthetic":
-        return 0.40
+        return 0.30
     return 1.00
 
 
@@ -391,7 +404,6 @@ async def safe_quote(input_mint, output_mint, amount):
         await asyncio.sleep(0.2)
     return None
 
-
 async def jupiter_price(m):
     q = await safe_quote(SOL, m, AMOUNT)
     if not q:
@@ -403,14 +415,14 @@ async def jupiter_price(m):
     if in_amt <= 0 or out_amt <= 0:
         return None
 
-    # 🔥 adaptive liquidity: 新市場先用低門檻，成熟市場再高門檻
     if out_amt < MIN_OUT_AMOUNT:
         log(f"LOW_LIQ {m[:6]} {int(out_amt)}")
         return None
 
     price = in_amt / out_amt  # SOL per token
 
-    if price < MIN_PRICE or price > MAX_PRICE:
+    # Jupiter 主價格最可信，用較嚴格範圍
+    if price <= 0 or price > MAX_PRICE_JUPITER:
         log(f"BAD_PRICE {m[:6]} {price:.10f}")
         return None
 
@@ -419,7 +431,6 @@ async def jupiter_price(m):
         "liq": out_amt,
         "source": "jupiter",
     }
-
 
 async def birdeye_price(m):
     if not BIRDEYE_API_KEY:
@@ -445,7 +456,9 @@ async def birdeye_price(m):
             return None
 
         price = token_usd / sol_usd
-        if price < MIN_PRICE or price > MAX_PRICE:
+
+        # fallback source 放寬，但仍過濾極端值
+        if price <= 0 or price > MAX_PRICE_FALLBACK:
             return None
 
         return {
@@ -455,7 +468,6 @@ async def birdeye_price(m):
         }
     except Exception:
         return None
-
 
 async def dexscreener_price(m):
     res = await http_get(
@@ -470,7 +482,6 @@ async def dexscreener_price(m):
         if not pairs:
             return None
 
-        # 取流動性較高的 pair
         pairs = sorted(
             pairs,
             key=lambda x: sf((x.get("liquidity", {}) or {}).get("usd", 0)),
@@ -479,11 +490,16 @@ async def dexscreener_price(m):
         pair = pairs[0]
 
         native_price = sf(pair.get("priceNative", 0))
-        if native_price <= 0:
+
+        # 防 DEX 單位錯亂
+        if native_price > 10:
+            log(f"DEX_SKIP_BAD_UNIT {m[:6]} {native_price}")
             return None
 
-        if native_price < MIN_PRICE or native_price > MAX_PRICE:
+        if native_price <= 0 or native_price > MAX_PRICE_FALLBACK:
             return None
+
+        log(f"DEX PRICE: {m[:6]}")
 
         return {
             "price": native_price,
@@ -492,7 +508,6 @@ async def dexscreener_price(m):
         }
     except Exception:
         return None
-
 
 async def get_price_info(m):
     for fn in (jupiter_price, birdeye_price, dexscreener_price):
@@ -512,7 +527,6 @@ async def get_price_info(m):
         }
 
     return None
-
 
 async def get_price(m):
     info = await get_price_info(m)
@@ -554,11 +568,19 @@ async def features(t):
 
     smart = min(len(wallets) / 5.0, 1.0)
 
+    # 新幣 boost
+    sniper_boost = 0.0
+    if t.get("source") == "pumpfun":
+        sniper_boost += 0.02
+    if pinfo.get("source") == "jupiter":
+        sniper_boost += 0.01
+
     return {
         "mint": m,
         "price": price,
         "breakout": breakout,
         "smart": smart,
+        "sniper_boost": sniper_boost,
         "is_new": prev is None,
         "wallet_count": len(wallets),
         "source": t.get("source", "unknown"),
@@ -577,7 +599,6 @@ def mode(f):
         return "smart"
     return "momentum"
 
-
 def score_alpha(f):
     m = mode(f)
 
@@ -589,7 +610,7 @@ def score_alpha(f):
         liq_bonus += 0.01
 
     if m == "sniper":
-        raw = f["breakout"] * 0.4 + f["smart"] * 0.6 + liq_bonus
+        raw = f["breakout"] * 0.35 + f["smart"] * 0.45 + liq_bonus + f.get("sniper_boost", 0.0)
     elif m == "smart":
         raw = f["smart"] * 0.7 + f["breakout"] * 0.3 + liq_bonus
     else:
@@ -597,7 +618,6 @@ def score_alpha(f):
 
     raw = clamp(raw, 0.0, MAX_SCORE)
     return raw, m
-
 
 def source_weight(src):
     s = SOURCE_STATS[src]
@@ -616,7 +636,6 @@ def source_weight(src):
 
     return mem * source_quality(src)
 
-
 def score_with_allocator(f):
     base, m = score_alpha(f)
 
@@ -627,7 +646,6 @@ def score_with_allocator(f):
 
     base = clamp(base, 0.0, MAX_SCORE)
     return base, m
-
 
 def allocate_size(score, n_candidates):
     if n_candidates <= 0:
@@ -741,7 +759,6 @@ async def sell(p, reason, pnl, price):
         engine.positions.remove(p)
 
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
-
     realized = p["size"] * (1 + pnl)
     engine.capital += realized
 
@@ -775,13 +792,10 @@ async def sell(p, reason, pnl, price):
     })
 
     update_open_stats()
-
     log(f"SELL {m[:6]} {reason} pnl={pnl:.4f}")
     BLACKLIST[m] = now()
-
     engine.last_trade = f"SELL {m[:6]} {reason} pnl={pnl:.4f}"
     return True
-
 
 async def check_sell(p):
     price = await get_price(p["mint"])
@@ -817,6 +831,7 @@ async def check_sell(p):
 
 async def process_candidates(tokens):
     ranked = []
+    dyn_threshold = current_dynamic_threshold()
 
     for t in tokens:
         m = t.get("mint")
@@ -838,17 +853,18 @@ async def process_candidates(tokens):
 
         sc, mtype = score_with_allocator(f)
 
-        if sc < ENTRY_THRESHOLD:
+        log(f"SCORE {m[:6]} {sc:.4f}")
+
+        # V38.7 動態門檻
+        if sc < dyn_threshold:
             continue
 
         f["_score"] = sc
         f["_mode"] = mtype
-
         ranked.append(f)
 
     ranked.sort(key=lambda x: x["_score"], reverse=True)
     return ranked[:10]
-
 
 async def execute_portfolio(ranked):
     if not ranked:
@@ -872,6 +888,8 @@ async def execute_portfolio(ranked):
             continue
 
         ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+
+        # V38.7：長時間沒單時，放寬 filter
         if not ok and engine.no_trade_cycles <= 5:
             continue
 
@@ -920,7 +938,7 @@ def get_metrics():
     if gross_loss > 0:
         profit_factor = gross_win / gross_loss
 
-    tracked_tokens = len(set([t for t in LAST_PRICE.keys()]))
+    tracked_tokens = len(set(LAST_PRICE.keys()))
 
     return {
         "summary": {
@@ -969,7 +987,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V38.6 TRUE MARKET START")
+    log("🚀 V38.7 TRUE TRADING START")
 
     while engine.running:
         try:
@@ -989,7 +1007,6 @@ async def main_loop():
                 await asyncio.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # SELL FIRST
             for p in list(engine.positions):
                 await check_sell(p)
 
@@ -1003,25 +1020,29 @@ async def main_loop():
             else:
                 engine.no_trade_cycles = 0
 
+            # V38.7：真的打單 fallback
             if (
                 engine.no_trade_cycles > FORCE_TRADE_AFTER
                 and len(engine.positions) < MAX_POSITIONS
                 and exposure() < engine.capital * MAX_EXPOSURE
             ):
                 current_mints = {p["mint"] for p in engine.positions}
+
                 for f in ranked:
                     if f["mint"] in current_mints:
                         continue
+
                     log("FORCE_TRADE")
                     ok = await buy(
                         f["mint"],
                         f,
-                        allocate_size(f["_score"], 1),
+                        allocate_size(max(f["_score"], 0.01), 1),
                         f["_mode"],
                         forced=True,
                     )
                     if ok:
                         TOKEN_TRADE_COUNT[f["mint"]] += 1
+                        engine.no_trade_cycles = 0
                         break
 
             update_open_stats()
