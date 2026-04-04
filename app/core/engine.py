@@ -700,7 +700,7 @@ def allocate_size(score, n_candidates):
     elif score < 0.10:
         bucket *= 0.6
 
-    bucket = min(bucket, 0.2)
+    bucket = min(bucket, 0.05)
     return min(bucket, engine.capital * MAX_POSITION_SIZE)
 
 
