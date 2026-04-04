@@ -1,4 +1,4 @@
-# ================= V40.1 TRUE ALPHA BOOST FULL MARKET FIXED =================
+# ================= V41 TRUE ALPHA FILTER FULL MARKET =================
 
 import os
 import asyncio
@@ -43,18 +43,18 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.50"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.05"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.01"))
-TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.008"))
-MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "90"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.008"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.005"))
+TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.004"))
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "60"))
 
 TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "10"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
 FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.05"))
-FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.08"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.07"))
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.10"))
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "false").lower() == "true"
 
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
@@ -81,6 +81,7 @@ ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
 
 TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "1"))
 MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "25"))
+TOP_K_PRESELECT = int(os.getenv("TOP_K_PRESELECT", "3"))
 
 
 # ================= RUNTIME MEMORY =================
@@ -135,7 +136,7 @@ def ensure_engine():
 def log(x):
     print(x)
     engine.logs.append(str(x))
-    engine.logs = engine.logs[-600:]
+    engine.logs = engine.logs[-700:]
 
 
 # ================= HELPERS =================
@@ -718,17 +719,17 @@ def allocate_size(score, n_candidates):
     if n_candidates <= 0:
         return 0.0
 
-    bucket = engine.capital / max(n_candidates * 2, 2)
+    base = engine.capital / max(n_candidates * 2, 2)
 
-    if score > 0.75:
-        bucket *= 1.20
-    elif score > 0.60:
-        bucket *= 1.00
+    if score > 0.13:
+        base *= 1.8
+    elif score > 0.10:
+        base *= 1.2
     else:
-        bucket *= 0.70
+        base *= 0.5
 
-    bucket = min(bucket, 0.05)
-    return min(bucket, engine.capital * MAX_POSITION_SIZE)
+    base = min(base, 0.2)
+    return min(base, engine.capital * MAX_POSITION_SIZE)
 
 
 # ================= BUY =================
@@ -776,6 +777,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "wallet_count": f.get("wallet_count"),
         "price": f.get("price"),
         "score": f.get("_score"),
+        "tier": f.get("_tier"),
     })
 
     engine.positions.append({
@@ -796,6 +798,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "forced": forced,
         "paper": bool(res.get("paper")),
         "score": f.get("_score", 0.0),
+        "tier": f.get("_tier", "C"),
     })
 
     LAST_TRADE[m] = now()
@@ -805,10 +808,10 @@ async def buy(m, f, position_size, mtype, forced=False):
         engine.stats["forced_trades"] += 1
 
     update_open_stats()
-    engine.last_signal = f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f}"
+    engine.last_signal = f"BUY {m[:6]} {mtype} tier={f.get('_tier','C')} score={f.get('_score', 0):.4f}"
     engine.last_trade = engine.last_signal
 
-    log(f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f}")
+    log(f"BUY {m[:6]} {mtype} tier={f.get('_tier','C')} score={f.get('_score', 0):.4f}")
     return True
 
 
@@ -936,6 +939,21 @@ async def process_candidates(tokens):
 
         sc, mtype, detail = score_with_allocator(f)
 
+        # ===== V41 HARD FILTER =====
+        min_threshold = max(dyn_threshold, 0.10)
+        if sc < min_threshold:
+            continue
+
+        f["_score"] = sc
+        f["_mode"] = mtype
+
+        if sc > 0.13:
+            f["_tier"] = "A"
+        elif sc > 0.10:
+            f["_tier"] = "B"
+        else:
+            f["_tier"] = "C"
+
         log(
             f"SCORE_DETAIL {m[:6]} "
             f"breakout={f.get('breakout', 0):.4f} "
@@ -948,14 +966,10 @@ async def process_candidates(tokens):
             f"lscore={detail['lscore']:.4f} "
             f"wallets={f.get('wallet_count', 0)} "
             f"wscore={detail['wscore']:.4f} "
+            f"tier={f['_tier']} "
             f"score={sc:.4f}"
         )
 
-        if sc < dyn_threshold:
-            continue
-
-        f["_score"] = sc
-        f["_mode"] = mtype
         ranked.append(f)
 
     ranked.sort(key=lambda x: x["_score"], reverse=True)
@@ -971,10 +985,18 @@ async def execute_portfolio(ranked):
         return False
 
     traded = False
-    ranked = ranked[:TOP_N_TO_TRADE]
+
+    ranked = sorted(ranked, key=lambda x: x["_score"], reverse=True)
+    ranked = ranked[:TOP_K_PRESELECT]
+
+    log("TOP_RANKED " + " | ".join([f"{r['mint'][:6]}:{r['_score']:.4f}" for r in ranked]))
 
     for f in ranked:
         m = f["mint"]
+
+        if engine.stats.get("executed", 0) > 10 and engine.stats.get("wins", 0) == 0:
+            log("PAUSE_BAD_RUN")
+            return False
 
         if any(p["mint"] == m for p in engine.positions):
             log(f"SKIP_DUP_POS {m[:6]}")
@@ -1009,7 +1031,7 @@ async def execute_portfolio(ranked):
             continue
 
         pos_size = allocate_size(f["_score"], len(ranked))
-        log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} mode={f['_mode']}")
+        log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} tier={f.get('_tier','C')} mode={f['_mode']}")
         log(f"ALLOC_SIZE {m[:6]} size={pos_size:.4f} capital={engine.capital:.4f}")
 
         if pos_size <= 0 or engine.capital < pos_size:
@@ -1022,6 +1044,8 @@ async def execute_portfolio(ranked):
         if success:
             TOKEN_TRADE_COUNT[m] += 1
             traded = True
+            if TOP_N_TO_TRADE <= 1:
+                break
 
     return traded
 
@@ -1106,7 +1130,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V40.1 TRUE ALPHA BOOST FIX START")
+    log("🚀 V41 TRUE ALPHA FILTER START")
 
     while engine.running:
         try:
@@ -1147,15 +1171,17 @@ async def main_loop():
             ):
                 current_mints = {p["mint"] for p in engine.positions}
 
-                for f in ranked[:TOP_N_TO_TRADE]:
+                for f in ranked[:TOP_K_PRESELECT]:
                     if f["mint"] in current_mints:
+                        continue
+                    if f["_score"] < 0.10:
                         continue
 
                     log("FORCE_TRADE")
                     ok = await buy(
                         f["mint"],
                         f,
-                        allocate_size(max(f["_score"], 0.05), 1),
+                        allocate_size(max(f["_score"], 0.10), 1),
                         f["_mode"],
                         forced=True,
                     )
