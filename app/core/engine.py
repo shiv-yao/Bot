@@ -1,10 +1,12 @@
-# ================= V37.8 FULL FUSION STABLE VERSION =================
+# ================= V37.9 FULL FUSION TRUE MARKET DATA =================
 
 import os
 import asyncio
 import time
 import random
 from collections import defaultdict
+
+import httpx
 
 from app.state import engine
 from app.alpha.adaptive_filter import adaptive_filter
@@ -40,7 +42,7 @@ REAL_TRADING = os.getenv("REAL_TRADING", "false").lower() == "true"
 
 SOL = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 1_000_000_000
-AMOUNT = int(os.getenv("AMOUNT", "1000000"))
+AMOUNT = int(os.getenv("AMOUNT", "1000000"))  # quote size, atomic SOL
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.50"))
@@ -60,12 +62,16 @@ SNIPER_FALLBACK_THRESHOLD = float(os.getenv("SNIPER_FALLBACK_THRESHOLD", "0.001"
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 
 # ===== STABILITY CLAMPS =====
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000001"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "10"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))   # SOL per token
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0.01"))           # SOL per token
 MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.05"))
 MAX_SCORE = float(os.getenv("MAX_SCORE", "0.1"))
 MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
+
+MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "1000"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
 
 # ================= RUNTIME MEMORY =================
@@ -99,8 +105,6 @@ def ensure_engine():
     engine.last_trade = getattr(engine, "last_trade", "")
 
     engine.stats = getattr(engine, "stats", {})
-
-    # 防 KeyError
     engine.stats.setdefault("signals", 0)
     engine.stats.setdefault("executed", 0)
     engine.stats.setdefault("rejected", 0)
@@ -174,7 +178,19 @@ def dedup(tokens):
     return out
 
 
-# ================= PRICE =================
+# ================= HTTP =================
+
+async def http_get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+# ================= PRICE SOURCES =================
 
 async def safe_quote(input_mint, output_mint, amount):
     for _ in range(3):
@@ -187,25 +203,151 @@ async def safe_quote(input_mint, output_mint, amount):
         await asyncio.sleep(0.2)
     return None
 
-async def get_price(m):
+async def jupiter_price(m):
+    """
+    回傳:
+      {
+        "price": SOL per token,
+        "liq": outAmount,
+        "source": "jupiter"
+      }
+    """
     q = await safe_quote(SOL, m, AMOUNT)
     if not q:
-        log(f"NO_QUOTE {m[:6]}")
         return None
 
-    out = sf(q.get("outAmount", 0))
-    if out <= 0 or out > 1e12:
-        log(f"BAD_OUT {m[:6]} {out}")
+    try:
+        in_amt = sf(q.get("inAmount", 0))
+        out_amt = sf(q.get("outAmount", 0))
+    except Exception:
         return None
 
-    price = out / 1e6
+    if in_amt <= 0 or out_amt <= 0:
+        return None
 
-    # ===== V37.8 核心：價格限制 =====
+    if out_amt < MIN_OUT_AMOUNT:
+        log(f"LOW_LIQ {m[:6]} {int(out_amt)}")
+        return None
+
+    price = in_amt / out_amt  # ✅ SOL per token
+
     if price < MIN_PRICE or price > MAX_PRICE:
-        log(f"BAD_PRICE {m[:6]} {price:.8f}")
+        log(f"BAD_PRICE {m[:6]} {price:.10f}")
         return None
 
-    return price
+    return {
+        "price": price,
+        "liq": out_amt,
+        "source": "jupiter",
+    }
+
+async def birdeye_price(m):
+    """
+    嘗試把 USD price 轉成 SOL price:
+      token_usd / sol_usd = SOL per token
+    """
+    if not BIRDEYE_API_KEY:
+        return None
+
+    headers = {"X-API-KEY": BIRDEYE_API_KEY}
+
+    token_res = await http_get(
+        "https://public-api.birdeye.so/defi/price",
+        params={"address": m},
+        headers=headers,
+    )
+    sol_res = await http_get(
+        "https://public-api.birdeye.so/defi/price",
+        params={"address": SOL},
+        headers=headers,
+    )
+
+    try:
+        token_usd = sf(token_res["data"]["value"])
+        sol_usd = sf(sol_res["data"]["value"])
+        if token_usd <= 0 or sol_usd <= 0:
+            return None
+
+        price = token_usd / sol_usd  # SOL per token
+        if price < MIN_PRICE or price > MAX_PRICE:
+            return None
+
+        return {
+            "price": price,
+            "liq": 0,
+            "source": "birdeye",
+        }
+    except Exception:
+        return None
+
+async def dexscreener_price(m):
+    """
+    同樣把 USD price 轉成 SOL price
+    """
+    res = await http_get(f"https://api.dexscreener.com/latest/dex/search/?q={m}")
+    if not res:
+        return None
+
+    try:
+        pairs = res.get("pairs", [])
+        if not pairs:
+            return None
+
+        pair = pairs[0]
+        token_usd = sf(pair.get("priceUsd", 0))
+        native_price = sf(pair.get("priceNative", 0))
+
+        # priceNative 若為 SOL pair，通常就是 SOL per token
+        if native_price > 0:
+            price = native_price
+        elif token_usd > 0:
+            # 沒有 SOL USD 價時，不硬算
+            return None
+        else:
+            return None
+
+        if price < MIN_PRICE or price > MAX_PRICE:
+            return None
+
+        return {
+            "price": price,
+            "liq": sf(pair.get("liquidity", {}).get("usd", 0)),
+            "source": "dexscreener",
+        }
+    except Exception:
+        return None
+
+async def get_price_info(m):
+    """
+    多資料源:
+      1. Jupiter
+      2. Birdeye
+      3. DexScreener
+      4. LAST_PRICE fallback
+    """
+    for fn in (jupiter_price, birdeye_price, dexscreener_price):
+        try:
+            r = await fn(m)
+            if r and r.get("price"):
+                return r
+        except Exception:
+            pass
+
+    last = LAST_PRICE.get(m)
+    if last:
+        return {
+            "price": last,
+            "liq": 0,
+            "source": "last_price",
+        }
+
+    return None
+
+async def get_price(m):
+    info = await get_price_info(m)
+    if not info:
+        return None
+    return info["price"]
 
 
 # ================= FEATURES =================
@@ -215,10 +357,11 @@ async def features(t):
     if not m:
         return None
 
-    price = await get_price(m)
-    if price is None:
+    pinfo = await get_price_info(m)
+    if not pinfo:
         return None
 
+    price = pinfo["price"]
     prev = LAST_PRICE.get(m)
 
     if prev and prev > 0:
@@ -226,7 +369,6 @@ async def features(t):
     else:
         breakout = 0.005
 
-    # ===== V37.8 核心：breakout 限制 =====
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
 
     if breakout == 0:
@@ -249,6 +391,8 @@ async def features(t):
         "is_new": prev is None,
         "wallet_count": len(wallets),
         "source": t.get("source", "unknown"),
+        "price_source": pinfo.get("source", "unknown"),
+        "liq": pinfo.get("liq", 0),
     }
 
 
@@ -264,14 +408,17 @@ def mode(f):
 def score_alpha(f):
     m = mode(f)
 
-    if m == "sniper":
-        raw = f["breakout"] * 0.4 + f["smart"] * 0.6
-    elif m == "smart":
-        raw = f["smart"] * 0.7 + f["breakout"] * 0.3
-    else:
-        raw = f["breakout"] * 0.8 + f["smart"] * 0.2
+    liq_bonus = 0.0
+    if sf(f.get("liq", 0)) > 0:
+        liq_bonus = 0.01
 
-    # ===== V37.8 核心：score 限制 =====
+    if m == "sniper":
+        raw = f["breakout"] * 0.4 + f["smart"] * 0.6 + liq_bonus
+    elif m == "smart":
+        raw = f["smart"] * 0.7 + f["breakout"] * 0.3 + liq_bonus
+    else:
+        raw = f["breakout"] * 0.8 + f["smart"] * 0.2 + liq_bonus
+
     raw = clamp(raw, 0.0, MAX_SCORE)
     return raw, m
 
@@ -280,7 +427,6 @@ def size_by_score(score):
 
     if score > 0.02:
         base *= 1.15
-
     if score > 0.05:
         base *= 1.10
 
@@ -330,6 +476,8 @@ async def buy(m, f, position_size, mtype, forced=False):
         "time": now(),
         "mode": mtype,
         "source": f["source"],
+        "price_source": f.get("price_source"),
+        "liq": f.get("liq", 0),
         "high": f["price"],
         "wallet_count": f.get("wallet_count", 0),
         "tx_buy": tx_sig,
@@ -345,7 +493,7 @@ async def buy(m, f, position_size, mtype, forced=False):
     update_open_stats()
 
     engine.last_signal = (
-        f"BUY {m[:6]} {mtype} score={position_size:.4f} entry={f['price']:.8f}"
+        f"BUY {m[:6]} {mtype} score={f.get('_score', 0):.4f} entry={f['price']:.10f}"
     )
     engine.last_trade = engine.last_signal
 
@@ -357,7 +505,6 @@ async def buy(m, f, position_size, mtype, forced=False):
 
 async def sell(p, reason, pnl, price):
     m = p["mint"]
-
     sell_amount = int(p.get("token_amount_atomic") or 0)
 
     if p.get("paper"):
@@ -382,13 +529,11 @@ async def sell(p, reason, pnl, price):
     if p in engine.positions:
         engine.positions.remove(p)
 
-    # ===== V37.8 核心：pnl 限制 =====
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
     realized = p["size"] * (1 + pnl)
     engine.capital += realized
 
-    # ===== V37.8 核心：capital 防爆 =====
     if engine.capital > MAX_CAPITAL:
         log("CAPITAL_RESET")
         engine.capital = engine.start_capital
@@ -412,6 +557,7 @@ async def sell(p, reason, pnl, price):
         "size": p.get("size"),
         "mode": p.get("mode"),
         "source": src,
+        "price_source": p.get("price_source"),
         "time_open": p.get("time"),
         "time_close": now(),
         "tx_buy": p.get("tx_buy"),
@@ -433,8 +579,6 @@ async def check_sell(p):
         return False
 
     pnl = (price - entry) / entry
-
-    # ===== V37.8 核心：pnl 先限制再判斷 =====
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
     p["high"] = max(sf(p.get("high"), entry), price)
@@ -584,7 +728,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V37.8 START")
+    log("🚀 V37.9 START")
 
     while engine.running:
         try:
@@ -595,7 +739,6 @@ async def main_loop():
             tokens = dedup(tokens)
             random.shuffle(tokens)
 
-            # 先賣再買
             for p in list(engine.positions):
                 await check_sell(p)
 
@@ -611,7 +754,6 @@ async def main_loop():
             else:
                 engine.no_trade_cycles = 0
 
-            # force trade 只在有空位時
             if (
                 engine.no_trade_cycles > FORCE_TRADE_AFTER
                 and tokens
