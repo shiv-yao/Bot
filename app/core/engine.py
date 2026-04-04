@@ -1,4 +1,4 @@
-# ================= V38.7 TRUE TRADING FUND BRAIN =================
+# ================= V38.7 TRUE TRADING FUND BRAIN (FULL FIXED) =================
 
 import os
 import asyncio
@@ -76,6 +76,10 @@ BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() =
 ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.001"))
 ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.005"))
 
+# 修復：交易門控
+SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "true").lower() == "true"
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.05"))
+
 
 # ================= RUNTIME MEMORY =================
 
@@ -128,7 +132,7 @@ def ensure_engine():
 def log(x):
     print(x)
     engine.logs.append(str(x))
-    engine.logs = engine.logs[-300:]
+    engine.logs = engine.logs[-400:]
 
 
 # ================= HELPERS =================
@@ -197,9 +201,6 @@ def limit_token_frequency(tokens, max_per_token=2):
     return out
 
 def current_dynamic_threshold():
-    """
-    市場越冷、越久沒下單，門檻越低
-    """
     base = ENTRY_THRESHOLD
     if engine.no_trade_cycles > 20:
         base *= 0.5
@@ -419,9 +420,8 @@ async def jupiter_price(m):
         log(f"LOW_LIQ {m[:6]} {int(out_amt)}")
         return None
 
-    price = in_amt / out_amt  # SOL per token
+    price = in_amt / out_amt
 
-    # Jupiter 主價格最可信，用較嚴格範圍
     if price <= 0 or price > MAX_PRICE_JUPITER:
         log(f"BAD_PRICE {m[:6]} {price:.10f}")
         return None
@@ -457,7 +457,6 @@ async def birdeye_price(m):
 
         price = token_usd / sol_usd
 
-        # fallback source 放寬，但仍過濾極端值
         if price <= 0 or price > MAX_PRICE_FALLBACK:
             return None
 
@@ -491,7 +490,6 @@ async def dexscreener_price(m):
 
         native_price = sf(pair.get("priceNative", 0))
 
-        # 防 DEX 單位錯亂
         if native_price > 10:
             log(f"DEX_SKIP_BAD_UNIT {m[:6]} {native_price}")
             return None
@@ -568,7 +566,6 @@ async def features(t):
 
     smart = min(len(wallets) / 5.0, 1.0)
 
-    # 新幣 boost
     sniper_boost = 0.0
     if t.get("source") == "pumpfun":
         sniper_boost += 0.02
@@ -852,10 +849,8 @@ async def process_candidates(tokens):
         f["meta"] = t.get("meta", {})
 
         sc, mtype = score_with_allocator(f)
-
         log(f"SCORE {m[:6]} {sc:.4f}")
 
-        # V38.7 動態門檻
         if sc < dyn_threshold:
             continue
 
@@ -876,29 +871,44 @@ async def execute_portfolio(ranked):
         m = f["mint"]
 
         if any(p["mint"] == m for p in engine.positions):
+            log(f"SKIP_DUP_POS {m[:6]}")
             continue
 
         if len(engine.positions) >= MAX_POSITIONS:
+            log("SKIP_MAX_POSITIONS")
             break
 
         if exposure() >= engine.capital * MAX_EXPOSURE:
+            log("SKIP_MAX_EXPOSURE")
             break
 
         if now() - LAST_TRADE[m] < TOKEN_COOLDOWN:
+            log(f"SKIP_COOLDOWN {m[:6]}")
             continue
 
-        ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+        # ===== 完整修復：soft bypass filter =====
+        if SOFT_DISABLE_FILTER:
+            ok = True
+        else:
+            ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+            if not ok and f["_score"] >= FILTER_SCORE_BYPASS:
+                ok = True
 
-        # V38.7：長時間沒單時，放寬 filter
-        if not ok and engine.no_trade_cycles <= 5:
+        log(f"FILTER_RESULT {m[:6]} ok={ok}")
+
+        if not ok:
             continue
 
         pos_size = allocate_size(f["_score"], len(ranked))
+        log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} mode={f['_mode']}")
+        log(f"ALLOC_SIZE {m[:6]} size={pos_size:.4f} capital={engine.capital:.4f}")
 
         if pos_size <= 0 or engine.capital < pos_size:
+            log(f"SKIP_SIZE_OR_CAPITAL {m[:6]}")
             continue
 
         success = await buy(m, f, pos_size, f["_mode"])
+        log(f"BUY_RESULT {m[:6]} success={success}")
 
         if success:
             TOKEN_TRADE_COUNT[m] += 1
@@ -973,7 +983,7 @@ def get_metrics():
         },
         "positions": engine.positions,
         "recent_trades": engine.trade_history[-20:],
-        "logs": engine.logs[-80:],
+        "logs": engine.logs[-120:],
         "source_stats": dict(SOURCE_STATS),
         "portfolio": {
             "tracked_tokens": tracked_tokens,
@@ -1020,7 +1030,6 @@ async def main_loop():
             else:
                 engine.no_trade_cycles = 0
 
-            # V38.7：真的打單 fallback
             if (
                 engine.no_trade_cycles > FORCE_TRADE_AFTER
                 and len(engine.positions) < MAX_POSITIONS
@@ -1040,6 +1049,7 @@ async def main_loop():
                         f["_mode"],
                         forced=True,
                     )
+                    log(f"FORCE_BUY_RESULT {f['mint'][:6]} success={ok}")
                     if ok:
                         TOKEN_TRADE_COUNT[f["mint"]] += 1
                         engine.no_trade_cycles = 0
