@@ -994,7 +994,10 @@ async def check_sell(p):
     if last and last > 0:
         jump = abs(price - last) / last
         if jump > 0.25:
-            log(f"SELL_SKIP_BAD_PRICE {p['mint'][:6]} price={price:.10f} last={last:.10f}")
+            log(
+                f"SELL_SKIP_BAD_PRICE {p['mint'][:6]} "
+                f"price={price:.10f} last={last:.10f}"
+            )
             return False
 
     pnl = (price - entry) / entry
@@ -1006,28 +1009,32 @@ async def check_sell(p):
     if pnl > 0 and LAST_MOMENTUM.get(p["mint"], 0) > 0:
         return False
 
+    # 抗噪音 SL：小幅虧損但 momentum 還是正，不賣
     if pnl < 0 and pnl > -0.03:
-    if LAST_MOMENTUM.get(p["mint"], 0) > 0:
-        return False
-
-    
+        if LAST_MOMENTUM.get(p["mint"], 0) > 0:
+            return False
 
     # partial TP
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
+
         partial = p["size"] * 0.5
         p["size"] *= 0.5
         engine.capital += partial
+
         log(f"PARTIAL_TP {p['mint'][:6]} pnl={pnl:.4f}")
 
     # A級延長 TP
-    tp = TAKE_PROFIT * 2 if p.get("tier") == "A" else TAKE_PROFIT
+    tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier")
+    tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
     reason = None
+
     if pnl >= tp:
         reason = "TP"
 
     elif pnl <= STOP_LOSS:
+        # 再確認一次，避免單點壞價格誤殺
         await asyncio.sleep(0.5)
         price2 = await get_price(p["mint"])
         if price2 is None:
@@ -1038,6 +1045,7 @@ async def check_sell(p):
 
         if pnl2 <= STOP_LOSS:
             pnl = pnl2
+            price = price2
             reason = "SL"
         else:
             return False
@@ -1046,6 +1054,9 @@ async def check_sell(p):
         reason = "TRAIL"
 
     elif now() - sf(p.get("time"), now()) > MAX_HOLD_SEC:
+        # A級幣如果還有正動能，延長持有
+        if tier == "A" and LAST_MOMENTUM.get(p["mint"], 0) > 0.003:
+            return False
         reason = "TIME"
 
     if reason:
