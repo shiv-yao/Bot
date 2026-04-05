@@ -1,4 +1,4 @@
-# ================= V41+V42 TRUE FUSION FILTER FULL MARKET =================
+# ================= V42 TRUE FUSION FILTER CONFIRMED MOMENTUM =================
 
 import os
 import asyncio
@@ -42,7 +42,7 @@ SOL_DECIMALS = 1_000_000_000
 AMOUNT = int(os.getenv("AMOUNT", "1000000"))
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
-MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.50"))
+MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.25"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.05"))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.008"))
@@ -50,13 +50,13 @@ STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.005"))
 TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.004"))
 MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "60"))
 
-TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "10"))
+TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "15"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
-FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "15"))
+FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "20"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.07"))
-FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.10"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.12"))
+FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.12"))
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "false").lower() == "true"
 
 MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
@@ -78,14 +78,18 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "20"))
 BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true"
 
-ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.005"))
-ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
+ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.04"))
+ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.10"))
 
 TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "1"))
 MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "60"))
-TOP_K_PRESELECT = int(os.getenv("TOP_K_PRESELECT", "3"))
+TOP_K_PRESELECT = int(os.getenv("TOP_K_PRESELECT", "2"))
 
 MEMPOOL_WSS = os.getenv("MEMPOOL_WSS", "wss://api.mainnet-beta.solana.com")
+
+MIN_CONFIRM_MOMENTUM = float(os.getenv("MIN_CONFIRM_MOMENTUM", "0.003"))
+MIN_CONFIRM_BREAKOUT = float(os.getenv("MIN_CONFIRM_BREAKOUT", "0.004"))
+STRICT_A_TIER_THRESHOLD = float(os.getenv("STRICT_A_TIER_THRESHOLD", "0.12"))
 
 SEARCH_TERMS = [
     "SOL", "USDC", "BONK",
@@ -219,35 +223,10 @@ def limit_token_frequency(tokens, max_per_token=2):
 def current_dynamic_threshold():
     base = ENTRY_THRESHOLD
     if engine.no_trade_cycles > 30:
-        base *= 0.5
-    elif engine.no_trade_cycles > 15:
         base *= 0.7
-    if engine.stats.get("executed", 0) == 0:
-        base *= 0.9
+    elif engine.no_trade_cycles > 15:
+        base *= 0.85
     return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
-
-def normalize_liq(liq: float) -> float:
-    liq = max(sf(liq), 0.0)
-    if liq <= 0:
-        return 0.0
-    x = math.log10(liq + 1.0)
-    score = (x - 2.0) / 7.0
-    score = clamp(score, 0.0, 1.0)
-    return score * 0.55
-
-def normalize_wallets(n: int) -> float:
-    n = max(int(n), 0)
-    if n == 0:
-        return 0.0
-    if n == 1:
-        return 0.02
-    if n <= 3:
-        return 0.08
-    if n <= 5:
-        return 0.15
-    if n <= 10:
-        return 0.24
-    return 0.32
 
 def breakout_strength(b: float) -> float:
     b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
@@ -730,10 +709,42 @@ def mode(f):
     return "momentum"
 
 def score_alpha(f):
-    breakout = f.get("breakout", 0)
-    momentum = f.get("momentum", 0)
-    smart = f.get("smart", 0)
-    liq = f.get("liq", 0)
+    breakout = f.get("breakout", 0.0)
+    momentum = f.get("momentum", 0.0)
+    smart = f.get("smart", 0.0)
+    liq = f.get("liq", 0.0)
+
+    # ===== V42 CONFIRMED MOMENTUM GATE =====
+    if momentum < MIN_CONFIRM_MOMENTUM:
+        return 0.0, {
+            "bscore": 0.0,
+            "mscore": 0.0,
+            "sscore": 0.0,
+            "lscore": 0.0,
+            "wscore": 0.0,
+            "nscore": 0.0,
+        }
+
+    if breakout < MIN_CONFIRM_BREAKOUT:
+        return 0.0, {
+            "bscore": 0.0,
+            "mscore": 0.0,
+            "sscore": 0.0,
+            "lscore": 0.0,
+            "wscore": 0.0,
+            "nscore": 0.0,
+        }
+
+    # fake breakout
+    if breakout > 0.01 and momentum < 0:
+        return 0.0, {
+            "bscore": 0.0,
+            "mscore": 0.0,
+            "sscore": 0.0,
+            "lscore": 0.0,
+            "wscore": 0.0,
+            "nscore": 0.0,
+        }
 
     bscore = breakout_strength(breakout)
     mscore = momentum_strength(momentum)
@@ -751,9 +762,6 @@ def score_alpha(f):
         wscore = 0.0
 
     nscore = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
-
-    if breakout > 0.01 and momentum <= 0:
-        bscore *= 0.35
 
     score = (
         bscore * 0.45 +
@@ -802,10 +810,12 @@ def allocate_size(score, n_candidates):
 
     base = engine.capital / max(n_candidates * 2, 2)
 
-    if score > 0.13:
-        base *= 1.8
-    elif score > 0.10:
-        base *= 1.2
+    if score > 0.15:
+        base *= 2.0
+    elif score > 0.13:
+        base *= 1.5
+    elif score > 0.12:
+        base *= 1.1
     else:
         base *= 0.5
 
@@ -1020,19 +1030,19 @@ async def process_candidates(tokens):
 
         sc, mtype, detail = score_with_allocator(f)
 
-        min_threshold = max(dyn_threshold, 0.10)
+        min_threshold = max(dyn_threshold, STRICT_A_TIER_THRESHOLD)
         if sc < min_threshold:
             continue
 
         f["_score"] = sc
         f["_mode"] = mtype
 
-        if sc > 0.13:
+        if sc >= 0.15:
+            f["_tier"] = "A+"
+        elif sc >= STRICT_A_TIER_THRESHOLD:
             f["_tier"] = "A"
-        elif sc > 0.10:
-            f["_tier"] = "B"
         else:
-            f["_tier"] = "C"
+            f["_tier"] = "B"
 
         log(
             f"SCORE_DETAIL {m[:6]} "
@@ -1078,6 +1088,10 @@ async def execute_portfolio(ranked):
             log("PAUSE_BAD_RUN")
             return False
 
+        if f.get("_tier") not in {"A", "A+"}:
+            log(f"SKIP_NON_A_TIER {m[:6]} tier={f.get('_tier')}")
+            continue
+
         if any(p["mint"] == m for p in engine.positions):
             log(f"SKIP_DUP_POS {m[:6]}")
             continue
@@ -1106,12 +1120,8 @@ async def execute_portfolio(ranked):
         if not ok:
             continue
 
-        if f["_score"] < 0.05:
-            log(f"SKIP_LOW_SCORE {m[:6]}")
-            continue
-
         pos_size = allocate_size(f["_score"], len(ranked))
-        log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} tier={f.get('_tier','C')} mode={f['_mode']}")
+        log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} tier={f.get('_tier','?')} mode={f['_mode']}")
         log(f"ALLOC_SIZE {m[:6]} size={pos_size:.4f} capital={engine.capital:.4f}")
 
         if pos_size <= 0 or engine.capital < pos_size:
@@ -1210,7 +1220,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V41+V42 TRUE FUSION START")
+    log("🚀 V42 TRUE FUSION CONFIRMED START")
 
     asyncio.create_task(mempool_stream())
 
@@ -1256,14 +1266,16 @@ async def main_loop():
                 for f in ranked[:TOP_K_PRESELECT]:
                     if f["mint"] in current_mints:
                         continue
-                    if f["_score"] < 0.10:
+                    if f["_score"] < STRICT_A_TIER_THRESHOLD:
+                        continue
+                    if f.get("_tier") not in {"A", "A+"}:
                         continue
 
                     log("FORCE_TRADE")
                     ok = await buy(
                         f["mint"],
                         f,
-                        allocate_size(max(f["_score"], 0.10), 1),
+                        allocate_size(max(f["_score"], STRICT_A_TIER_THRESHOLD), 1),
                         f["_mode"],
                         forced=True,
                     )
