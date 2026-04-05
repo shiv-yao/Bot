@@ -1033,7 +1033,9 @@ async def sell(p, reason, pnl, price):
 # ================= CHECK SELL =================
 
 async def check_sell(p):
-    price = await get_price(p["mint"])
+    m = p["mint"]
+
+    price = await get_price(m)
     if price is None:
         return False
 
@@ -1043,102 +1045,110 @@ async def check_sell(p):
 
     hold_sec = now() - sf(p.get("time"), now())
 
+    # ===== 防極小價格（單位錯誤）=====
+    if price < 1e-8:
+        log(f"PRICE_TOO_SMALL_SKIP {m[:6]} {price}")
+        return False
+
+    # ===== 剛進場保護 =====
     if hold_sec < 8:
         return False
 
-    last = LAST_PRICE.get(p["mint"])
+    last = LAST_PRICE.get(m)
+
+    # ===== 抗亂價（核心修正）=====
     if last and last > 0:
         jump = abs(price - last) / last
+
         if jump > 0.25:
-            log(
-                f"SELL_SKIP_BAD_PRICE {p['mint'][:6]} "
-                f"price={price:.10f} last={last:.10f}"
-            )
-            return False
+            log(f"BAD_PRICE_DETECTED {m[:6]} jump={jump:.2f}")
+
+            # ❗短時間內 → 忽略
+            if hold_sec < 20:
+                return False
+
+            # ❗持倉久 → 不再信 last_price
+            else:
+                log(f"FORCE_USE_PRICE {m[:6]}")
 
     pnl = (price - entry) / entry
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
+    # 更新 high
     p["high"] = max(sf(p.get("high"), entry), price)
 
     tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier", "C")
-    momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0.0), 0.0)
+    momentum_now = sf(LAST_MOMENTUM.get(m, 0.0), 0.0)
 
-    if pnl <= HARD_STOP_LOSS:
-        log(f"HARD_STOP {p['mint'][:6]} pnl={pnl:.4f}")
-        return await sell(p, "HARD_STOP", pnl, price)
+    # ================= 💀 強制退出（最重要） =================
+    if hold_sec > 90:
+        log(f"FORCE_EXIT {m[:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
+        return await sell(p, "FORCE_EXIT", pnl, price)
 
+    # ================= 🩸 快速止血 =================
+    if pnl < -0.02 and hold_sec > 20:
+        log(f"FAST_CUT {m[:6]} pnl={pnl:.4f}")
+        return await sell(p, "FAST_CUT", pnl, price)
+
+    # ================= 🧠 momentum 保護 =================
     if pnl > 0 and momentum_now > 0.003:
         return False
 
-    if -0.03 < pnl < 0 and momentum_now > 0.004:
+    if -0.02 < pnl < 0 and momentum_now > 0.004:
         return False
 
-    if pnl < -0.015 and hold_sec > 20:
-        log(f"FAST_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
-        return await sell(p, "FAST_CUT", pnl, price)
+    # ================= 💰 partial TP =================
+    if pnl >= 0.008 and not p.get("tp1_done"):
+        p["tp1_done"] = True
 
-    if pnl < 0 and hold_sec > 45:
-        log(f"EARLY_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
-        return await sell(p, "EARLY_CUT", pnl, price)
+        original_size = sf(p.get("size", 0.0), 0.0)
+        partial = original_size * 0.5
 
-    if hold_sec > FORCE_EXIT_SEC:
-        log(f"FORCE_EXIT {p['mint'][:6]} hold={hold_sec:.1f}s pnl={pnl:.4f}")
-        return await sell(p, "FORCE_EXIT", pnl, price)
+        p["size"] = original_size * 0.5
+        engine.capital += partial
 
+        log(f"PARTIAL_TP {m[:6]} pnl={pnl:.4f}")
+
+    # ================= 🎯 TP =================
     tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
-    reason = None
-
     if pnl >= tp:
-        reason = "TP"
+        return await sell(p, "TP", pnl, price)
 
-    elif pnl <= STOP_LOSS:
-        await asyncio.sleep(0.5)
-        price2 = await get_price(p["mint"])
-        if price2 is None:
-            return False
+    # ================= 🛑 SL（二次確認） =================
+    if pnl <= STOP_LOSS:
+        await asyncio.sleep(0.4)
+        price2 = await get_price(m)
 
-        last2 = LAST_PRICE.get(p["mint"])
-        if last2 and last2 > 0:
-            jump2 = abs(price2 - last2) / last2
-            if jump2 > 0.25:
-                log(
-                    f"SELL_SKIP_BAD_PRICE2 {p['mint'][:6]} "
-                    f"price={price2:.10f} last={last2:.10f}"
-                )
-                return False
+        if price2:
+            pnl2 = (price2 - entry) / entry
+            pnl2 = clamp(pnl2, -MAX_PNL_ABS, MAX_PNL_ABS)
 
-        pnl2 = (price2 - entry) / entry
-        pnl2 = clamp(pnl2, -MAX_PNL_ABS, MAX_PNL_ABS)
+            if pnl2 <= STOP_LOSS:
+                log(f"CONFIRMED_SL {m[:6]} pnl={pnl2:.4f}")
+                return await sell(p, "SL", pnl2, price2)
 
-        if pnl2 <= STOP_LOSS:
-            pnl = pnl2
-            price = price2
-            reason = "SL"
-        else:
-            return False
+        return False
 
-    elif price < p["high"] * (1 - TRAILING_GAP):
-        reason = "TRAIL"
+    # ================= 📉 trailing =================
+    if price < p["high"] * (1 - TRAILING_GAP):
+        log(f"TRAIL_EXIT {m[:6]} pnl={pnl:.4f}")
+        return await sell(p, "TRAIL", pnl, price)
 
-    elif hold_sec > MAX_HOLD_SEC:
+    # ================= ⏳ TIME EXIT =================
+    if hold_sec > MAX_HOLD_SEC:
         log(
-            f"TIME_CHECK {p['mint'][:6]} "
-            f"pnl={pnl:.4f} hold={hold_sec:.1f}s "
+            f"TIME_CHECK {m[:6]} pnl={pnl:.4f} "
             f"momentum={momentum_now:.4f} tier={tier}"
         )
 
+        # A 幣還有動能 → 放
         if tier == "A" and momentum_now > 0.002:
             return False
 
+        # 不動 or 微虧 → 出
         if pnl < 0.003:
-            reason = "TIME"
-        else:
-            return False
-
-    if reason:
-        return await sell(p, reason, pnl, price)
+            return await sell(p, "TIME", pnl, price)
 
     return False
 
