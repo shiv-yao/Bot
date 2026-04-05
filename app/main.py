@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 import time
 import traceback
+from app.env_check import inspect_env
 
 app = FastAPI()
 
@@ -509,3 +510,7 @@ def resume():
             status_code=500,
             content={"ok": False, "error": str(e)},
         )
+
+@app.get("/env-check")
+def env_check():
+    return inspect_env()
