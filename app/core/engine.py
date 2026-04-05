@@ -1,4 +1,4 @@
-# ================= V44.1 TRUE FUSION FILTER FUND FLOW FULL FIX =================
+# ================= V45 TRUE FUSION FILTER BREATHING FUND FULL =================
 
 import os
 import asyncio
@@ -40,14 +40,17 @@ SOL = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 1_000_000_000
 AMOUNT = int(os.getenv("AMOUNT", "1000000"))
 
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
-MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.25"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.35"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.03"))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.03"))
 TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.01"))
 MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "120"))
+
+HARD_STOP_LOSS = float(os.getenv("HARD_STOP_LOSS", "-0.04"))
+FORCE_EXIT_SEC = int(os.getenv("FORCE_EXIT_SEC", "90"))
 
 TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "15"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
@@ -89,6 +92,11 @@ MIN_CONFIRM_MOMENTUM = float(os.getenv("MIN_CONFIRM_MOMENTUM", "0.003"))
 MIN_CONFIRM_BREAKOUT = float(os.getenv("MIN_CONFIRM_BREAKOUT", "0.004"))
 STRICT_A_TIER_THRESHOLD = float(os.getenv("STRICT_A_TIER_THRESHOLD", "0.12"))
 
+BREATHING_LOSS_STREAK = int(os.getenv("BREATHING_LOSS_STREAK", "2"))
+BREATHING_COOLDOWN_SEC = int(os.getenv("BREATHING_COOLDOWN_SEC", "180"))
+BREATHING_MIN_RISK_MULT = float(os.getenv("BREATHING_MIN_RISK_MULT", "0.45"))
+BREATHING_MAX_RISK_MULT = float(os.getenv("BREATHING_MAX_RISK_MULT", "1.20"))
+
 SEARCH_TERMS = [
     "SOL", "USDC", "BONK",
     "MEME", "PEPE", "DOG", "AI",
@@ -114,6 +122,11 @@ SOURCE_STATS = defaultdict(lambda: {
 
 MEMPOOL_BUFFER = []
 MEMPOOL_TASK = None
+
+BREATHING_STATE = {
+    "risk_mult": 1.0,
+    "cooldown_until": 0.0,
+}
 
 
 # ================= ENGINE =================
@@ -238,6 +251,47 @@ def momentum_strength(m: float) -> float:
     if m <= 0:
         return 0.0
     return min(m / 0.05, 1.0) * 0.30
+
+def recent_closed_trades(n=5):
+    hist = getattr(engine, "trade_history", []) or []
+    rows = [x for x in hist if isinstance(x, dict)]
+    return rows[-n:]
+
+def update_breathing_state():
+    rows = recent_closed_trades(5)
+    if not rows:
+        BREATHING_STATE["risk_mult"] = 1.0
+        return
+
+    last2 = rows[-2:] if len(rows) >= 2 else rows
+    loss_streak = 0
+    for r in reversed(last2):
+        if sf(r.get("pnl"), 0.0) < 0:
+            loss_streak += 1
+        else:
+            break
+
+    if loss_streak >= BREATHING_LOSS_STREAK:
+        BREATHING_STATE["risk_mult"] = max(
+            BREATHING_MIN_RISK_MULT,
+            BREATHING_STATE["risk_mult"] * 0.7
+        )
+        BREATHING_STATE["cooldown_until"] = now() + BREATHING_COOLDOWN_SEC
+        log(
+            f"BREATHING_DE_RISK loss_streak={loss_streak} "
+            f"risk_mult={BREATHING_STATE['risk_mult']:.2f}"
+        )
+        return
+
+    if now() > sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0):
+        BREATHING_STATE["risk_mult"] = min(
+            BREATHING_MAX_RISK_MULT,
+            BREATHING_STATE["risk_mult"] + 0.05
+        )
+
+def breathing_risk_mult():
+    x = sf(BREATHING_STATE.get("risk_mult", 1.0), 1.0)
+    return clamp(x, BREATHING_MIN_RISK_MULT, BREATHING_MAX_RISK_MULT)
 
 
 # ================= HTTP =================
@@ -816,6 +870,8 @@ def allocate_size(score, n_candidates):
     else:
         base *= 0.5
 
+    base *= breathing_risk_mult()
+
     base = min(base, 0.2)
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
@@ -965,7 +1021,9 @@ async def sell(p, reason, pnl, price):
         "meta": p.get("meta", {}),
     })
 
+    update_breathing_state()
     update_open_stats()
+
     log(f"SELL {m[:6]} {reason} pnl={pnl:.4f}")
     BLACKLIST[m] = now()
     engine.last_trade = f"SELL {m[:6]} {reason} pnl={pnl:.4f}"
@@ -1006,13 +1064,16 @@ async def check_sell(p):
     tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier", "C")
     momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0.0), 0.0)
 
+    if pnl <= HARD_STOP_LOSS:
+        log(f"HARD_STOP {p['mint'][:6]} pnl={pnl:.4f}")
+        return await sell(p, "HARD_STOP", pnl, price)
+
     if pnl > 0 and momentum_now > 0.003:
         return False
 
     if -0.03 < pnl < 0 and momentum_now > 0.004:
         return False
 
-    # ===== 分段資金釋放 =====
     if pnl < -0.015 and hold_sec > 20:
         log(f"FAST_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "FAST_CUT", pnl, price)
@@ -1020,6 +1081,10 @@ async def check_sell(p):
     if pnl < 0 and hold_sec > 45:
         log(f"EARLY_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "EARLY_CUT", pnl, price)
+
+    if hold_sec > FORCE_EXIT_SEC:
+        log(f"FORCE_EXIT {p['mint'][:6]} hold={hold_sec:.1f}s pnl={pnl:.4f}")
+        return await sell(p, "FORCE_EXIT", pnl, price)
 
     tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
@@ -1162,6 +1227,12 @@ async def execute_portfolio(ranked):
             log("PAUSE_BAD_RUN")
             return False
 
+        if now() < sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0):
+            log(
+                f"BREATHING_COOLDOWN risk_mult={breathing_risk_mult():.2f} "
+                f"until={int(BREATHING_STATE['cooldown_until'] - now())}s"
+            )
+
         if f.get("_tier") not in {"A", "A+"}:
             log(f"SKIP_NON_A_TIER {m[:6]} tier={f.get('_tier')}")
             continue
@@ -1277,6 +1348,11 @@ def get_metrics():
             "open_exposure": exposure(),
             "forced_trades": engine.stats.get("forced_trades", 0),
             "no_trade_cycles": engine.no_trade_cycles,
+            "breathing_risk_mult": breathing_risk_mult(),
+            "breathing_cooldown_left": max(
+                0,
+                int(sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0) - now())
+            ),
         },
         "positions": engine.positions,
         "recent_trades": engine.trade_history[-20:],
@@ -1309,7 +1385,7 @@ async def main_loop():
     global MEMPOOL_TASK
 
     ensure_engine()
-    log("🚀 V44.1 TRUE FUSION FUND FLOW START")
+    log("🚀 V45 TRUE FUSION BREATHING FUND START")
 
     if MEMPOOL_TASK is None or MEMPOOL_TASK.done():
         MEMPOOL_TASK = asyncio.create_task(mempool_stream())
