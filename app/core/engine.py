@@ -1308,7 +1308,20 @@ def get_metrics():
             "tracked_tokens": tracked_tokens,
             "positions_by_source": dict(Counter([p.get("source", "unknown") for p in engine.positions])),
             "positions_by_strategy": dict(Counter([p.get("mode", "unknown") for p in engine.positions])),
-        }
+        },
+        "open_positions_detail": [
+    {
+        "mint": p.get("mint"),
+        "tier": p.get("tier"),
+        "source": p.get("source"),
+        "mode": p.get("mode"),
+        "entry": p.get("entry"),
+        "size": p.get("size"),
+        "hold_sec": round(time.time() - sf(p.get("time"), time.time()), 2),
+        "high": p.get("high"),
+    }
+    for p in (engine.positions or [])
+]
     }
 
 
