@@ -1,4 +1,4 @@
-# ================= V45 TRUE FUSION FILTER BREATHING FUND FULL =================
+# ================= V50 FINAL FUSION FUND ENGINE =================
 
 import os
 import asyncio
@@ -66,6 +66,8 @@ MIN_ORDER_SOL = float(os.getenv("MIN_ORDER_SOL", "0.01"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0000000001"))
 MAX_PRICE_JUPITER = float(os.getenv("MAX_PRICE_JUPITER", "0.1"))
 MAX_PRICE_FALLBACK = float(os.getenv("MAX_PRICE_FALLBACK", "10"))
+MIN_LIQUIDITY_TRADE = float(os.getenv("MIN_LIQUIDITY_TRADE", "50000"))
+MIN_LIQUIDITY_OBSERVE = float(os.getenv("MIN_LIQUIDITY_OBSERVE", "5000"))
 
 MAX_BREAKOUT_ABS = float(os.getenv("MAX_BREAKOUT_ABS", "0.20"))
 MAX_SCORE = float(os.getenv("MAX_SCORE", "1.5"))
@@ -88,14 +90,30 @@ TOP_K_PRESELECT = int(os.getenv("TOP_K_PRESELECT", "2"))
 
 MEMPOOL_WSS = os.getenv("MEMPOOL_WSS", "wss://api.mainnet-beta.solana.com")
 
-MIN_CONFIRM_MOMENTUM = float(os.getenv("MIN_CONFIRM_MOMENTUM", "0.003"))
-MIN_CONFIRM_BREAKOUT = float(os.getenv("MIN_CONFIRM_BREAKOUT", "0.004"))
+MIN_CONFIRM_MOMENTUM = float(os.getenv("MIN_CONFIRM_MOMENTUM", "0.006"))
+MIN_CONFIRM_BREAKOUT = float(os.getenv("MIN_CONFIRM_BREAKOUT", "0.008"))
 STRICT_A_TIER_THRESHOLD = float(os.getenv("STRICT_A_TIER_THRESHOLD", "0.12"))
 
 BREATHING_LOSS_STREAK = int(os.getenv("BREATHING_LOSS_STREAK", "2"))
 BREATHING_COOLDOWN_SEC = int(os.getenv("BREATHING_COOLDOWN_SEC", "180"))
 BREATHING_MIN_RISK_MULT = float(os.getenv("BREATHING_MIN_RISK_MULT", "0.45"))
 BREATHING_MAX_RISK_MULT = float(os.getenv("BREATHING_MAX_RISK_MULT", "1.20"))
+
+# execution quality guard
+MAX_NEW_BUYS_PER_CYCLE = int(os.getenv("MAX_NEW_BUYS_PER_CYCLE", "1"))
+MAX_BUYS_PER_10MIN = int(os.getenv("MAX_BUYS_PER_10MIN", "12"))
+BUY_WINDOW_SEC = int(os.getenv("BUY_WINDOW_SEC", "600"))
+
+# alpha weights
+ALPHA_BREAKOUT_WEIGHT = float(os.getenv("ALPHA_BREAKOUT_WEIGHT", "0.35"))
+ALPHA_MOMENTUM_WEIGHT = float(os.getenv("ALPHA_MOMENTUM_WEIGHT", "0.25"))
+ALPHA_SMART_WEIGHT = float(os.getenv("ALPHA_SMART_WEIGHT", "0.25"))
+ALPHA_LIQ_WEIGHT = float(os.getenv("ALPHA_LIQ_WEIGHT", "0.10"))
+ALPHA_WALLET_WEIGHT = float(os.getenv("ALPHA_WALLET_WEIGHT", "0.05"))
+
+SNIPER_MULTIPLIER = float(os.getenv("SNIPER_MULTIPLIER", "1.30"))
+SMART_MULTIPLIER = float(os.getenv("SMART_MULTIPLIER", "1.20"))
+MOMENTUM_MULTIPLIER = float(os.getenv("MOMENTUM_MULTIPLIER", "1.00"))
 
 SEARCH_TERMS = [
     "SOL", "USDC", "BONK",
@@ -109,6 +127,7 @@ SEARCH_TERMS = [
 LAST_TRADE = defaultdict(float)
 LAST_PRICE = {}
 LAST_MOMENTUM = {}
+LAST_PRICE_SOURCE = {}
 
 TOKEN_TRADE_COUNT = defaultdict(int)
 BLACKLIST = {}
@@ -120,12 +139,31 @@ SOURCE_STATS = defaultdict(lambda: {
     "total_pnl": 0.0,
 })
 
+STRATEGY_STATS = defaultdict(lambda: {
+    "count": 0,
+    "wins": 0,
+    "losses": 0,
+    "total_pnl": 0.0,
+})
+
+SCORE_COMPONENT_STATS = defaultdict(lambda: {
+    "count": 0,
+    "sum": 0.0,
+})
+
+BUY_TIMES = []
+
 MEMPOOL_BUFFER = []
 MEMPOOL_TASK = None
 
 BREATHING_STATE = {
     "risk_mult": 1.0,
     "cooldown_until": 0.0,
+}
+
+REGIME_STATE = {
+    "mode": "neutral",
+    "last_update": 0.0,
 }
 
 
@@ -164,7 +202,7 @@ def ensure_engine():
 def log(x):
     print(x)
     engine.logs.append(str(x))
-    engine.logs = engine.logs[-700:]
+    engine.logs = engine.logs[-900:]
 
 
 # ================= HELPERS =================
@@ -208,6 +246,20 @@ def source_stat_loss(src, pnl):
     s["losses"] += 1
     s["total_pnl"] += pnl
 
+def strategy_stat_update(strategy, pnl):
+    s = STRATEGY_STATS[strategy]
+    s["count"] += 1
+    s["total_pnl"] += pnl
+    if pnl > 0:
+        s["wins"] += 1
+    else:
+        s["losses"] += 1
+
+def score_stat_add(name, value):
+    s = SCORE_COMPONENT_STATS[name]
+    s["count"] += 1
+    s["sum"] += sf(value)
+
 def dedup(tokens):
     seen = set()
     out = []
@@ -234,19 +286,27 @@ def limit_token_frequency(tokens, max_per_token=2):
 
 def current_dynamic_threshold():
     base = ENTRY_THRESHOLD
+
+    regime = detect_regime()
+    if regime == "bull":
+        base *= 0.92
+    elif regime == "bear":
+        base *= 1.12
+
     if engine.no_trade_cycles > 30:
-        base *= 0.7
+        base *= 0.75
     elif engine.no_trade_cycles > 15:
-        base *= 0.85
+        base *= 0.88
+
     return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
 
-def breakout_strength(b: float) -> float:
+def breakout_strength(b):
     b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if b <= 0:
         return 0.0
     return min(b / 0.05, 1.0) * 0.35
 
-def momentum_strength(m: float) -> float:
+def momentum_strength(m):
     m = clamp(sf(m), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if m <= 0:
         return 0.0
@@ -257,8 +317,12 @@ def recent_closed_trades(n=5):
     rows = [x for x in hist if isinstance(x, dict)]
     return rows[-n:]
 
+def breathing_risk_mult():
+    x = sf(BREATHING_STATE.get("risk_mult", 1.0), 1.0)
+    return clamp(x, BREATHING_MIN_RISK_MULT, BREATHING_MAX_RISK_MULT)
+
 def update_breathing_state():
-    rows = recent_closed_trades(5)
+    rows = recent_closed_trades(6)
     if not rows:
         BREATHING_STATE["risk_mult"] = 1.0
         return
@@ -274,7 +338,7 @@ def update_breathing_state():
     if loss_streak >= BREATHING_LOSS_STREAK:
         BREATHING_STATE["risk_mult"] = max(
             BREATHING_MIN_RISK_MULT,
-            BREATHING_STATE["risk_mult"] * 0.7
+            BREATHING_STATE["risk_mult"] * 0.70
         )
         BREATHING_STATE["cooldown_until"] = now() + BREATHING_COOLDOWN_SEC
         log(
@@ -283,15 +347,52 @@ def update_breathing_state():
         )
         return
 
+    recent = rows[-3:]
+    if recent and all(sf(x.get("pnl"), 0.0) > 0 for x in recent):
+        BREATHING_STATE["risk_mult"] = min(
+            BREATHING_MAX_RISK_MULT,
+            BREATHING_STATE["risk_mult"] + 0.08
+        )
+        log(f"BREATHING_RE_RISK risk_mult={BREATHING_STATE['risk_mult']:.2f}")
+        return
+
     if now() > sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0):
         BREATHING_STATE["risk_mult"] = min(
             BREATHING_MAX_RISK_MULT,
-            BREATHING_STATE["risk_mult"] + 0.05
+            BREATHING_STATE["risk_mult"] + 0.03
         )
 
-def breathing_risk_mult():
-    x = sf(BREATHING_STATE.get("risk_mult", 1.0), 1.0)
-    return clamp(x, BREATHING_MIN_RISK_MULT, BREATHING_MAX_RISK_MULT)
+def detect_regime():
+    # cache 15 sec
+    if now() - sf(REGIME_STATE.get("last_update", 0.0), 0.0) < 15:
+        return REGIME_STATE["mode"]
+
+    rows = recent_closed_trades(8)
+    if len(rows) < 4:
+        REGIME_STATE["mode"] = "neutral"
+        REGIME_STATE["last_update"] = now()
+        return "neutral"
+
+    pnls = [sf(x.get("pnl"), 0.0) for x in rows]
+    wins = sum(1 for x in pnls if x > 0)
+    avg_pnl = sum(pnls) / max(len(pnls), 1)
+    winrate = wins / max(len(pnls), 1)
+
+    mode = "neutral"
+    if winrate >= 0.60 and avg_pnl > 0:
+        mode = "bull"
+    elif winrate <= 0.30 and avg_pnl < 0:
+        mode = "bear"
+
+    REGIME_STATE["mode"] = mode
+    REGIME_STATE["last_update"] = now()
+    return mode
+
+def buy_window_count():
+    cutoff = now() - BUY_WINDOW_SEC
+    while BUY_TIMES and BUY_TIMES[0] < cutoff:
+        BUY_TIMES.pop(0)
+    return len(BUY_TIMES)
 
 
 # ================= HTTP =================
@@ -524,19 +625,19 @@ async def fetch_alpha_candidates():
 
     return out
 
-def source_quality(source: str) -> float:
+def source_quality(source):
     if source == "pumpfun":
-        return 1.20
+        return 1.18
     if source == "mempool":
-        return 1.25
+        return 1.22
     if source == "dexscreener":
-        return 1.05
+        return 0.75
     if source == "fusion":
-        return 1.08
+        return 1.05
     if source == "jupiter":
-        return 0.95
+        return 1.00
     if source == "synthetic":
-        return 0.30
+        return 0.25
     return 1.00
 
 
@@ -635,6 +736,7 @@ async def dexscreener_price(m):
         pair = pairs[0]
 
         native_price = sf(pair.get("priceNative", 0))
+        liq = sf((pair.get("liquidity", {}) or {}).get("usd", 0))
 
         if native_price > 10:
             log(f"DEX_SKIP_BAD_UNIT {m[:6]} {native_price}")
@@ -643,37 +745,55 @@ async def dexscreener_price(m):
         if native_price <= 0 or native_price > MAX_PRICE_FALLBACK:
             return None
 
+        if liq < MIN_LIQUIDITY_OBSERVE:
+            return None
+
         log(f"DEX PRICE: {m[:6]}")
 
         return {
             "price": native_price,
-            "liq": sf((pair.get("liquidity", {}) or {}).get("usd", 0)),
+            "liq": liq,
             "source": "dexscreener",
         }
     except Exception:
         return None
 
-async def get_price_info(m):
+async def get_price_info(m, prefer_clean=False):
+    candidates = []
+
     for fn in (jupiter_price, birdeye_price, dexscreener_price):
         try:
             r = await fn(m)
             if r and r.get("price"):
-                return r
+                candidates.append(r)
         except Exception:
             pass
+
+    if prefer_clean:
+        for r in candidates:
+            if r.get("source") == "jupiter" and sf(r.get("liq", 0), 0.0) >= MIN_LIQUIDITY_TRADE:
+                return r
+        return None
+
+    for r in candidates:
+        if r.get("source") == "jupiter":
+            return r
+
+    if candidates:
+        return candidates[0]
 
     last = LAST_PRICE.get(m)
     if last:
         return {
             "price": last,
             "liq": 0,
-            "source": "last_price",
+            "source": LAST_PRICE_SOURCE.get(m, "last_price"),
         }
 
     return None
 
 async def get_price(m):
-    info = await get_price_info(m)
+    info = await get_price_info(m, prefer_clean=False)
     if not info:
         return None
     return info["price"]
@@ -686,8 +806,15 @@ async def features(t):
     if not m:
         return None
 
-    pinfo = await get_price_info(m)
+    # V47/V48/V49/V50: buy-side 只接受乾淨市場
+    pinfo = await get_price_info(m, prefer_clean=True)
     if not pinfo:
+        return None
+
+    if pinfo.get("source") != "jupiter":
+        return None
+
+    if sf(pinfo.get("liq", 0), 0.0) < MIN_LIQUIDITY_TRADE:
         return None
 
     price = pinfo["price"]
@@ -696,29 +823,28 @@ async def features(t):
     if prev and prev > 0:
         breakout = (price - prev) / prev
     else:
-        breakout = random.uniform(0.003, 0.02)
+        breakout = random.uniform(0.004, 0.02)
 
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
-
     if abs(breakout) < 0.001:
-        breakout = 0.003
+        breakout = 0.004
 
     momentum = 0.0
     try:
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.35)
         p2 = await get_price(m)
-        if price and p2:
+        if price and p2 and p2 > 0:
             momentum = (p2 - price) / price
     except Exception:
         momentum = 0.0
 
     momentum = clamp(momentum, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
-
     if abs(momentum) < 0.001:
         momentum = breakout * 0.5
 
     LAST_MOMENTUM[m] = momentum
     LAST_PRICE[m] = price
+    LAST_PRICE_SOURCE[m] = pinfo.get("source", "unknown")
 
     try:
         wallets = await update_token_wallets(m)
@@ -767,34 +893,34 @@ def score_alpha(f):
     smart = f.get("smart", 0.0)
     liq = f.get("liq", 0.0)
 
+    if f.get("price_source") != "jupiter":
+        return 0.0, {
+            "bscore": 0.0, "mscore": 0.0, "sscore": 0.0,
+            "lscore": 0.0, "wscore": 0.0, "nscore": 0.0,
+        }
+
+    if sf(liq, 0.0) < MIN_LIQUIDITY_TRADE:
+        return 0.0, {
+            "bscore": 0.0, "mscore": 0.0, "sscore": 0.0,
+            "lscore": 0.0, "wscore": 0.0, "nscore": 0.0,
+        }
+
     if momentum < MIN_CONFIRM_MOMENTUM:
         return 0.0, {
-            "bscore": 0.0,
-            "mscore": 0.0,
-            "sscore": 0.0,
-            "lscore": 0.0,
-            "wscore": 0.0,
-            "nscore": 0.0,
+            "bscore": 0.0, "mscore": 0.0, "sscore": 0.0,
+            "lscore": 0.0, "wscore": 0.0, "nscore": 0.0,
         }
 
     if breakout < MIN_CONFIRM_BREAKOUT:
         return 0.0, {
-            "bscore": 0.0,
-            "mscore": 0.0,
-            "sscore": 0.0,
-            "lscore": 0.0,
-            "wscore": 0.0,
-            "nscore": 0.0,
+            "bscore": 0.0, "mscore": 0.0, "sscore": 0.0,
+            "lscore": 0.0, "wscore": 0.0, "nscore": 0.0,
         }
 
     if breakout > 0.01 and momentum < 0:
         return 0.0, {
-            "bscore": 0.0,
-            "mscore": 0.0,
-            "sscore": 0.0,
-            "lscore": 0.0,
-            "wscore": 0.0,
-            "nscore": 0.0,
+            "bscore": 0.0, "mscore": 0.0, "sscore": 0.0,
+            "lscore": 0.0, "wscore": 0.0, "nscore": 0.0,
         }
 
     bscore = breakout_strength(breakout)
@@ -814,14 +940,29 @@ def score_alpha(f):
 
     nscore = clamp(sf(f.get("sniper_boost", 0)), 0.0, 0.12)
 
+    score_stat_add("breakout", breakout)
+    score_stat_add("momentum", momentum)
+    score_stat_add("smart_money", smart)
+    score_stat_add("liquidity", liq)
+    score_stat_add("wallet_count", wc)
+    score_stat_add("price", f.get("price", 0))
+
     score = (
-        bscore * 0.45 +
-        mscore * 0.10 +
-        sscore * 0.20 +
-        lscore * 0.20 +
-        wscore +
+        bscore * ALPHA_BREAKOUT_WEIGHT +
+        mscore * ALPHA_MOMENTUM_WEIGHT +
+        sscore * ALPHA_SMART_WEIGHT +
+        lscore * ALPHA_LIQ_WEIGHT +
+        wscore * ALPHA_WALLET_WEIGHT +
         nscore * 0.05
     )
+
+    mtype = mode(f)
+    if mtype == "sniper":
+        score *= SNIPER_MULTIPLIER
+    elif mtype == "smart":
+        score *= SMART_MULTIPLIER
+    else:
+        score *= MOMENTUM_MULTIPLIER
 
     return clamp(score, 0.0, MAX_SCORE), {
         "bscore": bscore,
@@ -840,9 +981,9 @@ def source_weight(src):
     if total >= 5:
         winrate = s["wins"] / total if total else 0.0
         if winrate > 0.6:
-            mem = 1.15
+            mem = 1.12
         elif winrate < 0.3:
-            mem = 0.85
+            mem = 0.82
 
     return mem * source_quality(src)
 
@@ -853,6 +994,12 @@ def score_with_allocator(f):
     if TOKEN_TRADE_COUNT[f["mint"]] > 2:
         base *= 0.7
 
+    regime = detect_regime()
+    if regime == "bull":
+        base *= 1.08
+    elif regime == "bear":
+        base *= 0.88
+
     return max(base, 0.0), mode(f), detail
 
 def allocate_size(score, n_candidates):
@@ -861,18 +1008,24 @@ def allocate_size(score, n_candidates):
 
     base = engine.capital / max(n_candidates * 2, 2)
 
-    if score > 0.15:
+    regime = detect_regime()
+    if regime == "bull":
+        base *= 1.20
+    elif regime == "bear":
+        base *= 0.65
+
+    if score > 0.16:
         base *= 2.0
-    elif score > 0.13:
-        base *= 1.5
+    elif score > 0.14:
+        base *= 1.65
     elif score > 0.12:
-        base *= 1.1
+        base *= 1.15
     else:
-        base *= 0.5
+        base *= 0.55
 
     base *= breathing_risk_mult()
 
-    base = min(base, 0.2)
+    base = min(base, 0.20)
     return min(base, engine.capital * MAX_POSITION_SIZE)
 
 
@@ -922,6 +1075,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "price": f.get("price"),
         "score": f.get("_score"),
         "tier": f.get("_tier"),
+        "regime": detect_regime(),
     })
 
     engine.positions.append({
@@ -946,6 +1100,8 @@ async def buy(m, f, position_size, mtype, forced=False):
     })
 
     LAST_TRADE[m] = now()
+    BUY_TIMES.append(now())
+
     engine.stats["executed"] += 1
     engine.stats["signals"] += 1
     if forced:
@@ -998,12 +1154,16 @@ async def sell(p, reason, pnl, price):
     update_peak_capital()
 
     src = p.get("source", "unknown")
+    strategy = p.get("mode", "unknown")
+
     if pnl > 0:
         engine.stats["wins"] += 1
         source_stat_win(src, pnl)
     else:
         engine.stats["losses"] += 1
         source_stat_loss(src, pnl)
+
+    strategy_stat_update(strategy, pnl)
 
     push_trade({
         "mint": m,
@@ -1012,7 +1172,7 @@ async def sell(p, reason, pnl, price):
         "pnl": pnl,
         "reason": reason,
         "size": p.get("size"),
-        "mode": p.get("mode"),
+        "mode": strategy,
         "source": src,
         "price_source": p.get("price_source"),
         "time_open": p.get("time"),
@@ -1045,108 +1205,116 @@ async def check_sell(p):
 
     hold_sec = now() - sf(p.get("time"), now())
 
-    # ===== 防極小價格（單位錯誤）=====
     if price < 1e-8:
         log(f"PRICE_TOO_SMALL_SKIP {m[:6]} {price}")
         return False
 
-    # ===== 剛進場保護 =====
     if hold_sec < 8:
         return False
 
     last = LAST_PRICE.get(m)
 
-    # ===== 抗亂價（核心修正）=====
     if last and last > 0:
         jump = abs(price - last) / last
-
         if jump > 0.25:
             log(f"BAD_PRICE_DETECTED {m[:6]} jump={jump:.2f}")
-
-            # ❗短時間內 → 忽略
             if hold_sec < 20:
                 return False
-
-            # ❗持倉久 → 不再信 last_price
             else:
                 log(f"FORCE_USE_PRICE {m[:6]}")
 
     pnl = (price - entry) / entry
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
-    # 更新 high
     p["high"] = max(sf(p.get("high"), entry), price)
 
     tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier", "C")
     momentum_now = sf(LAST_MOMENTUM.get(m, 0.0), 0.0)
+    regime = detect_regime()
 
-    # ================= 💀 強制退出（最重要） =================
-    if hold_sec > 90:
+    # hard stop
+    if pnl <= HARD_STOP_LOSS:
+        log(f"HARD_STOP {m[:6]} pnl={pnl:.4f}")
+        return await sell(p, "HARD_STOP", pnl, price)
+
+    # force exit
+    if hold_sec > FORCE_EXIT_SEC:
         log(f"FORCE_EXIT {m[:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "FORCE_EXIT", pnl, price)
 
-    # ================= 🩸 快速止血 =================
-    if pnl < -0.02 and hold_sec > 20:
+    # fast cut
+    fast_cut_line = -0.02 if regime != "bear" else -0.015
+    if pnl < fast_cut_line and hold_sec > 20:
         log(f"FAST_CUT {m[:6]} pnl={pnl:.4f}")
         return await sell(p, "FAST_CUT", pnl, price)
 
-    # ================= 🧠 momentum 保護 =================
-    if pnl > 0 and momentum_now > 0.003:
+    # profit momentum hold
+    if pnl > 0 and momentum_now > 0.0035:
         return False
 
-    if -0.02 < pnl < 0 and momentum_now > 0.004:
+    # small red but momentum alive
+    if -0.02 < pnl < 0 and momentum_now > 0.0045:
         return False
 
-    # ================= 💰 partial TP =================
+    # partial TP
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
-
         original_size = sf(p.get("size", 0.0), 0.0)
         partial = original_size * 0.5
-
         p["size"] = original_size * 0.5
         engine.capital += partial
-
         log(f"PARTIAL_TP {m[:6]} pnl={pnl:.4f}")
 
-    # ================= 🎯 TP =================
-    tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
+    tp = TAKE_PROFIT
+    if tier == "A+":
+        tp *= 2.2
+    elif tier == "A":
+        tp *= 1.8
+
+    if regime == "bull":
+        tp *= 1.15
+    elif regime == "bear":
+        tp *= 0.85
 
     if pnl >= tp:
         return await sell(p, "TP", pnl, price)
 
-    # ================= 🛑 SL（二次確認） =================
     if pnl <= STOP_LOSS:
         await asyncio.sleep(0.4)
         price2 = await get_price(m)
-
         if price2:
             pnl2 = (price2 - entry) / entry
             pnl2 = clamp(pnl2, -MAX_PNL_ABS, MAX_PNL_ABS)
-
             if pnl2 <= STOP_LOSS:
                 log(f"CONFIRMED_SL {m[:6]} pnl={pnl2:.4f}")
                 return await sell(p, "SL", pnl2, price2)
-
         return False
 
-    # ================= 📉 trailing =================
-    if price < p["high"] * (1 - TRAILING_GAP):
+    dynamic_trailing_gap = TRAILING_GAP
+    if tier == "A+":
+        dynamic_trailing_gap *= 1.15
+    if regime == "bear":
+        dynamic_trailing_gap *= 0.85
+
+    if price < p["high"] * (1 - dynamic_trailing_gap):
         log(f"TRAIL_EXIT {m[:6]} pnl={pnl:.4f}")
         return await sell(p, "TRAIL", pnl, price)
 
-    # ================= ⏳ TIME EXIT =================
-    if hold_sec > MAX_HOLD_SEC:
+    dynamic_hold = MAX_HOLD_SEC
+    if regime == "bull":
+        dynamic_hold = int(MAX_HOLD_SEC * 1.25)
+    elif regime == "bear":
+        dynamic_hold = int(MAX_HOLD_SEC * 0.70)
+
+    if hold_sec > dynamic_hold:
         log(
             f"TIME_CHECK {m[:6]} pnl={pnl:.4f} "
-            f"momentum={momentum_now:.4f} tier={tier}"
+            f"momentum={momentum_now:.4f} tier={tier} regime={regime}"
         )
 
-        # A 幣還有動能 → 放
-        if tier == "A" and momentum_now > 0.002:
+        if tier in {"A", "A+"} and momentum_now > 0.0025 and pnl > 0:
             return False
 
-        # 不動 or 微虧 → 出
         if pnl < 0.003:
             return await sell(p, "TIME", pnl, price)
 
@@ -1158,6 +1326,7 @@ async def check_sell(p):
 async def process_candidates(tokens):
     ranked = []
     dyn_threshold = current_dynamic_threshold()
+    regime = detect_regime()
 
     for t in tokens:
         m = t.get("mint")
@@ -1180,13 +1349,18 @@ async def process_candidates(tokens):
         sc, mtype, detail = score_with_allocator(f)
 
         min_threshold = max(dyn_threshold, STRICT_A_TIER_THRESHOLD)
+        if regime == "bear":
+            min_threshold = max(min_threshold, STRICT_A_TIER_THRESHOLD + 0.01)
+        elif regime == "bull":
+            min_threshold *= 0.95
+
         if sc < min_threshold:
             continue
 
         f["_score"] = sc
         f["_mode"] = mtype
 
-        if sc >= 0.15:
+        if sc >= 0.16:
             f["_tier"] = "A+"
         elif sc >= STRICT_A_TIER_THRESHOLD:
             f["_tier"] = "A"
@@ -1225,6 +1399,7 @@ async def execute_portfolio(ranked):
         return False
 
     traded = False
+    buys_this_cycle = 0
 
     ranked = sorted(ranked, key=lambda x: x["_score"], reverse=True)
     ranked = ranked[:TOP_K_PRESELECT]
@@ -1238,6 +1413,10 @@ async def execute_portfolio(ranked):
             f"BREATHING_COOLDOWN risk_mult={breathing_risk_mult():.2f} "
             f"until={int(BREATHING_STATE['cooldown_until'] - now())}s"
         )
+
+    if buy_window_count() >= MAX_BUYS_PER_10MIN:
+        log("BUY_RATE_LIMIT")
+        return False
 
     for f in ranked:
         m = f["mint"]
@@ -1268,7 +1447,6 @@ async def execute_portfolio(ranked):
             log(f"SKIP_COOLDOWN {m[:6]}")
             continue
 
-        # 冷卻期內只允許 A+ 或超高分單
         if in_breathing_cooldown:
             if f.get("_tier") != "A+" and sf(f.get("_score"), 0.0) < max(STRICT_A_TIER_THRESHOLD + 0.02, 0.14):
                 log(f"SKIP_BREATHING_COOLDOWN {m[:6]} score={f['_score']:.4f} tier={f.get('_tier')}")
@@ -1295,10 +1473,8 @@ async def execute_portfolio(ranked):
             continue
 
         pos_size = allocate_size(f["_score"], len(ranked))
-
-        # 冷卻期內再額外縮倉
         if in_breathing_cooldown:
-            pos_size *= 0.7
+            pos_size *= 0.70
 
         log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} tier={f.get('_tier','?')} mode={f['_mode']}")
         log(f"ALLOC_SIZE {m[:6]} size={pos_size:.4f} capital={engine.capital:.4f}")
@@ -1313,7 +1489,12 @@ async def execute_portfolio(ranked):
 
         if success:
             TOKEN_TRADE_COUNT[m] += 1
+            buys_this_cycle += 1
             traded = True
+
+            if buys_this_cycle >= MAX_NEW_BUYS_PER_CYCLE:
+                break
+
             if TOP_N_TO_TRADE <= 1:
                 break
 
@@ -1321,6 +1502,37 @@ async def execute_portfolio(ranked):
 
 
 # ================= METRICS =================
+
+def _avg_stat(name):
+    s = SCORE_COMPONENT_STATS.get(name, {"count": 0, "sum": 0.0})
+    c = s.get("count", 0)
+    if c <= 0:
+        return {"count": 0, "avg_score": 0.0}
+    return {"count": c, "avg_score": s.get("sum", 0.0) / c}
+
+def _source_perf(src):
+    s = SOURCE_STATS.get(src, {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0})
+    c = s["count"]
+    return {
+        "count": c,
+        "wins": s["wins"],
+        "losses": s["losses"],
+        "total_pnl": s["total_pnl"],
+        "avg_pnl": s["total_pnl"] / c if c else 0.0,
+        "win_rate": s["wins"] / c if c else 0.0,
+    }
+
+def _strategy_perf(name):
+    s = STRATEGY_STATS.get(name, {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0})
+    c = s["count"]
+    return {
+        "count": c,
+        "wins": s["wins"],
+        "losses": s["losses"],
+        "total_pnl": s["total_pnl"],
+        "avg_pnl": s["total_pnl"] / c if c else 0.0,
+        "win_rate": s["wins"] / c if c else 0.0,
+    }
 
 def get_metrics():
     start_capital = sf(engine.start_capital, 5.0)
@@ -1353,6 +1565,15 @@ def get_metrics():
 
     tracked_tokens = len(set(LAST_PRICE.keys()))
 
+    source_perf = {k: _source_perf(k) for k in SOURCE_STATS.keys()}
+    strategy_perf = {k: _strategy_perf(k) for k in STRATEGY_STATS.keys()}
+
+    best_source = None
+    worst_source = None
+    if source_perf:
+        best_source = max(source_perf.items(), key=lambda x: x[1]["avg_pnl"])[0]
+        worst_source = min(source_perf.items(), key=lambda x: x[1]["avg_pnl"])[0]
+
     return {
         "summary": {
             "capital": capital,
@@ -1363,6 +1584,7 @@ def get_metrics():
             "drawdown": drawdown,
             "running": bool(engine.running),
             "mode": "REAL" if REAL_TRADING else "PAPER",
+            "regime": detect_regime(),
         },
         "performance": {
             "trades": trades,
@@ -1388,15 +1610,40 @@ def get_metrics():
                 0,
                 int(sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0) - now())
             ),
+            "buy_window_count": buy_window_count(),
         },
         "positions": engine.positions,
         "recent_trades": engine.trade_history[-20:],
         "logs": engine.logs[-120:],
-        "source_stats": dict(SOURCE_STATS),
+        "source_stats": source_perf,
+        "strategy_stats": strategy_perf,
+        "best_source": _source_perf(best_source) if best_source else None,
+        "worst_source": _source_perf(worst_source) if worst_source else None,
+        "score_component_stats": {
+            "breakout": _avg_stat("breakout"),
+            "smart_money": _avg_stat("smart_money"),
+            "liquidity": _avg_stat("liquidity"),
+            "momentum": _avg_stat("momentum"),
+            "wallet_count": _avg_stat("wallet_count"),
+            "price": _avg_stat("price"),
+        },
         "portfolio": {
-            "tracked_tokens": tracked_tokens,
             "positions_by_source": dict(Counter([p.get("source", "unknown") for p in engine.positions])),
             "positions_by_strategy": dict(Counter([p.get("mode", "unknown") for p in engine.positions])),
+            "total_exposure_ratio": exposure() / capital if capital > 0 else 0.0,
+            "source_exposure_ratio": {
+                k: sum(sf(p.get("size", 0.0)) for p in engine.positions if p.get("source") == k) / capital
+                for k in set([p.get("source", "unknown") for p in engine.positions])
+            } if capital > 0 else {},
+            "strategy_snapshot": {
+                k: v for k, v in strategy_perf.items()
+            },
+        },
+        "smart_wallet": {
+            "tracked_tokens": tracked_tokens,
+            "wallet_count_by_token": {
+                k: 1 for k in list(LAST_PRICE.keys())[-100:]
+            }
         },
         "open_positions_detail": [
             {
@@ -1408,6 +1655,7 @@ def get_metrics():
                 "size": p.get("size"),
                 "hold_sec": round(time.time() - sf(p.get("time"), time.time()), 2),
                 "high": p.get("high"),
+                "price_source": p.get("price_source"),
             }
             for p in (engine.positions or [])
         ]
@@ -1420,7 +1668,7 @@ async def main_loop():
     global MEMPOOL_TASK
 
     ensure_engine()
-    log("🚀 V45 TRUE FUSION BREATHING FUND START")
+    log("🚀 V50 FINAL FUSION FUND START")
 
     if MEMPOOL_TASK is None or MEMPOOL_TASK.done():
         MEMPOOL_TASK = asyncio.create_task(mempool_stream())
@@ -1463,7 +1711,6 @@ async def main_loop():
                 and exposure() < engine.capital * MAX_EXPOSURE
             ):
                 current_mints = {p["mint"] for p in engine.positions}
-
                 for f in ranked[:TOP_K_PRESELECT]:
                     if f["mint"] in current_mints:
                         continue
