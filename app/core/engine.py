@@ -1,13 +1,15 @@
-# ================= V41 TRUE ALPHA FILTER FULL MARKET =================
+# ================= V41+V42 TRUE FUSION FILTER FULL MARKET =================
 
 import os
 import asyncio
 import time
 import random
 import math
+import json
 from collections import defaultdict, Counter
 
 import httpx
+import websockets
 
 from app.state import engine
 from app.alpha.adaptive_filter import adaptive_filter
@@ -73,15 +75,23 @@ MIN_OUT_AMOUNT_STRICT = int(os.getenv("MIN_OUT_AMOUNT_STRICT", "1000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
-MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "5"))
+MIN_UNIVERSE = int(os.getenv("MIN_UNIVERSE", "20"))
 BOOT_SYNTHETIC_UNIVERSE = os.getenv("BOOT_SYNTHETIC_UNIVERSE", "true").lower() == "true"
 
 ADAPTIVE_THRESHOLD_MIN = float(os.getenv("ADAPTIVE_THRESHOLD_MIN", "0.005"))
 ADAPTIVE_THRESHOLD_MAX = float(os.getenv("ADAPTIVE_THRESHOLD_MAX", "0.08"))
 
 TOP_N_TO_TRADE = int(os.getenv("TOP_N_TO_TRADE", "1"))
-MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "25"))
+MAX_TOKENS_PER_CYCLE = int(os.getenv("MAX_TOKENS_PER_CYCLE", "60"))
 TOP_K_PRESELECT = int(os.getenv("TOP_K_PRESELECT", "3"))
+
+MEMPOOL_WSS = os.getenv("MEMPOOL_WSS", "wss://api.mainnet-beta.solana.com")
+
+SEARCH_TERMS = [
+    "SOL", "USDC", "BONK",
+    "MEME", "PEPE", "DOG", "AI",
+    "PUMP", "NEW", "MOON", "100x"
+]
 
 
 # ================= RUNTIME MEMORY =================
@@ -99,6 +109,8 @@ SOURCE_STATS = defaultdict(lambda: {
     "losses": 0,
     "total_pnl": 0.0,
 })
+
+MEMPOOL_BUFFER = []
 
 
 # ================= ENGINE =================
@@ -262,6 +274,62 @@ async def http_get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
         return None
 
 
+# ================= V42 MEMPOOL + DEX BULK =================
+
+async def mempool_stream():
+    while True:
+        try:
+            async with websockets.connect(MEMPOOL_WSS, ping_interval=20) as ws:
+                sub = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {
+                            "mentions": [
+                                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5W6s8nH9c"
+                            ]
+                        },
+                        {"commitment": "processed"}
+                    ]
+                }
+                await ws.send(json.dumps(sub))
+
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    text = json.dumps(data)
+
+                    for word in text.replace('"', " ").replace(",", " ").split():
+                        if 32 <= len(word) <= 48 and word.isalnum():
+                            MEMPOOL_BUFFER.append({
+                                "mint": word,
+                                "source": "mempool",
+                                "meta": {},
+                            })
+                            if len(MEMPOOL_BUFFER) > 300:
+                                del MEMPOOL_BUFFER[:-300]
+        except Exception as e:
+            log(f"MEMPOOL_ERR {e}")
+            await asyncio.sleep(2)
+
+def flush_mempool():
+    out = []
+    while MEMPOOL_BUFFER:
+        out.append(MEMPOOL_BUFFER.pop(0))
+    return out
+
+async def fetch_dex_bulk():
+    tasks = [fetch_dexscreener_candidates(q) for q in SEARCH_TERMS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged = []
+    for r in results:
+        if isinstance(r, list):
+            merged.extend(r)
+    return merged
+
+
 # ================= TRUE ALPHA SOURCES =================
 
 async def fetch_fusion_candidates():
@@ -287,7 +355,7 @@ async def fetch_fusion_candidates():
         log("FUSION: 0")
         return []
 
-async def fetch_pumpfun_candidates(limit=20):
+async def fetch_pumpfun_candidates(limit=30):
     url = "https://frontend-api.pump.fun/coins/latest"
     data = await http_get(url)
 
@@ -393,9 +461,7 @@ async def fetch_alpha_candidates():
         fetch_fusion_candidates(),
         fetch_pumpfun_candidates(),
         fetch_jupiter_candidates(),
-        fetch_dexscreener_candidates("SOL"),
-        fetch_dexscreener_candidates("USDC"),
-        fetch_dexscreener_candidates("BONK"),
+        fetch_dex_bulk(),
         return_exceptions=True,
     )
 
@@ -404,20 +470,33 @@ async def fetch_alpha_candidates():
         if isinstance(r, list):
             merged.extend(r)
 
-    if len(merged) < MIN_UNIVERSE and BOOT_SYNTHETIC_UNIVERSE:
-        log(f"LOW_UNIVERSE_BOOT {len(merged)}")
+    merged.extend(flush_mempool())
+
+    seen = set()
+    out = []
+    for t in merged:
+        m = t.get("mint")
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        out.append(t)
+
+    if len(out) < MIN_UNIVERSE and BOOT_SYNTHETIC_UNIVERSE:
+        log(f"LOW_UNIVERSE_BOOT {len(out)}")
         for i in range(10):
-            merged.append({
+            out.append({
                 "mint": f"SIM{i}{random.randint(1000,9999)}",
                 "source": "synthetic",
                 "meta": {},
             })
 
-    return merged
+    return out
 
 def source_quality(source: str) -> float:
     if source == "pumpfun":
         return 1.20
+    if source == "mempool":
+        return 1.25
     if source == "dexscreener":
         return 1.05
     if source == "fusion":
@@ -620,6 +699,8 @@ async def features(t):
     sniper_boost = 0.0
     if t.get("source") == "pumpfun":
         sniper_boost += 0.05
+    if t.get("source") == "mempool":
+        sniper_boost += 0.08
     if pinfo.get("source") == "jupiter":
         sniper_boost += 0.02
 
@@ -939,7 +1020,6 @@ async def process_candidates(tokens):
 
         sc, mtype, detail = score_with_allocator(f)
 
-        # ===== V41 HARD FILTER =====
         min_threshold = max(dyn_threshold, 0.10)
         if sc < min_threshold:
             continue
@@ -1130,7 +1210,9 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V41 TRUE ALPHA FILTER START")
+    log("🚀 V41+V42 TRUE FUSION START")
+
+    asyncio.create_task(mempool_stream())
 
     while engine.running:
         try:
