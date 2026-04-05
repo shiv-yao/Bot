@@ -1211,6 +1211,7 @@ async def process_candidates(tokens):
 
 async def execute_portfolio(ranked):
     if not ranked:
+        log("EXEC_INPUT 0")
         return False
 
     traded = False
@@ -1218,20 +1219,24 @@ async def execute_portfolio(ranked):
     ranked = sorted(ranked, key=lambda x: x["_score"], reverse=True)
     ranked = ranked[:TOP_K_PRESELECT]
 
+    log(f"EXEC_INPUT {len(ranked)}")
     log("TOP_RANKED " + " | ".join([f"{r['mint'][:6]}:{r['_score']:.4f}" for r in ranked]))
+
+    in_breathing_cooldown = now() < sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0)
+    if in_breathing_cooldown:
+        log(
+            f"BREATHING_COOLDOWN risk_mult={breathing_risk_mult():.2f} "
+            f"until={int(BREATHING_STATE['cooldown_until'] - now())}s"
+        )
 
     for f in ranked:
         m = f["mint"]
 
+        log(f"EXEC_CANDIDATE {m[:6]} score={f['_score']:.4f} tier={f.get('_tier')} mode={f.get('_mode')}")
+
         if engine.stats.get("executed", 0) > 10 and engine.stats.get("wins", 0) == 0:
             log("PAUSE_BAD_RUN")
             return False
-
-        if now() < sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0):
-            log(
-                f"BREATHING_COOLDOWN risk_mult={breathing_risk_mult():.2f} "
-                f"until={int(BREATHING_STATE['cooldown_until'] - now())}s"
-            )
 
         if f.get("_tier") not in {"A", "A+"}:
             log(f"SKIP_NON_A_TIER {m[:6]} tier={f.get('_tier')}")
@@ -1253,11 +1258,25 @@ async def execute_portfolio(ranked):
             log(f"SKIP_COOLDOWN {m[:6]}")
             continue
 
+        # 冷卻期內只允許 A+ 或超高分單
+        if in_breathing_cooldown:
+            if f.get("_tier") != "A+" and sf(f.get("_score"), 0.0) < max(STRICT_A_TIER_THRESHOLD + 0.02, 0.14):
+                log(f"SKIP_BREATHING_COOLDOWN {m[:6]} score={f['_score']:.4f} tier={f.get('_tier')}")
+                continue
+
         if SOFT_DISABLE_FILTER:
             ok = True
+            log(f"FILTER_BYPASS {m[:6]} SOFT_DISABLE_FILTER=true")
         else:
-            ok, _ = adaptive_filter(f, None, engine.no_trade_cycles)
+            try:
+                ok, meta = adaptive_filter(f, None, engine.no_trade_cycles)
+                log(f"FILTER_META {m[:6]} meta={meta}")
+            except Exception as e:
+                log(f"FILTER_ERR {m[:6]} {e}")
+                ok = False
+
             if not ok and f["_score"] >= FILTER_SCORE_BYPASS:
+                log(f"FILTER_SCORE_BYPASS_HIT {m[:6]} score={f['_score']:.4f}")
                 ok = True
 
         log(f"FILTER_RESULT {m[:6]} ok={ok}")
@@ -1266,6 +1285,11 @@ async def execute_portfolio(ranked):
             continue
 
         pos_size = allocate_size(f["_score"], len(ranked))
+
+        # 冷卻期內再額外縮倉
+        if in_breathing_cooldown:
+            pos_size *= 0.7
+
         log(f"TRY_PORTFOLIO {m[:6]} score={f['_score']:.4f} tier={f.get('_tier','?')} mode={f['_mode']}")
         log(f"ALLOC_SIZE {m[:6]} size={pos_size:.4f} capital={engine.capital:.4f}")
 
@@ -1273,6 +1297,7 @@ async def execute_portfolio(ranked):
             log(f"SKIP_SIZE_OR_CAPITAL {m[:6]}")
             continue
 
+        log(f"PRE_BUY {m[:6]} size={pos_size:.4f}")
         success = await buy(m, f, pos_size, f["_mode"])
         log(f"BUY_RESULT {m[:6]} success={success}")
 
