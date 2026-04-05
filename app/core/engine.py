@@ -983,6 +983,12 @@ async def check_sell(p):
     if entry <= 0:
         return False
 
+    if now() - p["time"] < 3:
+        return False
+
+
+    
+
     pnl = (price - entry) / entry
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
