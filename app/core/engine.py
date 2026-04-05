@@ -985,8 +985,10 @@ async def check_sell(p):
     if entry <= 0:
         return False
 
+    hold_sec = now() - sf(p.get("time"), now())
+
     # 剛進場保護
-    if now() - p["time"] < 8:
+    if hold_sec < 8:
         return False
 
     # 壞價格保護
@@ -1005,27 +1007,35 @@ async def check_sell(p):
 
     p["high"] = max(sf(p.get("high"), entry), price)
 
+    tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier")
+    momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0), 0.0)
+
     # momentum 正就不急著賣
-    if pnl > 0 and LAST_MOMENTUM.get(p["mint"], 0) > 0:
+    if pnl > 0 and momentum_now > 0:
         return False
 
     # 抗噪音 SL：小幅虧損但 momentum 還是正，不賣
-    if pnl < 0 and pnl > -0.03:
-        if LAST_MOMENTUM.get(p["mint"], 0) > 0:
-            return False
+    if pnl < 0 and pnl > -0.03 and momentum_now > 0:
+        return False
+
+    # ===== V44 資金釋放機制 =====
+    # 已持有一段時間還在虧，直接砍掉，釋放資金給下一輪
+    if pnl < 0 and hold_sec > 60:
+        log(f"EARLY_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
+        return await sell(p, "EARLY_CUT", pnl, price)
 
     # partial TP
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
 
-        partial = p["size"] * 0.5
-        p["size"] *= 0.5
+        original_size = sf(p.get("size", 0.0), 0.0)
+        partial = original_size * 0.5
+        p["size"] = original_size * 0.5
         engine.capital += partial
 
         log(f"PARTIAL_TP {p['mint'][:6]} pnl={pnl:.4f}")
 
     # A級延長 TP
-    tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier")
     tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
     reason = None
@@ -1040,6 +1050,17 @@ async def check_sell(p):
         if price2 is None:
             return False
 
+        # 第二次價格也做壞價保護
+        last2 = LAST_PRICE.get(p["mint"])
+        if last2 and last2 > 0:
+            jump2 = abs(price2 - last2) / last2
+            if jump2 > 0.25:
+                log(
+                    f"SELL_SKIP_BAD_PRICE2 {p['mint'][:6]} "
+                    f"price={price2:.10f} last={last2:.10f}"
+                )
+                return False
+
         pnl2 = (price2 - entry) / entry
         pnl2 = clamp(pnl2, -MAX_PNL_ABS, MAX_PNL_ABS)
 
@@ -1053,9 +1074,9 @@ async def check_sell(p):
     elif price < p["high"] * (1 - TRAILING_GAP):
         reason = "TRAIL"
 
-    elif now() - sf(p.get("time"), now()) > MAX_HOLD_SEC:
+    elif hold_sec > MAX_HOLD_SEC:
         # A級幣如果還有正動能，延長持有
-        if tier == "A" and LAST_MOMENTUM.get(p["mint"], 0) > 0.003:
+        if tier == "A" and momentum_now > 0.003:
             return False
         reason = "TIME"
 
