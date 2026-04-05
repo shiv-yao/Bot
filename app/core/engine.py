@@ -1006,6 +1006,12 @@ async def check_sell(p):
     if pnl > 0 and LAST_MOMENTUM.get(p["mint"], 0) > 0:
         return False
 
+    if pnl < 0 and pnl > -0.03:
+    if LAST_MOMENTUM.get(p["mint"], 0) > 0:
+        return False
+
+    
+
     # partial TP
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
