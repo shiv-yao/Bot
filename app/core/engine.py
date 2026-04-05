@@ -974,6 +974,11 @@ async def sell(p, reason, pnl, price):
     engine.last_trade = f"SELL {m[:6]} {reason} pnl={pnl:.4f}"
     return True
 
+# ================= V43 TRUE ALPHA FUND MODE =================
+
+# 👉 只貼「需要改的核心 SELL 邏輯」
+# （其他全部保留你原本 V41）
+
 async def check_sell(p):
     price = await get_price(p["mint"])
     if price is None:
@@ -983,24 +988,50 @@ async def check_sell(p):
     if entry <= 0:
         return False
 
-    if now() - p["time"] < 3:
-        return False
-
-
-    
-
     pnl = (price - entry) / entry
     pnl = clamp(pnl, -MAX_PNL_ABS, MAX_PNL_ABS)
 
     p["high"] = max(sf(p.get("high"), entry), price)
 
+    # ================= V43 升級 =================
+
+    # 🚫 1. 剛進場保護（防止被瞬間洗掉）
+    if now() - p["time"] < 3:
+        return False
+
+    # 🚫 2. momentum 正 → 不賣（核心）
+    if pnl > 0 and LAST_MOMENTUM.get(p["mint"], 0) > 0:
+        return False
+
+    # 💰 3. 分批止盈（鎖利潤）
+    if pnl >= 0.008 and not p.get("tp1_done"):
+        p["tp1_done"] = True
+
+        partial = p["size"] * 0.5
+        p["size"] *= 0.5
+        engine.capital += partial
+
+        log(f"PARTIAL_TP {p['mint'][:6]} pnl={pnl:.4f}")
+
+    # 🔥 4. A級幣延長 TP（讓大單跑）
+    if p.get("tier") == "A":
+        tp = TAKE_PROFIT * 2
+    else:
+        tp = TAKE_PROFIT
+
+    # ================= 原本邏輯（改良版） =================
+
     reason = None
-    if pnl >= TAKE_PROFIT:
+
+    if pnl >= tp:
         reason = "TP"
+
     elif pnl <= STOP_LOSS:
         reason = "SL"
+
     elif price < p["high"] * (1 - TRAILING_GAP):
         reason = "TRAIL"
+
     elif now() - sf(p.get("time"), now()) > MAX_HOLD_SEC:
         reason = "TIME"
 
