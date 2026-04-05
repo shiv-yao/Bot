@@ -1,4 +1,4 @@
-# ================= V42 TRUE FUSION FILTER CONFIRMED MOMENTUM =================
+# ================= V44 TRUE FUSION FILTER FUND FLOW =================
 
 import os
 import asyncio
@@ -43,12 +43,12 @@ AMOUNT = int(os.getenv("AMOUNT", "1000000"))
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.25"))
-MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.05"))
+MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.03"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.008"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.005"))
-TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.004"))
-MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "60"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.03"))
+TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.01"))
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "120"))
 
 TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "15"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
@@ -253,7 +253,7 @@ async def http_get(url, params=None, headers=None, timeout=HTTP_TIMEOUT):
         return None
 
 
-# ================= V42 MEMPOOL + DEX BULK =================
+# ================= MEMPOOL + DEX BULK =================
 
 async def mempool_stream():
     while True:
@@ -714,7 +714,6 @@ def score_alpha(f):
     smart = f.get("smart", 0.0)
     liq = f.get("liq", 0.0)
 
-    # ===== V42 CONFIRMED MOMENTUM GATE =====
     if momentum < MIN_CONFIRM_MOMENTUM:
         return 0.0, {
             "bscore": 0.0,
@@ -735,7 +734,6 @@ def score_alpha(f):
             "nscore": 0.0,
         }
 
-    # fake breakout
     if breakout > 0.01 and momentum < 0:
         return 0.0, {
             "bscore": 0.0,
@@ -974,7 +972,8 @@ async def sell(p, reason, pnl, price):
     engine.last_trade = f"SELL {m[:6]} {reason} pnl={pnl:.4f}"
     return True
 
-# ================= V43 TRUE ALPHA FUND MODE =================#
+
+# ================= CHECK SELL =================
 
 async def check_sell(p):
     price = await get_price(p["mint"])
@@ -1007,24 +1006,29 @@ async def check_sell(p):
 
     p["high"] = max(sf(p.get("high"), entry), price)
 
-    tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier")
-    momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0), 0.0)
+    tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier", "C")
+    momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0.0), 0.0)
 
-    # momentum 正就不急著賣
-    if pnl > 0 and momentum_now > 0:
+    # 有獲利且動能還在，不急著賣
+    if pnl > 0 and momentum_now > 0.003:
         return False
 
-    # 抗噪音 SL：小幅虧損但 momentum 還是正，不賣
-    if pnl < 0 and pnl > -0.03 and momentum_now > 0:
+    # 小幅虧損但動能還在，不急著砍
+    if -0.03 < pnl < 0 and momentum_now > 0.004:
         return False
 
-    # ===== V44 資金釋放機制 =====
-    # 已持有一段時間還在虧，直接砍掉，釋放資金給下一輪
-    if pnl < 0 and hold_sec > 60:
+    # ===== V44 分段資金釋放 =====
+    # 爛單快速砍
+    if pnl < -0.015 and hold_sec > 20:
+        log(f"FAST_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
+        return await sell(p, "FAST_CUT", pnl, price)
+
+    # 卡住的小虧單，提早釋放資金
+    if pnl < 0 and hold_sec > 45:
         log(f"EARLY_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "EARLY_CUT", pnl, price)
 
-    # partial TP
+    # partial TP：先鎖一半利潤
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
 
@@ -1035,7 +1039,7 @@ async def check_sell(p):
 
         log(f"PARTIAL_TP {p['mint'][:6]} pnl={pnl:.4f}")
 
-    # A級延長 TP
+    # A級幣延長 TP
     tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
     reason = None
@@ -1044,13 +1048,12 @@ async def check_sell(p):
         reason = "TP"
 
     elif pnl <= STOP_LOSS:
-        # 再確認一次，避免單點壞價格誤殺
+        # 二次確認，避免單點壞價格誤殺
         await asyncio.sleep(0.5)
         price2 = await get_price(p["mint"])
         if price2 is None:
             return False
 
-        # 第二次價格也做壞價保護
         last2 = LAST_PRICE.get(p["mint"])
         if last2 and last2 > 0:
             jump2 = abs(price2 - last2) / last2
@@ -1075,31 +1078,21 @@ async def check_sell(p):
         reason = "TRAIL"
 
     elif hold_sec > MAX_HOLD_SEC:
-        # A級幣如果還有正動能，延長持有
-        if tier == "A" and momentum_now > 0.003:
+        log(
+            f"TIME_CHECK {p['mint'][:6]} "
+            f"pnl={pnl:.4f} hold={hold_sec:.1f}s "
+            f"momentum={momentum_now:.4f} tier={tier}"
+        )
+
+        # A級且仍有些微動能，延長持有
+        if tier == "A" and momentum_now > 0.002:
             return False
-        reason = "TIME"
 
-    if reason:
-        return await sell(p, reason, pnl, price)
-
-    return False
-
-    # ================= 原本邏輯（改良版） =================
-
-    reason = None
-
-    if pnl >= tp:
-        reason = "TP"
-
-    elif pnl <= STOP_LOSS:
-        reason = "SL"
-
-    elif price < p["high"] * (1 - TRAILING_GAP):
-        reason = "TRAIL"
-
-    elif now() - sf(p.get("time"), now()) > MAX_HOLD_SEC:
-        reason = "TIME"
+        # 打平太久 / 微虧太久 / 沒延續，就釋放
+        if pnl < 0.003:
+            reason = "TIME"
+        else:
+            return False
 
     if reason:
         return await sell(p, reason, pnl, price)
@@ -1323,7 +1316,7 @@ def get_metrics():
 
 async def main_loop():
     ensure_engine()
-    log("🚀 V42 TRUE FUSION CONFIRMED START")
+    log("🚀 V44 TRUE FUSION FUND FLOW START")
 
     asyncio.create_task(mempool_stream())
 
