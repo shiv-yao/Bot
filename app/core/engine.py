@@ -1,10 +1,9 @@
-# ================= V44 TRUE FUSION FILTER FUND FLOW =================
+# ================= V44.1 TRUE FUSION FILTER FUND FLOW FULL FIX =================
 
 import os
 import asyncio
 import time
 import random
-import math
 import json
 from collections import defaultdict, Counter
 
@@ -71,7 +70,6 @@ MAX_PNL_ABS = float(os.getenv("MAX_PNL_ABS", "0.2"))
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "20"))
 
 MIN_OUT_AMOUNT = int(os.getenv("MIN_OUT_AMOUNT", "300"))
-MIN_OUT_AMOUNT_STRICT = int(os.getenv("MIN_OUT_AMOUNT_STRICT", "1000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
@@ -115,6 +113,7 @@ SOURCE_STATS = defaultdict(lambda: {
 })
 
 MEMPOOL_BUFFER = []
+MEMPOOL_TASK = None
 
 
 # ================= ENGINE =================
@@ -986,11 +985,9 @@ async def check_sell(p):
 
     hold_sec = now() - sf(p.get("time"), now())
 
-    # 剛進場保護
     if hold_sec < 8:
         return False
 
-    # 壞價格保護
     last = LAST_PRICE.get(p["mint"])
     if last and last > 0:
         jump = abs(price - last) / last
@@ -1009,37 +1006,21 @@ async def check_sell(p):
     tier = p.get("tier") or (p.get("meta", {}) or {}).get("tier", "C")
     momentum_now = sf(LAST_MOMENTUM.get(p["mint"], 0.0), 0.0)
 
-    # 有獲利且動能還在，不急著賣
     if pnl > 0 and momentum_now > 0.003:
         return False
 
-    # 小幅虧損但動能還在，不急著砍
     if -0.03 < pnl < 0 and momentum_now > 0.004:
         return False
 
-    # ===== V44 分段資金釋放 =====
-    # 爛單快速砍
+    # ===== 分段資金釋放 =====
     if pnl < -0.015 and hold_sec > 20:
         log(f"FAST_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "FAST_CUT", pnl, price)
 
-    # 卡住的小虧單，提早釋放資金
     if pnl < 0 and hold_sec > 45:
         log(f"EARLY_CUT {p['mint'][:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "EARLY_CUT", pnl, price)
 
-    # partial TP：先鎖一半利潤
-    if pnl >= 0.008 and not p.get("tp1_done"):
-        p["tp1_done"] = True
-
-        original_size = sf(p.get("size", 0.0), 0.0)
-        partial = original_size * 0.5
-        p["size"] = original_size * 0.5
-        engine.capital += partial
-
-        log(f"PARTIAL_TP {p['mint'][:6]} pnl={pnl:.4f}")
-
-    # A級幣延長 TP
     tp = TAKE_PROFIT * 2 if tier == "A" else TAKE_PROFIT
 
     reason = None
@@ -1048,7 +1029,6 @@ async def check_sell(p):
         reason = "TP"
 
     elif pnl <= STOP_LOSS:
-        # 二次確認，避免單點壞價格誤殺
         await asyncio.sleep(0.5)
         price2 = await get_price(p["mint"])
         if price2 is None:
@@ -1084,11 +1064,9 @@ async def check_sell(p):
             f"momentum={momentum_now:.4f} tier={tier}"
         )
 
-        # A級且仍有些微動能，延長持有
         if tier == "A" and momentum_now > 0.002:
             return False
 
-        # 打平太久 / 微虧太久 / 沒延續，就釋放
         if pnl < 0.003:
             reason = "TIME"
         else:
@@ -1310,28 +1288,31 @@ def get_metrics():
             "positions_by_strategy": dict(Counter([p.get("mode", "unknown") for p in engine.positions])),
         },
         "open_positions_detail": [
-    {
-        "mint": p.get("mint"),
-        "tier": p.get("tier"),
-        "source": p.get("source"),
-        "mode": p.get("mode"),
-        "entry": p.get("entry"),
-        "size": p.get("size"),
-        "hold_sec": round(time.time() - sf(p.get("time"), time.time()), 2),
-        "high": p.get("high"),
-    }
-    for p in (engine.positions or [])
-]
+            {
+                "mint": p.get("mint"),
+                "tier": p.get("tier"),
+                "source": p.get("source"),
+                "mode": p.get("mode"),
+                "entry": p.get("entry"),
+                "size": p.get("size"),
+                "hold_sec": round(time.time() - sf(p.get("time"), time.time()), 2),
+                "high": p.get("high"),
+            }
+            for p in (engine.positions or [])
+        ]
     }
 
 
 # ================= LOOP =================
 
 async def main_loop():
-    ensure_engine()
-    log("🚀 V44 TRUE FUSION FUND FLOW START")
+    global MEMPOOL_TASK
 
-    asyncio.create_task(mempool_stream())
+    ensure_engine()
+    log("🚀 V44.1 TRUE FUSION FUND FLOW START")
+
+    if MEMPOOL_TASK is None or MEMPOOL_TASK.done():
+        MEMPOOL_TASK = asyncio.create_task(mempool_stream())
 
     while engine.running:
         try:
