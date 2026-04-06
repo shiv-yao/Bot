@@ -1,4 +1,4 @@
-# ================= V50 FINAL FUSION FUND ENGINE =================
+# ================= V52 FINAL FUSION FUND ENGINE =================
 
 import os
 import asyncio
@@ -44,20 +44,20 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.35"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "0.03"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.03"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.024"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-0.013"))
 TRAILING_GAP = float(os.getenv("TRAILING_GAP", "0.01"))
 MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "120"))
 
-HARD_STOP_LOSS = float(os.getenv("HARD_STOP_LOSS", "-0.04"))
+HARD_STOP_LOSS = float(os.getenv("HARD_STOP_LOSS", "-0.020"))
 FORCE_EXIT_SEC = int(os.getenv("FORCE_EXIT_SEC", "90"))
 
 TOKEN_COOLDOWN = int(os.getenv("TOKEN_COOLDOWN", "15"))
 BLACKLIST_TIME = int(os.getenv("BLACKLIST_TIME", "60"))
-FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "20"))
+FORCE_TRADE_AFTER = int(os.getenv("FORCE_TRADE_AFTER", "120"))
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 
-ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.12"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.11"))
 FILTER_SCORE_BYPASS = float(os.getenv("FILTER_SCORE_BYPASS", "0.12"))
 SOFT_DISABLE_FILTER = os.getenv("SOFT_DISABLE_FILTER", "false").lower() == "true"
 
@@ -99,12 +99,10 @@ BREATHING_COOLDOWN_SEC = int(os.getenv("BREATHING_COOLDOWN_SEC", "180"))
 BREATHING_MIN_RISK_MULT = float(os.getenv("BREATHING_MIN_RISK_MULT", "0.45"))
 BREATHING_MAX_RISK_MULT = float(os.getenv("BREATHING_MAX_RISK_MULT", "1.20"))
 
-# execution quality guard
 MAX_NEW_BUYS_PER_CYCLE = int(os.getenv("MAX_NEW_BUYS_PER_CYCLE", "1"))
-MAX_BUYS_PER_10MIN = int(os.getenv("MAX_BUYS_PER_10MIN", "12"))
+MAX_BUYS_PER_10MIN = int(os.getenv("MAX_BUYS_PER_10MIN", "8"))
 BUY_WINDOW_SEC = int(os.getenv("BUY_WINDOW_SEC", "600"))
 
-# alpha weights
 ALPHA_BREAKOUT_WEIGHT = float(os.getenv("ALPHA_BREAKOUT_WEIGHT", "0.35"))
 ALPHA_MOMENTUM_WEIGHT = float(os.getenv("ALPHA_MOMENTUM_WEIGHT", "0.25"))
 ALPHA_SMART_WEIGHT = float(os.getenv("ALPHA_SMART_WEIGHT", "0.25"))
@@ -120,6 +118,36 @@ SEARCH_TERMS = [
     "MEME", "PEPE", "DOG", "AI",
     "PUMP", "NEW", "MOON", "100x"
 ]
+
+# ================= V52 AGENT CONFIG =================
+
+AGENT_UPDATE_SEC = int(os.getenv("AGENT_UPDATE_SEC", "20"))
+
+AGENT_MIN_TRADES = int(os.getenv("AGENT_MIN_TRADES", "5"))
+AGENT_LOOKBACK_TRADES = int(os.getenv("AGENT_LOOKBACK_TRADES", "10"))
+
+AGENT_BULL_WINRATE = float(os.getenv("AGENT_BULL_WINRATE", "0.60"))
+AGENT_BEAR_WINRATE = float(os.getenv("AGENT_BEAR_WINRATE", "0.35"))
+
+AGENT_RISK_MIN = float(os.getenv("AGENT_RISK_MIN", "0.45"))
+AGENT_RISK_MAX = float(os.getenv("AGENT_RISK_MAX", "1.35"))
+
+AGENT_DEFENSIVE_ENTRY = float(os.getenv("AGENT_DEFENSIVE_ENTRY", "0.13"))
+AGENT_NORMAL_ENTRY = float(os.getenv("AGENT_NORMAL_ENTRY", "0.11"))
+AGENT_AGGRESSIVE_ENTRY = float(os.getenv("AGENT_AGGRESSIVE_ENTRY", "0.10"))
+
+AGENT_DEFENSIVE_TP = float(os.getenv("AGENT_DEFENSIVE_TP", "0.020"))
+AGENT_NORMAL_TP = float(os.getenv("AGENT_NORMAL_TP", "0.024"))
+AGENT_AGGRESSIVE_TP = float(os.getenv("AGENT_AGGRESSIVE_TP", "0.030"))
+
+AGENT_DEFENSIVE_SL = float(os.getenv("AGENT_DEFENSIVE_SL", "-0.010"))
+AGENT_NORMAL_SL = float(os.getenv("AGENT_NORMAL_SL", "-0.013"))
+AGENT_AGGRESSIVE_SL = float(os.getenv("AGENT_AGGRESSIVE_SL", "-0.016"))
+
+AGENT_KILL_LOSS_STREAK = int(os.getenv("AGENT_KILL_LOSS_STREAK", "4"))
+AGENT_KILL_COOLDOWN_SEC = int(os.getenv("AGENT_KILL_COOLDOWN_SEC", "300"))
+
+AGENT_FORCE_TRADE_ENABLE = os.getenv("AGENT_FORCE_TRADE_ENABLE", "true").lower() == "true"
 
 
 # ================= RUNTIME MEMORY =================
@@ -164,6 +192,23 @@ BREATHING_STATE = {
 REGIME_STATE = {
     "mode": "neutral",
     "last_update": 0.0,
+}
+
+# ================= V52 AGENT RUNTIME =================
+
+AGENT_STATE = {
+    "last_update": 0.0,
+    "mode": "normal",
+    "risk_mult": 1.0,
+    "confidence": 0.5,
+    "cooldown_until": 0.0,
+    "last_reason": "boot",
+}
+
+AUTO_PARAMS = {
+    "entry_threshold": ENTRY_THRESHOLD,
+    "take_profit": TAKE_PROFIT,
+    "stop_loss": STOP_LOSS,
 }
 
 
@@ -284,34 +329,6 @@ def limit_token_frequency(tokens, max_per_token=2):
         out.append(t)
     return out
 
-def current_dynamic_threshold():
-    base = ENTRY_THRESHOLD
-
-    regime = detect_regime()
-    if regime == "bull":
-        base *= 0.92
-    elif regime == "bear":
-        base *= 1.12
-
-    if engine.no_trade_cycles > 30:
-        base *= 0.75
-    elif engine.no_trade_cycles > 15:
-        base *= 0.88
-
-    return clamp(base, ADAPTIVE_THRESHOLD_MIN, ADAPTIVE_THRESHOLD_MAX)
-
-def breakout_strength(b):
-    b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
-    if b <= 0:
-        return 0.0
-    return min(b / 0.05, 1.0) * 0.35
-
-def momentum_strength(m):
-    m = clamp(sf(m), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
-    if m <= 0:
-        return 0.0
-    return min(m / 0.05, 1.0) * 0.30
-
 def recent_closed_trades(n=5):
     hist = getattr(engine, "trade_history", []) or []
     rows = [x for x in hist if isinstance(x, dict)]
@@ -363,7 +380,6 @@ def update_breathing_state():
         )
 
 def detect_regime():
-    # cache 15 sec
     if now() - sf(REGIME_STATE.get("last_update", 0.0), 0.0) < 15:
         return REGIME_STATE["mode"]
 
@@ -393,6 +409,149 @@ def buy_window_count():
     while BUY_TIMES and BUY_TIMES[0] < cutoff:
         BUY_TIMES.pop(0)
     return len(BUY_TIMES)
+
+# ================= V52 AGENT HELPERS =================
+
+def agent_in_cooldown():
+    return now() < sf(AGENT_STATE.get("cooldown_until", 0.0), 0.0)
+
+def agent_recent_rows():
+    rows = recent_closed_trades(AGENT_LOOKBACK_TRADES)
+    return [x for x in rows if isinstance(x, dict)]
+
+def agent_loss_streak(rows=None):
+    rows = rows or agent_recent_rows()
+    streak = 0
+    for r in reversed(rows):
+        if sf(r.get("pnl"), 0.0) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+def agent_update():
+    if now() - sf(AGENT_STATE.get("last_update", 0.0), 0.0) < AGENT_UPDATE_SEC:
+        return
+
+    rows = agent_recent_rows()
+    if len(rows) < AGENT_MIN_TRADES:
+        AGENT_STATE["last_update"] = now()
+        AGENT_STATE["last_reason"] = "not_enough_trades"
+        return
+
+    pnls = [sf(x.get("pnl"), 0.0) for x in rows]
+    wins = sum(1 for x in pnls if x > 0)
+    count = len(pnls)
+    winrate = wins / count if count else 0.0
+    avg_pnl = sum(pnls) / count if count else 0.0
+    streak = agent_loss_streak(rows)
+
+    mode = "normal"
+    reason = "balanced"
+
+    if streak >= AGENT_KILL_LOSS_STREAK:
+        AGENT_STATE["cooldown_until"] = now() + AGENT_KILL_COOLDOWN_SEC
+        mode = "defensive"
+        reason = f"kill_loss_streak_{streak}"
+    elif winrate >= AGENT_BULL_WINRATE and avg_pnl > 0:
+        mode = "aggressive"
+        reason = "good_recent_performance"
+    elif winrate <= AGENT_BEAR_WINRATE and avg_pnl < 0:
+        mode = "defensive"
+        reason = "bad_recent_performance"
+
+    AGENT_STATE["mode"] = mode
+    AGENT_STATE["confidence"] = clamp(winrate if count else 0.5, 0.1, 0.95)
+
+    risk_mult = AGENT_STATE.get("risk_mult", 1.0)
+    if mode == "aggressive":
+        risk_mult += 0.08
+    elif mode == "defensive":
+        risk_mult *= 0.82
+    else:
+        risk_mult += 0.03
+
+    AGENT_STATE["risk_mult"] = clamp(risk_mult, AGENT_RISK_MIN, AGENT_RISK_MAX)
+    AGENT_STATE["last_update"] = now()
+    AGENT_STATE["last_reason"] = reason
+
+    log(
+        f"AGENT_UPDATE mode={AGENT_STATE['mode']} "
+        f"risk_mult={AGENT_STATE['risk_mult']:.2f} "
+        f"conf={AGENT_STATE['confidence']:.2f} "
+        f"reason={AGENT_STATE['last_reason']}"
+    )
+
+def agent_adjust_params():
+    mode = AGENT_STATE.get("mode", "normal")
+
+    if mode == "aggressive":
+        AUTO_PARAMS["entry_threshold"] = AGENT_AGGRESSIVE_ENTRY
+        AUTO_PARAMS["take_profit"] = AGENT_AGGRESSIVE_TP
+        AUTO_PARAMS["stop_loss"] = AGENT_AGGRESSIVE_SL
+    elif mode == "defensive":
+        AUTO_PARAMS["entry_threshold"] = AGENT_DEFENSIVE_ENTRY
+        AUTO_PARAMS["take_profit"] = AGENT_DEFENSIVE_TP
+        AUTO_PARAMS["stop_loss"] = AGENT_DEFENSIVE_SL
+    else:
+        AUTO_PARAMS["entry_threshold"] = AGENT_NORMAL_ENTRY
+        AUTO_PARAMS["take_profit"] = AGENT_NORMAL_TP
+        AUTO_PARAMS["stop_loss"] = AGENT_NORMAL_SL
+
+def agent_effective_entry_threshold():
+    return clamp(
+        sf(AUTO_PARAMS.get("entry_threshold", ENTRY_THRESHOLD), ENTRY_THRESHOLD),
+        ADAPTIVE_THRESHOLD_MIN,
+        max(ADAPTIVE_THRESHOLD_MAX, STRICT_A_TIER_THRESHOLD),
+    )
+
+def agent_effective_tp():
+    return sf(AUTO_PARAMS.get("take_profit", TAKE_PROFIT), TAKE_PROFIT)
+
+def agent_effective_sl():
+    return sf(AUTO_PARAMS.get("stop_loss", STOP_LOSS), STOP_LOSS)
+
+def agent_force_trade_allowed():
+    if not AGENT_FORCE_TRADE_ENABLE:
+        return False
+    if agent_in_cooldown():
+        return False
+    if AGENT_STATE.get("mode") == "defensive":
+        return False
+    return True
+
+def current_dynamic_threshold():
+    base = agent_effective_entry_threshold()
+
+    regime = detect_regime()
+    if regime == "bull":
+        base *= 0.94
+    elif regime == "bear":
+        base *= 1.10
+
+    if engine.no_trade_cycles > 30:
+        base *= 0.78
+    elif engine.no_trade_cycles > 15:
+        base *= 0.90
+
+    if AGENT_STATE.get("mode") == "aggressive":
+        base *= 0.96
+    elif AGENT_STATE.get("mode") == "defensive":
+        base *= 1.05
+
+    return clamp(base, ADAPTIVE_THRESHOLD_MIN, max(ADAPTIVE_THRESHOLD_MAX, STRICT_A_TIER_THRESHOLD))
+
+def breakout_strength(b):
+    b = clamp(sf(b), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+    if b <= 0:
+        return 0.0
+    return min(b / 0.05, 1.0) * 0.35
+
+def momentum_strength(m):
+    m = clamp(sf(m), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
+    if m <= 0:
+        return 0.0
+    return min(m / 0.05, 1.0) * 0.30
 
 
 # ================= HTTP =================
@@ -806,7 +965,6 @@ async def features(t):
     if not m:
         return None
 
-    # V47/V48/V49/V50: buy-side 只接受乾淨市場
     pinfo = await get_price_info(m, prefer_clean=True)
     if not pinfo:
         return None
@@ -1024,6 +1182,10 @@ def allocate_size(score, n_candidates):
         base *= 0.55
 
     base *= breathing_risk_mult()
+    base *= clamp(sf(AGENT_STATE.get("risk_mult", 1.0), 1.0), AGENT_RISK_MIN, AGENT_RISK_MAX)
+
+    if agent_in_cooldown():
+        base *= 0.60
 
     base = min(base, 0.20)
     return min(base, engine.capital * MAX_POSITION_SIZE)
@@ -1076,6 +1238,7 @@ async def buy(m, f, position_size, mtype, forced=False):
         "score": f.get("_score"),
         "tier": f.get("_tier"),
         "regime": detect_regime(),
+        "agent_mode": AGENT_STATE.get("mode"),
     })
 
     engine.positions.append({
@@ -1232,31 +1395,25 @@ async def check_sell(p):
     momentum_now = sf(LAST_MOMENTUM.get(m, 0.0), 0.0)
     regime = detect_regime()
 
-    # hard stop
     if pnl <= HARD_STOP_LOSS:
         log(f"HARD_STOP {m[:6]} pnl={pnl:.4f}")
         return await sell(p, "HARD_STOP", pnl, price)
 
-    # force exit
     if hold_sec > FORCE_EXIT_SEC:
         log(f"FORCE_EXIT {m[:6]} pnl={pnl:.4f} hold={hold_sec:.1f}s")
         return await sell(p, "FORCE_EXIT", pnl, price)
 
-    # fast cut
     fast_cut_line = -0.02 if regime != "bear" else -0.015
     if pnl < fast_cut_line and hold_sec > 20:
         log(f"FAST_CUT {m[:6]} pnl={pnl:.4f}")
         return await sell(p, "FAST_CUT", pnl, price)
 
-    # profit momentum hold
     if pnl > 0 and momentum_now > 0.0035:
         return False
 
-    # small red but momentum alive
     if -0.02 < pnl < 0 and momentum_now > 0.0045:
         return False
 
-    # partial TP
     if pnl >= 0.008 and not p.get("tp1_done"):
         p["tp1_done"] = True
         original_size = sf(p.get("size", 0.0), 0.0)
@@ -1265,7 +1422,7 @@ async def check_sell(p):
         engine.capital += partial
         log(f"PARTIAL_TP {m[:6]} pnl={pnl:.4f}")
 
-    tp = TAKE_PROFIT
+    tp = agent_effective_tp()
     if tier == "A+":
         tp *= 2.2
     elif tier == "A":
@@ -1279,13 +1436,14 @@ async def check_sell(p):
     if pnl >= tp:
         return await sell(p, "TP", pnl, price)
 
-    if pnl <= STOP_LOSS:
+    effective_sl = agent_effective_sl()
+    if pnl <= effective_sl:
         await asyncio.sleep(0.4)
         price2 = await get_price(m)
         if price2:
             pnl2 = (price2 - entry) / entry
             pnl2 = clamp(pnl2, -MAX_PNL_ABS, MAX_PNL_ABS)
-            if pnl2 <= STOP_LOSS:
+            if pnl2 <= effective_sl:
                 log(f"CONFIRMED_SL {m[:6]} pnl={pnl2:.4f}")
                 return await sell(p, "SL", pnl2, price2)
         return False
@@ -1348,9 +1506,9 @@ async def process_candidates(tokens):
 
         sc, mtype, detail = score_with_allocator(f)
 
-        min_threshold = max(dyn_threshold, STRICT_A_TIER_THRESHOLD)
+        min_threshold = max(dyn_threshold, agent_effective_entry_threshold())
         if regime == "bear":
-            min_threshold = max(min_threshold, STRICT_A_TIER_THRESHOLD + 0.01)
+            min_threshold = max(min_threshold, agent_effective_entry_threshold() + 0.01)
         elif regime == "bull":
             min_threshold *= 0.95
 
@@ -1414,6 +1572,13 @@ async def execute_portfolio(ranked):
             f"until={int(BREATHING_STATE['cooldown_until'] - now())}s"
         )
 
+    if agent_in_cooldown():
+        log(
+            f"AGENT_COOLDOWN mode={AGENT_STATE.get('mode')} "
+            f"risk_mult={AGENT_STATE.get('risk_mult', 1.0):.2f} "
+            f"left={int(sf(AGENT_STATE.get('cooldown_until', 0.0), 0.0) - now())}s"
+        )
+
     if buy_window_count() >= MAX_BUYS_PER_10MIN:
         log("BUY_RATE_LIMIT")
         return False
@@ -1427,7 +1592,13 @@ async def execute_portfolio(ranked):
             log("PAUSE_BAD_RUN")
             return False
 
-        if f.get("_tier") not in {"A", "A+"}:
+        allowed_tiers = {"A", "A+"}
+        if AGENT_STATE.get("mode") == "aggressive":
+            allowed_tiers = {"A", "A+"}
+        elif AGENT_STATE.get("mode") == "defensive":
+            allowed_tiers = {"A+"}
+
+        if f.get("_tier") not in allowed_tiers:
             log(f"SKIP_NON_A_TIER {m[:6]} tier={f.get('_tier')}")
             continue
 
@@ -1447,8 +1618,8 @@ async def execute_portfolio(ranked):
             log(f"SKIP_COOLDOWN {m[:6]}")
             continue
 
-        if in_breathing_cooldown:
-            if f.get("_tier") != "A+" and sf(f.get("_score"), 0.0) < max(STRICT_A_TIER_THRESHOLD + 0.02, 0.14):
+        if in_breathing_cooldown or agent_in_cooldown():
+            if f.get("_tier") != "A+" and sf(f.get("_score"), 0.0) < max(agent_effective_entry_threshold() + 0.02, 0.14):
                 log(f"SKIP_BREATHING_COOLDOWN {m[:6]} score={f['_score']:.4f} tier={f.get('_tier')}")
                 continue
 
@@ -1611,6 +1782,17 @@ def get_metrics():
                 int(sf(BREATHING_STATE.get("cooldown_until", 0.0), 0.0) - now())
             ),
             "buy_window_count": buy_window_count(),
+            "agent_mode": AGENT_STATE.get("mode"),
+            "agent_risk_mult": AGENT_STATE.get("risk_mult"),
+            "agent_confidence": AGENT_STATE.get("confidence"),
+            "agent_cooldown_left": max(
+                0,
+                int(sf(AGENT_STATE.get("cooldown_until", 0.0), 0.0) - now())
+            ),
+            "agent_reason": AGENT_STATE.get("last_reason"),
+            "auto_entry_threshold": agent_effective_entry_threshold(),
+            "auto_take_profit": agent_effective_tp(),
+            "auto_stop_loss": agent_effective_sl(),
         },
         "positions": engine.positions,
         "recent_trades": engine.trade_history[-20:],
@@ -1668,13 +1850,24 @@ async def main_loop():
     global MEMPOOL_TASK
 
     ensure_engine()
-    log("🚀 V50 FINAL FUSION FUND START")
+    log("🚀 V52 FINAL FUSION FUND START")
 
     if MEMPOOL_TASK is None or MEMPOOL_TASK.done():
         MEMPOOL_TASK = asyncio.create_task(mempool_stream())
 
     while engine.running:
         try:
+            agent_update()
+            agent_adjust_params()
+
+            log(
+                f"AGENT_STATE mode={AGENT_STATE['mode']} "
+                f"risk_mult={AGENT_STATE['risk_mult']:.2f} "
+                f"entry={agent_effective_entry_threshold():.4f} "
+                f"tp={agent_effective_tp():.4f} "
+                f"sl={agent_effective_sl():.4f}"
+            )
+
             tokens = await fetch_alpha_candidates()
 
             if not isinstance(tokens, list):
@@ -1706,7 +1899,8 @@ async def main_loop():
                 engine.no_trade_cycles = 0
 
             if (
-                engine.no_trade_cycles > FORCE_TRADE_AFTER
+                agent_force_trade_allowed()
+                and engine.no_trade_cycles > FORCE_TRADE_AFTER
                 and len(engine.positions) < MAX_POSITIONS
                 and exposure() < engine.capital * MAX_EXPOSURE
             ):
