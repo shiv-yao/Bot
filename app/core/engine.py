@@ -971,38 +971,38 @@ async def features(t):
     if not m:
         return None
 
-    # V52.1: 候選階段放寬，不只 accept jupiter-trade-liq
-    pinfo = await get_price_info(m, prefer_clean=False)
+    pinfo = await get_price_info(m, prefer_clean=True)
     if not pinfo:
         return None
 
-    price_source = pinfo.get("source", "unknown")
+    # 允許乾淨的 jupiter，或高流動性 dexscreener 備援
+    if pinfo.get("source") not in {"jupiter", "dexscreener"}:
+        return None
+
     liq = sf(pinfo.get("liq", 0), 0.0)
-    price = sf(pinfo.get("price", 0), 0.0)
-
-    if price <= 0 or price < MIN_PRICE:
+    if liq < MIN_LIQUIDITY_TRADE:
         return None
 
-    if liq < MIN_LIQUIDITY_OBSERVE:
-        return None
-
+    price = pinfo["price"]
     prev = LAST_PRICE.get(m)
-    prev_time = LAST_PRICE_TIME.get(m, 0.0)
 
     if prev and prev > 0:
         breakout = (price - prev) / prev
     else:
-        breakout = random.uniform(0.003, 0.012)
+        breakout = random.uniform(0.003, 0.015)
 
     breakout = clamp(breakout, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if abs(breakout) < 0.001:
         breakout = 0.003
 
-    dt = now() - prev_time if prev_time > 0 else 0.0
-    if prev and prev > 0 and dt > 1.0:
-        momentum = (price - prev) / prev
-    else:
-        momentum = breakout * 0.5
+    momentum = 0.0
+    try:
+        await asyncio.sleep(0.25)
+        p2 = await get_price(m)
+        if price and p2 and p2 > 0:
+            momentum = (p2 - price) / price
+    except Exception:
+        momentum = 0.0
 
     momentum = clamp(momentum, -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if abs(momentum) < 0.001:
@@ -1010,8 +1010,7 @@ async def features(t):
 
     LAST_MOMENTUM[m] = momentum
     LAST_PRICE[m] = price
-    LAST_PRICE_SOURCE[m] = price_source
-    LAST_PRICE_TIME[m] = now()
+    LAST_PRICE_SOURCE[m] = pinfo.get("source", "unknown")
 
     try:
         wallets = await update_token_wallets(m)
@@ -1026,7 +1025,7 @@ async def features(t):
         sniper_boost += 0.05
     if t.get("source") == "mempool":
         sniper_boost += 0.08
-    if price_source == "jupiter":
+    if pinfo.get("source") == "jupiter":
         sniper_boost += 0.02
 
     return {
@@ -1040,7 +1039,7 @@ async def features(t):
         "wallet_count": wallet_count,
         "source": t.get("source", "unknown"),
         "meta": t.get("meta", {}),
-        "price_source": price_source,
+        "price_source": pinfo.get("source", "unknown"),
         "liq": liq,
     }
 
