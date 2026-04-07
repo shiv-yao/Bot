@@ -555,7 +555,7 @@ def momentum_strength(m):
     m = clamp(sf(m), -MAX_BREAKOUT_ABS, MAX_BREAKOUT_ABS)
     if m <= 0:
         return 0.0
-    return min(m / 0.05, 1.0) * 0.30)
+    return min(m / 0.05, 1.0) * 0.30
 
 
 # ================= HTTP =================
