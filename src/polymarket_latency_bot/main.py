@@ -14,6 +14,7 @@ from .logging_utils import log_event, setup_logging
 from .models import now_ms
 from .monitoring import register_monitoring_routes
 from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
+from .ops_api import register_ops_routes
 from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
@@ -61,6 +62,7 @@ async def run() -> None:
     if settings.enable_api:
         app = create_app(settings, state, feeds, risk)
         register_monitoring_routes(app, settings, state, risk, portfolio)
+        register_ops_routes(app, settings, state, feeds, risk, portfolio)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
