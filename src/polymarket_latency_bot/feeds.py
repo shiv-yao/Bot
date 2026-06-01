@@ -54,6 +54,14 @@ def _normalize_levels(raw_levels: list[Any], *, reverse: bool, limit: int) -> li
     return levels[:limit]
 
 
+def _update_level(levels: list[dict[str, float]], *, price: float, size: float, reverse: bool, limit: int) -> list[dict[str, float]]:
+    updated = [dict(level) for level in levels if float(level["price"]) != price]
+    if size > 0 and price > 0:
+        updated.append({"price": price, "size": size})
+    updated.sort(key=lambda item: item["price"], reverse=reverse)
+    return updated[:limit]
+
+
 class FeedHub:
     def __init__(self, settings: Settings, state: BotState, on_change: OnChange) -> None:
         self.settings = settings
@@ -216,6 +224,16 @@ class FeedHub:
                             current.best_bid = float(change["best_bid"])
                         if change.get("best_ask") is not None:
                             current.best_ask = float(change["best_ask"])
+                        try:
+                            level_price = float(change.get("price"))
+                            level_size = float(change.get("size"))
+                            side = str(change.get("side") or "").upper()
+                            if side == "BUY":
+                                current.bid_levels = _update_level(current.bid_levels, price=level_price, size=level_size, reverse=True, limit=self.settings.depth_levels)
+                            elif side == "SELL":
+                                current.ask_levels = _update_level(current.ask_levels, price=level_price, size=level_size, reverse=False, limit=self.settings.depth_levels)
+                        except (TypeError, ValueError):
+                            pass
                         current.timestamp_ms = now_ms()
                         self.state.books[asset_id] = current
                         changed = True
