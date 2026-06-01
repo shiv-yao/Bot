@@ -56,10 +56,21 @@ class Settings(BaseSettings):
     order_rate_per_sec: float = Field(default=10.0, gt=0, le=80)
     order_burst: int = Field(default=20, gt=0, le=500)
 
-    # Paper portfolio simulation
+    # Hardened Paper portfolio simulation
     paper_hold_sec: int = Field(default=60, ge=5, le=900)
     paper_max_open_positions: int = Field(default=2, ge=1, le=50)
     paper_mark_interval_sec: float = Field(default=1.0, gt=0)
+    paper_take_profit_pct: float = Field(default=0.08, gt=0, le=1)
+    paper_stop_loss_pct: float = Field(default=0.04, gt=0, le=1)
+    paper_trailing_stop_pct: float = Field(default=0.03, gt=0, le=1)
+    paper_open_buffer_sec: int = Field(default=30, ge=0, le=600)
+    paper_close_buffer_sec: int = Field(default=90, ge=0, le=600)
+    paper_max_trades_per_market: int = Field(default=2, ge=1, le=20)
+    paper_max_consecutive_losses_per_market: int = Field(default=2, ge=1, le=20)
+
+    # Local persistence for Paper history. Attach a Railway volume for durable storage.
+    paper_db_path: str = "/data/polymarket_paper.db"
+    recent_trade_limit: int = Field(default=100, ge=10, le=1000)
 
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
@@ -84,6 +95,8 @@ class Settings(BaseSettings):
     def validate_live(self) -> "Settings":
         if self.max_contract_price <= self.min_contract_price:
             raise ValueError("MAX_CONTRACT_PRICE must be greater than MIN_CONTRACT_PRICE")
+        if self.paper_open_buffer_sec + self.paper_close_buffer_sec >= self.market_interval_sec:
+            raise ValueError("paper market buffers must be shorter than MARKET_INTERVAL_SEC")
         if self.live_trading and self.live_confirmation != "I_UNDERSTAND_LIVE_ORDERS":
             raise ValueError("LIVE_TRADING requires LIVE_CONFIRMATION=I_UNDERSTAND_LIVE_ORDERS")
         if self.live_enabled:
