@@ -187,13 +187,17 @@ class FeedHub:
         message = json.loads(raw)
         messages = message if isinstance(message, list) else [message]
         changed = False
+        valid_tokens = {str(self.settings.yes_token_id), str(self.settings.no_token_id)}
         async with self.state.lock:
+            self.state.books = {token: book for token, book in self.state.books.items() if token in valid_tokens}
             for item in messages:
                 if not isinstance(item, dict):
                     continue
                 event = item.get("event_type") or item.get("type")
                 token_id = str(item.get("asset_id") or item.get("token_id") or "")
                 if event == "book" and token_id:
+                    if token_id not in valid_tokens:
+                        continue
                     bids = _normalize_levels(item.get("bids") or [], reverse=True, limit=self.settings.depth_levels)
                     asks = _normalize_levels(item.get("asks") or [], reverse=False, limit=self.settings.depth_levels)
                     self.state.books[token_id] = BookTop(
@@ -206,6 +210,8 @@ class FeedHub:
                     )
                     changed = True
                 elif event == "best_bid_ask" and token_id:
+                    if token_id not in valid_tokens:
+                        continue
                     current = self.state.books.get(token_id, BookTop(token_id))
                     if item.get("best_bid") is not None:
                         current.best_bid = float(item["best_bid"])
@@ -217,7 +223,7 @@ class FeedHub:
                 elif event == "price_change":
                     for change in item.get("price_changes") or []:
                         asset_id = str(change.get("asset_id") or "")
-                        if not asset_id:
+                        if not asset_id or asset_id not in valid_tokens:
                             continue
                         current = self.state.books.get(asset_id, BookTop(asset_id))
                         if change.get("best_bid") is not None:
