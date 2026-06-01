@@ -73,7 +73,8 @@ class Settings(BaseSettings):
     paper_trailing_stop_pct: float = Field(default=0.03, gt=0, le=1)
     paper_open_buffer_sec: int = Field(default=30, ge=0, le=600)
     paper_close_buffer_sec: int = Field(default=90, ge=0, le=600)
-    paper_max_trades_per_market: int = Field(default=2, ge=1, le=20)
+    # Set to 0 to disable the per-market trade-count cap.
+    paper_max_trades_per_market: int = Field(default=0, ge=0, le=100000)
     paper_max_consecutive_losses_per_market: int = Field(default=2, ge=1, le=20)
 
     # Local persistence for Paper history. Attach a Railway volume for durable storage.
