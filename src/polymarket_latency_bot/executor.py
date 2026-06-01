@@ -8,6 +8,7 @@ from typing import Any
 from .config import Settings
 from .logging_utils import log_event
 from .models import TradeIntent, now_ms
+from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .state import BotState
 
@@ -43,30 +44,43 @@ class BaseExecutor:
         self.bucket = TokenBucket(settings.order_rate_per_sec, settings.order_burst)
         self.logger = logging.getLogger("executor")
 
-    async def submit(self, intent: TradeIntent) -> None:
+    @property
+    def retain_risk_reservation_after_success(self) -> bool:
+        return False
+
+    async def submit(self, intent: TradeIntent) -> bool:
         try:
             self.queue.put_nowait(intent)
             async with self.state.lock:
                 self.state.queue_depth = self.queue.qsize()
                 self.state.last_intent = intent
+            return True
         except asyncio.QueueFull:
             async with self.state.lock:
                 self.state.orders_rejected += 1
                 self.state.last_error = "execution queue full"
+            await self.on_failed_intent(intent)
             log_event(self.logger, "intent_dropped", reason="queue_full", intent=intent.to_dict())
+            return False
+
+    async def on_failed_intent(self, intent: TradeIntent) -> None:
+        return None
 
     async def worker(self, worker_id: int) -> None:
         while True:
             intent = await self.queue.get()
-            async with self.state.lock:
-                self.state.queue_depth = self.queue.qsize()
+            reserved = False
             try:
+                async with self.state.lock:
+                    self.state.queue_depth = self.queue.qsize()
                 approved, reason = await self.risk.check(intent)
                 if not approved:
                     async with self.state.lock:
                         self.state.orders_rejected += 1
+                    await self.on_failed_intent(intent)
                     log_event(self.logger, "risk_reject", worker_id=worker_id, reason=reason, intent=intent.to_dict())
                     continue
+                reserved = True
                 await self.bucket.acquire()
                 started = now_ms()
                 result = await asyncio.wait_for(
@@ -74,22 +88,40 @@ class BaseExecutor:
                     timeout=self.settings.order_timeout_ms / 1000,
                 )
                 latency = now_ms() - started
+                accepted = bool(result.get("accepted", True)) if isinstance(result, dict) else True
                 async with self.state.lock:
-                    self.state.orders_submitted += 1
                     self.state.last_order_result = {"latency_ms": latency, "result": result}
-                log_event(self.logger, "order_result", worker_id=worker_id, latency_ms=latency, result=result)
+                    if accepted:
+                        self.state.orders_submitted += 1
+                    else:
+                        self.state.orders_rejected += 1
+                if accepted:
+                    if not self.retain_risk_reservation_after_success:
+                        await self.risk.record_result(intent.notional_usd)
+                        reserved = False
+                    log_event(self.logger, "order_result", worker_id=worker_id, latency_ms=latency, result=result)
+                else:
+                    await self.risk.record_result(intent.notional_usd)
+                    reserved = False
+                    await self.on_failed_intent(intent)
+                    log_event(self.logger, "order_rejected", worker_id=worker_id, latency_ms=latency, result=result)
             except asyncio.TimeoutError:
+                if reserved:
+                    await self.risk.record_result(intent.notional_usd)
+                await self.on_failed_intent(intent)
                 async with self.state.lock:
                     self.state.orders_rejected += 1
                     self.state.last_error = "order timeout"
                 log_event(self.logger, "order_timeout", worker_id=worker_id)
             except Exception as exc:
+                if reserved:
+                    await self.risk.record_result(intent.notional_usd)
+                await self.on_failed_intent(intent)
                 async with self.state.lock:
                     self.state.orders_rejected += 1
                     self.state.last_error = f"order error: {exc}"
                 log_event(self.logger, "order_error", worker_id=worker_id, error=str(exc))
             finally:
-                await self.risk.record_result(intent.notional_usd)
                 self.queue.task_done()
 
     async def place_order(self, intent: TradeIntent) -> dict[str, Any]:
@@ -97,16 +129,36 @@ class BaseExecutor:
 
 
 class PaperExecutor(BaseExecutor):
+    def __init__(
+        self,
+        settings: Settings,
+        state: BotState,
+        risk: RiskManager,
+        portfolio: PaperPortfolio,
+    ) -> None:
+        super().__init__(settings, state, risk)
+        self.portfolio = portfolio
+
+    @property
+    def retain_risk_reservation_after_success(self) -> bool:
+        return True
+
+    async def submit(self, intent: TradeIntent) -> bool:
+        accepted = await self.portfolio.reserve_intent(intent.token_id)
+        if not accepted:
+            log_event(self.logger, "paper_intent_skipped", reason="duplicate_or_max_positions", token_id=intent.token_id)
+            return False
+        queued = await super().submit(intent)
+        if not queued:
+            await self.portfolio.release_pending(intent.token_id)
+        return queued
+
+    async def on_failed_intent(self, intent: TradeIntent) -> None:
+        await self.portfolio.release_pending(intent.token_id)
+
     async def place_order(self, intent: TradeIntent) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {
-            "mode": "paper",
-            "accepted": True,
-            "token_id": intent.token_id,
-            "notional_usd": intent.notional_usd,
-            "market_price": intent.market_price,
-            "edge": intent.edge,
-        }
+        return await self.portfolio.open_position(intent)
 
 
 class LiveExecutor(BaseExecutor):
