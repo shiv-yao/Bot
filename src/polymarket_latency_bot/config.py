@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     signal_cooldown_ms: int = Field(default=10000, ge=0)
     max_signal_age_ms: int = Field(default=1500, gt=0)
 
+    # Paper order book depth and execution simulation
+    depth_levels: int = Field(default=5, ge=1, le=20)
+    min_depth_multiple: float = Field(default=3.0, ge=1.0, le=20.0)
+    max_slippage: float = Field(default=0.015, ge=0, le=0.20)
+    slippage_buffer: float = Field(default=0.005, ge=0, le=0.20)
+
     order_timeout_ms: int = Field(default=1500, gt=0)
     max_queue_size: int = Field(default=1000, gt=0)
     execution_workers: int = Field(default=2, gt=0, le=128)
@@ -77,6 +83,24 @@ class Settings(BaseSettings):
     rtds_ws_url: str = "wss://ws-live-data.polymarket.com"
     enable_rtds_momentum_prediction: bool = True
     rtds_prediction_window_sec: int = Field(default=60, ge=10)
+
+    # Public external BTC spot market feeds
+    enable_binance_ws: bool = True
+    enable_coinbase_ws: bool = True
+    binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    coinbase_ws_url: str = "wss://ws-feed.exchange.coinbase.com"
+    external_price_max_age_ms: int = Field(default=3000, ge=250)
+    external_price_window_sec: int = Field(default=60, ge=10, le=900)
+
+    # Multi-source fusion
+    enable_multi_source_fusion: bool = True
+    fusion_min_sources: int = Field(default=2, ge=1, le=8)
+    fusion_agreement_threshold: float = Field(default=0.60, ge=0.5, le=1.0)
+    fusion_probability_scale: float = Field(default=40.0, gt=0, le=500)
+    fusion_base_confidence: float = Field(default=0.55, ge=0, le=1)
+    fusion_source_weight_chainlink: float = Field(default=1.0, ge=0)
+    fusion_source_weight_binance: float = Field(default=1.0, ge=0)
+    fusion_source_weight_coinbase: float = Field(default=1.0, ge=0)
 
     external_poll_url: str = ""
     external_poll_api_key: str = ""
