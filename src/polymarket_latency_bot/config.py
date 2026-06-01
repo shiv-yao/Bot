@@ -39,10 +39,17 @@ class Settings(BaseSettings):
     max_order_equity_fraction: float = Field(default=0.005, gt=0, le=0.005)
     max_daily_loss_fraction: float = Field(default=0.005, gt=0, le=0.02)
     max_open_notional_usd: float = Field(default=10.0, gt=0)
-    min_edge: float = Field(default=0.05, gt=0)
-    min_confidence: float = Field(default=0.65, ge=0, le=1)
-    signal_cooldown_ms: int = Field(default=5000, ge=0)
+
+    # Balanced paper entry filters
+    min_edge: float = Field(default=0.03, gt=0)
+    min_net_edge: float = Field(default=0.015, ge=0)
+    min_confidence: float = Field(default=0.58, ge=0, le=1)
+    min_contract_price: float = Field(default=0.15, ge=0, le=1)
+    max_contract_price: float = Field(default=0.85, ge=0, le=1)
+    max_spread: float = Field(default=0.04, ge=0, le=1)
+    signal_cooldown_ms: int = Field(default=10000, ge=0)
     max_signal_age_ms: int = Field(default=1500, gt=0)
+
     order_timeout_ms: int = Field(default=1500, gt=0)
     max_queue_size: int = Field(default=1000, gt=0)
     execution_workers: int = Field(default=2, gt=0, le=128)
@@ -75,6 +82,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_live(self) -> "Settings":
+        if self.max_contract_price <= self.min_contract_price:
+            raise ValueError("MAX_CONTRACT_PRICE must be greater than MIN_CONTRACT_PRICE")
         if self.live_trading and self.live_confirmation != "I_UNDERSTAND_LIVE_ORDERS":
             raise ValueError("LIVE_TRADING requires LIVE_CONFIRMATION=I_UNDERSTAND_LIVE_ORDERS")
         if self.live_enabled:
