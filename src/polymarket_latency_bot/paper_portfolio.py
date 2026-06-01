@@ -58,6 +58,8 @@ class PaperPortfolio:
         self.wins = 0
         self.losses = 0
         self.flat = 0
+        self.total_realized_pnl = 0.0
+        self.total_closed_trades = 0
 
     async def reserve_intent(self, token_id: str) -> bool:
         async with self.lock:
@@ -166,6 +168,8 @@ class PaperPortfolio:
             )
             self.closed_trades.append(trade)
             self.closed_trades = self.closed_trades[-100:]
+            self.total_realized_pnl = round(self.total_realized_pnl + realized, 8)
+            self.total_closed_trades += 1
             if realized > 1e-9:
                 self.wins += 1
             elif realized < -1e-9:
@@ -177,18 +181,17 @@ class PaperPortfolio:
         log_event(self.logger, "paper_position_closed", trade=trade.to_dict())
 
     async def _publish_locked(self) -> None:
-        realized = round(sum(t.realized_pnl for t in self.closed_trades), 8)
         unrealized = round(sum(p.unrealized_pnl for p in self.positions.values()), 8)
         payload = {
             "summary": {
-                "realized_pnl": realized,
+                "realized_pnl": self.total_realized_pnl,
                 "unrealized_pnl": unrealized,
-                "net_pnl": round(realized + unrealized, 8),
+                "net_pnl": round(self.total_realized_pnl + unrealized, 8),
                 "wins": self.wins,
                 "losses": self.losses,
                 "flat": self.flat,
                 "open_positions": len(self.positions),
-                "closed_trades": len(self.closed_trades),
+                "closed_trades": self.total_closed_trades,
                 "skipped_duplicates": self.skipped_duplicates,
                 "win_rate": round(self.wins / max(1, self.wins + self.losses), 4),
             },
