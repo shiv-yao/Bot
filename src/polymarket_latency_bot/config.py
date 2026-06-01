@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     order_rate_per_sec: float = Field(default=70.0, gt=0, le=80)
     order_burst: int = Field(default=350, gt=0, le=500)
 
+    # Paper portfolio simulation
+    paper_hold_sec: int = Field(default=30, ge=5, le=900)
+    paper_max_open_positions: int = Field(default=4, ge=1, le=50)
+    paper_mark_interval_sec: float = Field(default=1.0, gt=0)
+
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     rtds_ws_url: str = "wss://ws-live-data.polymarket.com"
