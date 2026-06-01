@@ -29,26 +29,41 @@ class MultiSourceFusion:
             "coinbase": float(settings.fusion_source_weight_coinbase),
         }
 
-    async def record_price(self, source: str, price: float, timestamp_ms: int | None = None) -> None:
+    async def record_price(self, source: str, price: float, timestamp_ms: int | None = None, endpoint: str | None = None) -> None:
         if source not in self._prices or price <= 0:
             return
         timestamp = int(timestamp_ms or now_ms())
         self._prices[source].append((timestamp, float(price)))
         async with self.state.lock:
-            self.state.external_prices[source] = list(self._prices[source])[-20:]
-            self.state.source_status[source] = {
+            current = dict(self.state.source_status.get(source, {}))
+            current.update({
                 "connected": True,
                 "last_price": float(price),
                 "last_update_ms": timestamp,
                 "age_ms": 0,
-            }
+                "last_error": None,
+            })
+            if endpoint:
+                current["active_endpoint"] = endpoint
+            self.state.external_prices[source] = list(self._prices[source])[-20:]
+            self.state.source_status[source] = current
         if self.settings.enable_multi_source_fusion:
             await self._publish_fusion(timestamp)
 
-    async def mark_disconnected(self, source: str, error: str) -> None:
+    async def mark_connected(self, source: str, endpoint: str) -> None:
         async with self.state.lock:
             current = dict(self.state.source_status.get(source, {}))
-            current.update({"connected": False, "error": error})
+            current.update({"connected": True, "active_endpoint": endpoint, "last_error": None})
+            self.state.source_status[source] = current
+
+    async def mark_disconnected(self, source: str, error: str, endpoint: str | None = None) -> None:
+        async with self.state.lock:
+            current = dict(self.state.source_status.get(source, {}))
+            current["connected"] = False
+            current["last_error"] = error
+            current["reconnect_count"] = int(current.get("reconnect_count", 0)) + 1
+            if endpoint:
+                current["active_endpoint"] = endpoint
             self.state.source_status[source] = current
 
     async def _publish_fusion(self, timestamp: int) -> None:
@@ -95,6 +110,7 @@ class MultiSourceFusion:
             "agreement": agreement,
             "fused_momentum": fused_momentum,
             "source_count": len(samples),
+            "required_sources": self.settings.fusion_min_sources,
             "samples": samples,
             "timestamp_ms": timestamp,
         }
@@ -109,31 +125,50 @@ class MultiSourceFusion:
             ))
 
 
+def _binance_endpoints(settings: Any) -> list[str]:
+    endpoints = [str(settings.binance_ws_url).strip()]
+    endpoints.extend(url.strip() for url in str(settings.binance_ws_fallback_urls).split(",") if url.strip())
+    seen: set[str] = set()
+    unique: list[str] = []
+    for endpoint in endpoints:
+        if endpoint and endpoint not in seen:
+            seen.add(endpoint)
+            unique.append(endpoint)
+    return unique
+
+
 async def binance_ws_loop(settings: Any, state: Any, fusion: MultiSourceFusion) -> None:
     logger = logging.getLogger("binance_ws")
     if not settings.enable_binance_ws:
         return
+    endpoints = _binance_endpoints(settings)
+    index = 0
     while True:
+        endpoint = endpoints[index % len(endpoints)]
         try:
-            async with websockets.connect(settings.binance_ws_url, ping_interval=20, ping_timeout=10) as ws:
-                log_event(logger, "binance_ws_connected")
+            async with websockets.connect(endpoint, ping_interval=20, ping_timeout=10, open_timeout=10) as ws:
+                await fusion.mark_connected("binance", endpoint)
+                log_event(logger, "binance_ws_connected", endpoint=endpoint)
                 async for raw in ws:
                     item = json.loads(raw)
                     price = item.get("p")
                     if price is not None:
-                        await fusion.record_price("binance", float(price))
+                        await fusion.record_price("binance", float(price), endpoint=endpoint)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await fusion.mark_disconnected("binance", str(exc))
-            log_event(logger, "binance_ws_error", error=str(exc))
-            await asyncio.sleep(1)
+            error = str(exc)
+            await fusion.mark_disconnected("binance", error, endpoint)
+            log_event(logger, "binance_ws_error", endpoint=endpoint, error=error)
+            index = (index + 1) % len(endpoints)
+            await asyncio.sleep(settings.source_reconnect_delay_sec)
 
 
 async def coinbase_ws_loop(settings: Any, state: Any, fusion: MultiSourceFusion) -> None:
     logger = logging.getLogger("coinbase_ws")
     if not settings.enable_coinbase_ws:
         return
+    endpoint = settings.coinbase_ws_url
     subscribe = {
         "type": "subscribe",
         "product_ids": ["BTC-USD"],
@@ -141,16 +176,18 @@ async def coinbase_ws_loop(settings: Any, state: Any, fusion: MultiSourceFusion)
     }
     while True:
         try:
-            async with websockets.connect(settings.coinbase_ws_url, ping_interval=20, ping_timeout=10) as ws:
+            async with websockets.connect(endpoint, ping_interval=20, ping_timeout=10, open_timeout=10) as ws:
                 await ws.send(json.dumps(subscribe))
-                log_event(logger, "coinbase_ws_connected")
+                await fusion.mark_connected("coinbase", endpoint)
+                log_event(logger, "coinbase_ws_connected", endpoint=endpoint)
                 async for raw in ws:
                     item = json.loads(raw)
                     if item.get("type") == "ticker" and item.get("product_id") == "BTC-USD" and item.get("price") is not None:
-                        await fusion.record_price("coinbase", float(item["price"]))
+                        await fusion.record_price("coinbase", float(item["price"]), endpoint=endpoint)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await fusion.mark_disconnected("coinbase", str(exc))
-            log_event(logger, "coinbase_ws_error", error=str(exc))
-            await asyncio.sleep(1)
+            error = str(exc)
+            await fusion.mark_disconnected("coinbase", error, endpoint)
+            log_event(logger, "coinbase_ws_error", endpoint=endpoint, error=error)
+            await asyncio.sleep(settings.source_reconnect_delay_sec)
