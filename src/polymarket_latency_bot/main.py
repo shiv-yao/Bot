@@ -8,13 +8,13 @@ import uvicorn
 
 from .api import create_app
 from .config import Settings
-from .executor import PaperExecutor
 from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
 from .models import now_ms
 from .monitoring import register_monitoring_routes
 from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
 from .ops_api import register_ops_routes
+from .paper_metrics import MeasuredPaperExecutor
 from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
@@ -30,7 +30,7 @@ async def run() -> None:
     risk = RiskManager(settings)
     portfolio = PaperPortfolio(settings, state, risk, logging.getLogger("paper_portfolio"))
     strategy = LatencyStrategy(settings, state)
-    executor = PaperExecutor(settings, state, risk, portfolio)
+    executor = MeasuredPaperExecutor(settings, state, risk, portfolio)
 
     async def evaluate() -> None:
         started_ms = now_ms()
