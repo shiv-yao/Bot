@@ -11,6 +11,7 @@ from .config import Settings
 from .executor import PaperExecutor
 from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
+from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
 from .state import BotState
@@ -23,8 +24,9 @@ async def run() -> None:
     logger = logging.getLogger("main")
     state = BotState()
     risk = RiskManager(settings)
+    portfolio = PaperPortfolio(settings, state, risk, logging.getLogger("paper_portfolio"))
     strategy = LatencyStrategy(settings, state)
-    executor = PaperExecutor(settings, state, risk)
+    executor = PaperExecutor(settings, state, risk, portfolio)
 
     async def evaluate() -> None:
         for intent in await strategy.build_intents():
@@ -37,6 +39,7 @@ async def run() -> None:
         asyncio.create_task(chainlink_rtds_loop(settings, state, feeds), name="rtds-chainlink"),
         asyncio.create_task(feeds.user_ws_loop(), name="user-ws"),
         asyncio.create_task(feeds.external_poll_loop(), name="external-poll"),
+        asyncio.create_task(portfolio.mark_loop(), name="paper-portfolio-mark"),
     ]
     tasks += [
         asyncio.create_task(executor.worker(i), name=f"executor-{i}")
@@ -54,6 +57,8 @@ async def run() -> None:
         mode="paper",
         auto_discover_market=settings.auto_discover_market,
         rtds_feed="chainlink_btc_usd",
+        paper_hold_sec=settings.paper_hold_sec,
+        paper_max_open_positions=settings.paper_max_open_positions,
     )
     try:
         await asyncio.gather(*tasks)
