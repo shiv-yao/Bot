@@ -5,7 +5,31 @@ from typing import Any
 from fastapi import FastAPI
 
 
+def _risk_profile(settings: Any) -> dict[str, Any]:
+    return {
+        "paper_high_frequency_profile": bool(settings.paper_high_frequency_profile),
+        "live_enabled": bool(settings.live_enabled),
+        "effective_max_order_equity_fraction": float(settings.effective_max_order_equity_fraction),
+        "effective_max_daily_loss_fraction": float(settings.effective_max_daily_loss_fraction),
+        "effective_max_open_notional_usd": float(settings.effective_max_open_notional_usd),
+        "signal_cooldown_ms": int(settings.signal_cooldown_ms),
+        "strategy_evaluation_interval_ms": int(settings.strategy_evaluation_interval_ms),
+        "execution_workers": int(settings.execution_workers),
+        "max_queue_size": int(settings.max_queue_size),
+        "paper_disable_order_rate_limit": bool(settings.paper_disable_order_rate_limit),
+        "paper_hold_sec": int(settings.paper_hold_sec),
+        "paper_mark_interval_sec": float(settings.paper_mark_interval_sec),
+        "paper_open_buffer_sec": int(settings.paper_open_buffer_sec),
+        "paper_close_buffer_sec": int(settings.paper_close_buffer_sec),
+        "paper_max_consecutive_losses_per_market": int(settings.paper_max_consecutive_losses_per_market),
+    }
+
+
 def register_ai_routes(app: FastAPI, settings: Any, state: Any) -> None:
+    @app.get("/risk/profile")
+    async def risk_profile() -> dict[str, Any]:
+        return {"mode": "paper" if not settings.live_enabled else "live", "risk_profile": _risk_profile(settings)}
+
     @app.get("/ai/status")
     async def ai_status() -> dict[str, Any]:
         snapshot = await state.snapshot()
@@ -14,7 +38,7 @@ def register_ai_routes(app: FastAPI, settings: Any, state: Any) -> None:
         if not direction:
             direction = "WAIT"
         return {
-            "mode": "paper",
+            "mode": "paper" if not settings.live_enabled else "live",
             "market": {
                 "asset": "BTC",
                 "interval_sec": int(settings.market_interval_sec),
@@ -34,6 +58,7 @@ def register_ai_routes(app: FastAPI, settings: Any, state: Any) -> None:
                 "reason": strategy.get("reason"),
                 "timestamp_ms": strategy.get("timestamp_ms"),
             },
+            "risk_profile": _risk_profile(settings),
             "fusion": snapshot.get("fusion_snapshot", {}),
             "connections": snapshot.get("connections", {}),
         }
