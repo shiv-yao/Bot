@@ -6,6 +6,8 @@ from typing import Any
 
 from .logging_utils import log_event
 from .models import TradeIntent, now_ms
+from .paper_hardened import PaperRuleConfig, PaperRuleEngine
+from .persistence import PaperStore
 
 
 @dataclass(slots=True)
@@ -19,6 +21,7 @@ class PaperPosition:
     market_slug: str
     condition_id: str
     last_mark_price: float
+    high_water_price: float
     unrealized_pnl: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,21 +58,49 @@ class PaperPortfolio:
         self.positions: dict[str, PaperPosition] = {}
         self.closed_trades: list[PaperTrade] = []
         self.skipped_duplicates = 0
-        self.wins = 0
-        self.losses = 0
-        self.flat = 0
-        self.total_realized_pnl = 0.0
-        self.total_closed_trades = 0
+        self.rejection_counts: dict[str, int] = {}
+        self.rules = PaperRuleEngine(
+            PaperRuleConfig(
+                take_profit_pct=settings.paper_take_profit_pct,
+                stop_loss_pct=settings.paper_stop_loss_pct,
+                trailing_stop_pct=settings.paper_trailing_stop_pct,
+                open_buffer_sec=settings.paper_open_buffer_sec,
+                close_buffer_sec=settings.paper_close_buffer_sec,
+                max_trades_per_market=settings.paper_max_trades_per_market,
+                max_consecutive_losses_per_market=settings.paper_max_consecutive_losses_per_market,
+            )
+        )
+        self.store = PaperStore(settings.paper_db_path)
+        summary = self.store.summary()
+        self.total_realized_pnl = float(summary.get("realized_pnl", 0.0))
+        self.total_closed_trades = int(summary.get("closed_trades", 0))
+        self.wins = int(summary.get("wins", 0))
+        self.losses = int(summary.get("losses", 0))
+        self.flat = int(summary.get("flat", 0))
+        for item in reversed(self.store.recent_trades(settings.recent_trade_limit)):
+            self.closed_trades.append(PaperTrade(**item))
 
-    async def reserve_intent(self, token_id: str) -> bool:
+    def _reject(self, reason: str) -> None:
+        self.rejection_counts[reason] = self.rejection_counts.get(reason, 0) + 1
+
+    async def reserve_intent(self, intent: TradeIntent) -> bool:
         async with self.lock:
-            if token_id in self.pending_tokens or token_id in self.positions:
+            market = self.state.current_market or {}
+            allowed, reason = self.rules.market_is_open_for_entries(market, now_ms())
+            if not allowed:
+                self._reject(reason)
+                await self._publish_locked()
+                return False
+            if intent.token_id in self.pending_tokens or intent.token_id in self.positions:
                 self.skipped_duplicates += 1
+                self._reject("duplicate_or_pending_token")
                 await self._publish_locked()
                 return False
             if len(self.positions) + len(self.pending_tokens) >= self.settings.paper_max_open_positions:
+                self._reject("paper_max_open_positions")
+                await self._publish_locked()
                 return False
-            self.pending_tokens.add(token_id)
+            self.pending_tokens.add(intent.token_id)
             return True
 
     async def release_pending(self, token_id: str) -> None:
@@ -81,12 +112,16 @@ class PaperPortfolio:
             self.pending_tokens.discard(intent.token_id)
             if intent.token_id in self.positions:
                 self.skipped_duplicates += 1
+                self._reject("duplicate_open_position")
                 await self._publish_locked()
                 return {"accepted": False, "reason": "duplicate_open_position"}
             if len(self.positions) >= self.settings.paper_max_open_positions:
+                self._reject("paper_max_open_positions")
+                await self._publish_locked()
                 return {"accepted": False, "reason": "paper_max_open_positions"}
             price = max(float(intent.market_price), 1e-9)
             market = self.state.current_market or {}
+            slug = str(market.get("slug") or "")
             position = PaperPosition(
                 token_id=intent.token_id,
                 direction=intent.direction.value,
@@ -94,11 +129,13 @@ class PaperPortfolio:
                 entry_price=price,
                 shares=float(intent.notional_usd) / price,
                 opened_ms=now_ms(),
-                market_slug=str(market.get("slug") or ""),
+                market_slug=slug,
                 condition_id=str(market.get("condition_id") or ""),
                 last_mark_price=price,
+                high_water_price=price,
             )
             self.positions[intent.token_id] = position
+            self.rules.record_open(slug)
             await self._publish_locked()
             log_event(self.logger, "paper_position_opened", position=position.to_dict())
             return {
@@ -124,23 +161,26 @@ class PaperPortfolio:
         now = now_ms()
         to_close: list[tuple[str, float, str]] = []
         async with self.lock:
-            current_tokens = {
-                str(self.settings.yes_token_id or ""),
-                str(self.settings.no_token_id or ""),
-            }
+            current_tokens = {str(self.settings.yes_token_id or ""), str(self.settings.no_token_id or "")}
             for token_id, position in list(self.positions.items()):
                 book = self.state.books.get(token_id)
-                mark_price = (
-                    float(book.best_bid)
-                    if book is not None and book.best_bid is not None
-                    else position.last_mark_price
-                )
+                mark_price = float(book.best_bid) if book is not None and book.best_bid is not None else position.last_mark_price
                 position.last_mark_price = mark_price
+                position.high_water_price = max(position.high_water_price, mark_price)
                 position.unrealized_pnl = round((mark_price - position.entry_price) * position.shares, 8)
                 if token_id not in current_tokens:
                     to_close.append((token_id, mark_price, "market_rotated"))
-                elif now - position.opened_ms >= self.settings.paper_hold_sec * 1000:
-                    to_close.append((token_id, mark_price, "hold_time_elapsed"))
+                    continue
+                reason = self.rules.exit_reason(
+                    entry_price=position.entry_price,
+                    mark_price=mark_price,
+                    high_water_price=position.high_water_price,
+                    opened_ms=position.opened_ms,
+                    now_ms=now,
+                    hold_sec=self.settings.paper_hold_sec,
+                )
+                if reason:
+                    to_close.append((token_id, mark_price, reason))
             await self._publish_locked()
         for token_id, price, reason in to_close:
             await self.close_position(token_id, price, reason)
@@ -167,7 +207,7 @@ class PaperPortfolio:
                 market_slug=position.market_slug,
             )
             self.closed_trades.append(trade)
-            self.closed_trades = self.closed_trades[-100:]
+            self.closed_trades = self.closed_trades[-self.settings.recent_trade_limit:]
             self.total_realized_pnl = round(self.total_realized_pnl + realized, 8)
             self.total_closed_trades += 1
             if realized > 1e-9:
@@ -176,6 +216,8 @@ class PaperPortfolio:
                 self.losses += 1
             else:
                 self.flat += 1
+            self.rules.record_close(position.market_slug, realized)
+            self.store.record_trade(trade)
             await self._publish_locked()
         await self.risk.record_result(position.notional_usd, realized)
         log_event(self.logger, "paper_position_closed", trade=trade.to_dict())
@@ -197,6 +239,9 @@ class PaperPortfolio:
             },
             "open_positions": [p.to_dict() for p in self.positions.values()],
             "closed_trades": [t.to_dict() for t in reversed(self.closed_trades[-20:])],
+            "rejection_counts": dict(sorted(self.rejection_counts.items())),
+            "rules": self.rules.snapshot(),
+            "persistence": {"db_path": self.settings.paper_db_path, "restored_closed_trades": self.total_closed_trades},
         }
         async with self.state.lock:
             self.state.paper_portfolio = payload
