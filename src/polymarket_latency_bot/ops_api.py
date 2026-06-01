@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from .diagnostics import build_diagnostics
 from .models import Prediction, now_ms
 from .report_api import register_report_routes
 
@@ -29,7 +30,7 @@ class PaperLoadTestIn(BaseModel):
 
 
 OPS_HTML = """
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Paper Ops</title></head><body style="background:#07111f;color:#eef5ff;font-family:system-ui;padding:16px"><h1>Polymarket Paper Ops</h1><p>延遲、績效、報表與風控</p><p><a href="/monitor">Monitor</a> · <a href="/latency">Latency</a> · <a href="/performance">Performance</a> · <a href="/report/daily">Daily</a> · <a href="/report/exit-reasons">Exit Reasons</a> · <a href="/export/trades.csv">CSV</a> · <a href="/security/status">Security</a> · <a href="/docs">Docs</a></p><pre id="out">loading...</pre><script>async function refresh(){const [l,p,r,s]=await Promise.all([fetch('/latency').then(x=>x.json()),fetch('/performance').then(x=>x.json()),fetch('/risk').then(x=>x.json()),fetch('/security/status').then(x=>x.json())]);document.getElementById('out').textContent=JSON.stringify({latency:l,performance:p,risk:r,security:s},null,2)}refresh();setInterval(refresh,3000)</script></body></html>
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Paper Ops</title></head><body style="background:#07111f;color:#eef5ff;font-family:system-ui;padding:16px"><h1>Polymarket Paper Ops</h1><p>延遲、績效、診斷、報表與風控</p><p><a href="/monitor">Monitor</a> · <a href="/diagnostics">Diagnostics</a> · <a href="/latency">Latency</a> · <a href="/performance">Performance</a> · <a href="/report/daily">Daily</a> · <a href="/report/exit-reasons">Exit Reasons</a> · <a href="/export/trades.csv">CSV</a> · <a href="/security/status">Security</a> · <a href="/docs">Docs</a></p><pre id="out">loading...</pre><script>async function refresh(){const [d,p,r,s]=await Promise.all([fetch('/diagnostics').then(x=>x.json()),fetch('/performance').then(x=>x.json()),fetch('/risk').then(x=>x.json()),fetch('/security/status').then(x=>x.json())]);document.getElementById('out').textContent=JSON.stringify({diagnostics:d,performance:p,risk:r,security:s},null,2)}refresh();setInterval(refresh,3000)</script></body></html>
 """
 
 
@@ -65,7 +66,27 @@ def register_ops_routes(app: FastAPI, settings: Any, state: Any, feeds: Any, ris
     @app.get("/latency")
     async def latency() -> dict[str, Any]:
         snapshot = await state.snapshot()
-        return {"latency": snapshot.get("latency", {}), "runtime_counters": snapshot.get("runtime_counters", {})}
+        return {
+            "latency": snapshot.get("latency", {}),
+            "runtime_counters": snapshot.get("runtime_counters", {}),
+            "throughput": snapshot.get("throughput", {}),
+            "queue_depth": snapshot.get("queue_depth", 0),
+            "queue_high_water": snapshot.get("queue_high_water", 0),
+        }
+
+    @app.get("/diagnostics")
+    async def diagnostics() -> dict[str, Any]:
+        snapshot = await state.snapshot()
+        async with risk.lock:
+            risk_snapshot = risk.snapshot
+        return build_diagnostics(settings, snapshot, risk_snapshot, portfolio.store.db_path)
+
+    @app.get("/startup-check")
+    async def startup_check() -> dict[str, Any]:
+        snapshot = await state.snapshot()
+        async with risk.lock:
+            risk_snapshot = risk.snapshot
+        return build_diagnostics(settings, snapshot, risk_snapshot, portfolio.store.db_path)
 
     @app.get("/performance")
     async def performance() -> dict[str, Any]:
@@ -118,6 +139,7 @@ def register_ops_routes(app: FastAPI, settings: Any, state: Any, feeds: Any, ris
         await asyncio.gather(*(one() for _ in range(body.operations)))
         elapsed = max(0.000001, perf_counter() - started)
         await state.increment_counter("pipeline_loadtest_runs" if pipeline else "paper_loadtest_runs")
+        await state.record_event("pipeline_loadtest" if pipeline else "paper_loadtest")
         return {"mode": "pipeline_dry_run" if pipeline else "task_dry_run", "operations": body.operations, "concurrency": body.concurrency, "elapsed_sec": round(elapsed, 6), "ops_per_sec": round(body.operations / elapsed, 2), "creates_orders": False, "changes_positions": False}
 
     @app.post("/loadtest/paper")
