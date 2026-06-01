@@ -68,7 +68,8 @@ class Settings(BaseSettings):
 
     # Hardened Paper portfolio simulation
     paper_hold_sec: int = Field(default=60, ge=5, le=900)
-    paper_max_open_positions: int = Field(default=2, ge=1, le=50)
+    # Set to 0 to disable the Paper open-position-count cap.
+    paper_max_open_positions: int = Field(default=0, ge=0, le=100000)
     paper_mark_interval_sec: float = Field(default=1.0, gt=0)
     paper_take_profit_pct: float = Field(default=0.08, gt=0, le=1)
     paper_stop_loss_pct: float = Field(default=0.04, gt=0, le=1)
