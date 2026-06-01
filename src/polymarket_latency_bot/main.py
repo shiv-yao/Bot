@@ -6,6 +6,7 @@ from contextlib import suppress
 
 import uvicorn
 
+from .ai_api import register_ai_routes
 from .api import create_app
 from .config import Settings
 from .logging_utils import log_event, setup_logging
@@ -71,6 +72,7 @@ async def run() -> None:
         register_monitoring_routes(app, settings, state, risk, portfolio)
         register_ops_routes(app, settings, state, feeds, risk, portfolio)
         register_watchdog_routes(app, watchdog)
+        register_ai_routes(app, settings, state)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
@@ -80,6 +82,9 @@ async def run() -> None:
         logger,
         "bot_started",
         mode="paper",
+        market_slug_prefix=settings.market_slug_prefix,
+        market_interval_sec=settings.market_interval_sec,
+        ai_mode="single_direction_yes_no",
         auto_discover_market=settings.auto_discover_market,
         rtds_feed="chainlink_btc_usd",
         binance_ws=settings.enable_binance_ws,
