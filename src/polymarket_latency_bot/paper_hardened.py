@@ -11,7 +11,8 @@ class PaperRuleConfig:
     trailing_stop_pct: float = 0.03
     open_buffer_sec: int = 30
     close_buffer_sec: int = 90
-    max_trades_per_market: int = 2
+    # Set to 0 to disable the per-market trade-count cap.
+    max_trades_per_market: int = 0
     max_consecutive_losses_per_market: int = 2
 
 
@@ -37,7 +38,7 @@ class PaperRuleEngine:
             return False, "market_close_buffer"
         if slug in self.paused_markets:
             return False, "market_paused_after_losses"
-        if self.market_trade_counts.get(slug, 0) >= self.config.max_trades_per_market:
+        if self.config.max_trades_per_market > 0 and self.market_trade_counts.get(slug, 0) >= self.config.max_trades_per_market:
             return False, "market_trade_limit"
         return True, "ok"
 
