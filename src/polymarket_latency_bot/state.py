@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from statistics import mean
 from typing import Any
 
 from .models import BookTop, Prediction, TradeIntent, now_ms
@@ -38,6 +39,13 @@ class BotState:
         self.ws_market_connected = False
         self.ws_user_connected = False
         self.ws_rtds_connected = False
+        self.latency_samples: dict[str, deque[float]] = {
+            "strategy_ms": deque(maxlen=4096),
+            "queue_wait_ms": deque(maxlen=4096),
+            "execution_ms": deque(maxlen=4096),
+            "signal_to_result_ms": deque(maxlen=4096),
+        }
+        self.runtime_counters: dict[str, int] = {}
         self.paper_portfolio: dict[str, Any] = {
             "summary": {
                 "realized_pnl": 0.0, "unrealized_pnl": 0.0, "wins": 0, "losses": 0,
@@ -46,6 +54,35 @@ class BotState:
             "open_positions": [], "closed_trades": [], "rejection_counts": {}, "rules": {},
         }
         self.started_ms = now_ms()
+
+    async def record_latency(self, metric: str, value_ms: float) -> None:
+        async with self.lock:
+            values = self.latency_samples.setdefault(metric, deque(maxlen=4096))
+            values.append(max(0.0, float(value_ms)))
+
+    async def increment_counter(self, name: str, amount: int = 1) -> None:
+        async with self.lock:
+            self.runtime_counters[name] = self.runtime_counters.get(name, 0) + int(amount)
+
+    def _latency_summary_locked(self) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for name, values in self.latency_samples.items():
+            ordered = sorted(values)
+            if not ordered:
+                output[name] = {"count": 0, "avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0}
+                continue
+            def percentile(q: float) -> float:
+                index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * q)))
+                return round(float(ordered[index]), 4)
+            output[name] = {
+                "count": len(ordered),
+                "avg_ms": round(float(mean(ordered)), 4),
+                "p50_ms": percentile(0.50),
+                "p95_ms": percentile(0.95),
+                "p99_ms": percentile(0.99),
+                "max_ms": round(float(max(ordered)), 4),
+            }
+        return output
 
     async def snapshot(self) -> dict[str, Any]:
         async with self.lock:
@@ -77,6 +114,8 @@ class BotState:
                 "orders_submitted": self.orders_submitted,
                 "orders_rejected": self.orders_rejected,
                 "queue_depth": self.queue_depth,
+                "latency": self._latency_summary_locked(),
+                "runtime_counters": dict(sorted(self.runtime_counters.items())),
                 "connections": {
                     "market_ws": self.ws_market_connected,
                     "user_ws": self.ws_user_connected,
