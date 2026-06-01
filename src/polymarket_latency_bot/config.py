@@ -37,21 +37,21 @@ class Settings(BaseSettings):
     live_confirmation: str = ""
     account_equity_usd: float = Field(default=1000.0, gt=0)
     max_order_equity_fraction: float = Field(default=0.005, gt=0, le=0.005)
-    max_daily_loss_fraction: float = Field(default=0.02, gt=0, le=0.02)
-    max_open_notional_usd: float = Field(default=50.0, gt=0)
-    min_edge: float = Field(default=0.003, gt=0)
-    min_confidence: float = Field(default=0.55, ge=0, le=1)
-    signal_cooldown_ms: int = Field(default=250, ge=0)
-    max_signal_age_ms: int = Field(default=1000, gt=0)
+    max_daily_loss_fraction: float = Field(default=0.005, gt=0, le=0.02)
+    max_open_notional_usd: float = Field(default=10.0, gt=0)
+    min_edge: float = Field(default=0.05, gt=0)
+    min_confidence: float = Field(default=0.65, ge=0, le=1)
+    signal_cooldown_ms: int = Field(default=5000, ge=0)
+    max_signal_age_ms: int = Field(default=1500, gt=0)
     order_timeout_ms: int = Field(default=1500, gt=0)
-    max_queue_size: int = Field(default=10000, gt=0)
-    execution_workers: int = Field(default=8, gt=0, le=128)
-    order_rate_per_sec: float = Field(default=70.0, gt=0, le=80)
-    order_burst: int = Field(default=350, gt=0, le=500)
+    max_queue_size: int = Field(default=1000, gt=0)
+    execution_workers: int = Field(default=2, gt=0, le=128)
+    order_rate_per_sec: float = Field(default=10.0, gt=0, le=80)
+    order_burst: int = Field(default=20, gt=0, le=500)
 
     # Paper portfolio simulation
-    paper_hold_sec: int = Field(default=30, ge=5, le=900)
-    paper_max_open_positions: int = Field(default=4, ge=1, le=50)
+    paper_hold_sec: int = Field(default=60, ge=5, le=900)
+    paper_max_open_positions: int = Field(default=2, ge=1, le=50)
     paper_mark_interval_sec: float = Field(default=1.0, gt=0)
 
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
