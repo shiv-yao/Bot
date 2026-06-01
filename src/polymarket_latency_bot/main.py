@@ -8,8 +8,8 @@ import uvicorn
 
 from .api import create_app
 from .config import Settings
-from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
+from .measured_feeds import MeasuredFeedHub
 from .models import now_ms
 from .monitoring import register_monitoring_routes
 from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
@@ -34,14 +34,17 @@ async def run() -> None:
 
     async def evaluate() -> None:
         started_ms = now_ms()
+        await state.record_event("strategy_evaluation")
         intents = await strategy.build_intents()
         await state.record_latency("strategy_ms", now_ms() - started_ms)
         if intents:
             await state.increment_counter("strategy_intents", len(intents))
+            for _ in intents:
+                await state.record_event("strategy_intent")
         for intent in intents:
             await executor.submit(intent)
 
-    feeds = FeedHub(settings, state, evaluate)
+    feeds = MeasuredFeedHub(settings, state, evaluate)
     fusion = MultiSourceFusion(settings, state, feeds)
 
     tasks: list[asyncio.Task[object]] = [
