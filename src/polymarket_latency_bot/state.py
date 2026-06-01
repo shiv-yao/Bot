@@ -36,6 +36,7 @@ class BotState:
         self.orders_submitted = 0
         self.orders_rejected = 0
         self.queue_depth = 0
+        self.queue_high_water = 0
         self.ws_market_connected = False
         self.ws_user_connected = False
         self.ws_rtds_connected = False
@@ -46,6 +47,7 @@ class BotState:
             "signal_to_result_ms": deque(maxlen=4096),
         }
         self.runtime_counters: dict[str, int] = {}
+        self.rolling_events: dict[str, deque[int]] = {}
         self.paper_portfolio: dict[str, Any] = {
             "summary": {
                 "realized_pnl": 0.0, "unrealized_pnl": 0.0, "wins": 0, "losses": 0,
@@ -63,6 +65,25 @@ class BotState:
     async def increment_counter(self, name: str, amount: int = 1) -> None:
         async with self.lock:
             self.runtime_counters[name] = self.runtime_counters.get(name, 0) + int(amount)
+
+    async def record_event(self, name: str, timestamp_ms: int | None = None) -> None:
+        timestamp = int(timestamp_ms or now_ms())
+        async with self.lock:
+            events = self.rolling_events.setdefault(name, deque(maxlen=20000))
+            events.append(timestamp)
+            cutoff = timestamp - 60000
+            while events and events[0] < cutoff:
+                events.popleft()
+
+    def _throughput_locked(self, timestamp: int) -> dict[str, Any]:
+        cutoff = timestamp - 60000
+        output: dict[str, Any] = {}
+        for name, events in self.rolling_events.items():
+            while events and events[0] < cutoff:
+                events.popleft()
+            count = len(events)
+            output[name] = {"last_60s": count, "per_sec": round(count / 60, 4)}
+        return output
 
     def _latency_summary_locked(self) -> dict[str, Any]:
         output: dict[str, Any] = {}
@@ -114,8 +135,10 @@ class BotState:
                 "orders_submitted": self.orders_submitted,
                 "orders_rejected": self.orders_rejected,
                 "queue_depth": self.queue_depth,
+                "queue_high_water": self.queue_high_water,
                 "latency": self._latency_summary_locked(),
                 "runtime_counters": dict(sorted(self.runtime_counters.items())),
+                "throughput": self._throughput_locked(timestamp),
                 "connections": {
                     "market_ws": self.ws_market_connected,
                     "user_ws": self.ws_user_connected,
