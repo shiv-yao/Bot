@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     clob_host: str = "https://clob.polymarket.com"
+    gamma_api_url: str = "https://gamma-api.polymarket.com"
     chain_id: int = 137
     pk: str = ""
     clob_api_key: str = ""
@@ -25,6 +26,12 @@ class Settings(BaseSettings):
     condition_id: str = ""
     tick_size: str = "0.01"
     neg_risk: bool = False
+
+    auto_discover_market: bool = True
+    market_slug_prefix: str = "btc-updown-15m-"
+    market_interval_sec: int = Field(default=900, ge=60)
+    market_discovery_refresh_sec: float = Field(default=10.0, gt=0)
+    market_discovery_timeout_sec: float = Field(default=3.0, gt=0)
 
     live_trading: bool = False
     live_confirmation: str = ""
@@ -45,6 +52,8 @@ class Settings(BaseSettings):
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     rtds_ws_url: str = "wss://ws-live-data.polymarket.com"
+    enable_rtds_momentum_prediction: bool = True
+    rtds_prediction_window_sec: int = Field(default=60, ge=10)
 
     external_poll_url: str = ""
     external_poll_api_key: str = ""
@@ -68,10 +77,15 @@ class Settings(BaseSettings):
                 key for key, value in {
                     "PK": self.pk,
                     "FUNDER_ADDRESS": self.funder_address,
-                    "YES_TOKEN_ID": self.yes_token_id,
-                    "NO_TOKEN_ID": self.no_token_id,
                 }.items() if not value
             ]
+            if not self.auto_discover_market:
+                missing.extend(
+                    key for key, value in {
+                        "YES_TOKEN_ID": self.yes_token_id,
+                        "NO_TOKEN_ID": self.no_token_id,
+                    }.items() if not value
+                )
             if missing:
                 raise ValueError(f"Live mode missing required settings: {', '.join(missing)}")
         return self
