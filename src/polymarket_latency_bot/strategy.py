@@ -43,36 +43,44 @@ class LatencyStrategy:
         total_weight = sum(max(prediction.confidence, 0.0001) for prediction in fresh)
         fair_up = sum(prediction.probability_up * prediction.confidence for prediction in fresh) / total_weight
         confidence = min(1.0, sum(prediction.confidence for prediction in fresh) / len(fresh))
+        margin = self.settings.ai_min_probability_margin
         notional = self._notional_for_regime(btc_prices)
-        intents: list[TradeIntent] = []
 
-        yes_intent = await self._build_intent(
-            direction=Direction.BUY_YES,
-            token_id=self.settings.yes_token_id,
-            fair_probability=fair_up,
-            book=yes_book,
+        ai_snapshot = {
+            "ai_mode": "single_direction_yes_no",
+            "fair_probability_up": fair_up,
+            "confidence": confidence,
+            "probability_margin": margin,
+            "source_count": len(fresh),
+            "timestamp_ms": now,
+        }
+
+        if fair_up >= 0.5 + margin:
+            direction = Direction.BUY_YES
+            token_id = self.settings.yes_token_id
+            book = yes_book
+            fair_probability = fair_up
+        elif fair_up <= 0.5 - margin:
+            direction = Direction.BUY_NO
+            token_id = self.settings.no_token_id
+            book = no_book
+            fair_probability = 1 - fair_up
+        else:
+            await self._reject("ai_probability_too_close", ai_snapshot)
+            return []
+
+        intent = await self._build_intent(
+            direction=direction,
+            token_id=token_id,
+            fair_probability=fair_probability,
+            book=book,
             confidence=confidence,
             notional=notional,
             now=now,
             source_count=len(fresh),
+            ai_snapshot=ai_snapshot,
         )
-        if yes_intent is not None:
-            intents.append(yes_intent)
-
-        no_intent = await self._build_intent(
-            direction=Direction.BUY_NO,
-            token_id=self.settings.no_token_id,
-            fair_probability=1 - fair_up,
-            book=no_book,
-            confidence=confidence,
-            notional=notional,
-            now=now,
-            source_count=len(fresh),
-        )
-        if no_intent is not None:
-            intents.append(no_intent)
-
-        return intents
+        return [intent] if intent is not None else []
 
     async def _build_intent(
         self,
@@ -85,16 +93,17 @@ class LatencyStrategy:
         notional: float,
         now: int,
         source_count: int,
+        ai_snapshot: dict[str, Any],
     ) -> TradeIntent | None:
         snapshot: dict[str, Any] = {
+            **ai_snapshot,
             "direction": direction.value,
             "token_id": token_id,
             "fair_probability": fair_probability,
-            "confidence": confidence,
             "notional_usd": notional,
-            "timestamp_ms": now,
-            "source_count": source_count,
         }
+        if not token_id:
+            return await self._reject("token_missing", snapshot)
         if book is None:
             return await self._reject("book_missing", snapshot)
         if book.best_ask is None or book.best_bid is None:
