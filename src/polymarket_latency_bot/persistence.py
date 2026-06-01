@@ -87,3 +87,32 @@ class PaperStore:
                 """
             ).fetchone()
         return dict(row) if row else {"closed_trades": 0, "realized_pnl": 0.0, "wins": 0, "losses": 0, "flat": 0}
+
+    def performance(self) -> dict[str, Any]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT realized_pnl, hold_ms FROM paper_trades ORDER BY id ASC"
+            ).fetchall()
+        pnls = [float(row["realized_pnl"]) for row in rows]
+        holds = [int(row["hold_ms"]) for row in rows]
+        gross_profit = sum(value for value in pnls if value > 0)
+        gross_loss = abs(sum(value for value in pnls if value < 0))
+        cumulative = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for value in pnls:
+            cumulative += value
+            peak = max(peak, cumulative)
+            max_drawdown = max(max_drawdown, peak - cumulative)
+        trade_count = len(pnls)
+        return {
+            "closed_trades": trade_count,
+            "gross_profit": round(gross_profit, 8),
+            "gross_loss": round(gross_loss, 8),
+            "profit_factor": round(gross_profit / gross_loss, 6) if gross_loss > 0 else None,
+            "net_pnl": round(sum(pnls), 8),
+            "average_trade_pnl": round(sum(pnls) / trade_count, 8) if trade_count else 0.0,
+            "average_hold_ms": round(sum(holds) / len(holds), 2) if holds else 0.0,
+            "max_drawdown": round(max_drawdown, 8),
+            "win_rate": round(sum(1 for value in pnls if value > 0) / trade_count, 6) if trade_count else 0.0,
+        }
