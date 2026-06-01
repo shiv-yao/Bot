@@ -25,6 +25,20 @@ class BotState:
         self.ws_market_connected = False
         self.ws_user_connected = False
         self.ws_rtds_connected = False
+        self.paper_portfolio: dict[str, Any] = {
+            "summary": {
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "flat": 0,
+                "open_positions": 0,
+                "closed_trades": 0,
+                "skipped_duplicates": 0,
+            },
+            "open_positions": [],
+            "closed_trades": [],
+        }
         self.started_ms = now_ms()
 
     async def snapshot(self) -> dict[str, Any]:
@@ -37,6 +51,7 @@ class BotState:
                 "books": {k: v.to_dict() for k, v in self.books.items()},
                 "predictions": {k: v.to_dict() for k, v in self.predictions.items()},
                 "btc_prices_tail": list(self.btc_prices)[-10:],
+                "paper_portfolio": self.paper_portfolio,
                 "last_intent": self.last_intent.to_dict() if self.last_intent else None,
                 "last_order_result": self.last_order_result,
                 "last_error": self.last_error,
