@@ -53,3 +53,20 @@ class RiskManager:
                 self.snapshot.halted = True
                 self.snapshot.halt_reason = "daily_loss_limit"
             return self.snapshot
+
+    async def halt(self, reason: str = "manual_kill_switch") -> RiskSnapshot:
+        async with self.lock:
+            self.snapshot.halted = True
+            self.snapshot.halt_reason = reason or "manual_kill_switch"
+            return self.snapshot
+
+    async def resume(self) -> RiskSnapshot:
+        async with self.lock:
+            max_loss = self.snapshot.day_start_equity * self.settings.max_daily_loss_fraction
+            if self.snapshot.realized_pnl <= -max_loss:
+                self.snapshot.halted = True
+                self.snapshot.halt_reason = "daily_loss_limit"
+                return self.snapshot
+            self.snapshot.halted = False
+            self.snapshot.halt_reason = ""
+            return self.snapshot
