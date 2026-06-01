@@ -186,7 +186,7 @@ class LatencyStrategy:
         return True
 
     def _notional_for_regime(self, prices: list[tuple[int, float]]) -> float:
-        base = self.settings.account_equity_usd * self.settings.max_order_equity_fraction
+        base = self.settings.account_equity_usd * self.settings.effective_max_order_equity_fraction
         values = [price for _, price in prices[-30:]]
         if len(values) < 5 or values[0] <= 0:
             return round(base, 2)
