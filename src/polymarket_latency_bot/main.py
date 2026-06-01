@@ -8,7 +8,7 @@ import uvicorn
 
 from .api import create_app
 from .config import Settings
-from .executor import LiveExecutor, PaperExecutor
+from .executor import PaperExecutor
 from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
 from .risk import RiskManager
@@ -23,7 +23,7 @@ async def run() -> None:
     state = BotState()
     risk = RiskManager(settings)
     strategy = LatencyStrategy(settings, state)
-    executor = LiveExecutor(settings, state, risk) if settings.live_enabled else PaperExecutor(settings, state, risk)
+    executor = PaperExecutor(settings, state, risk)
 
     async def evaluate() -> None:
         for intent in await strategy.build_intents():
@@ -31,6 +31,7 @@ async def run() -> None:
 
     feeds = FeedHub(settings, state, evaluate)
     tasks: list[asyncio.Task[object]] = [
+        asyncio.create_task(feeds.market_discovery_loop(), name="market-discovery"),
         asyncio.create_task(feeds.market_ws_loop(), name="market-ws"),
         asyncio.create_task(feeds.rtds_loop(), name="rtds-ws"),
         asyncio.create_task(feeds.user_ws_loop(), name="user-ws"),
@@ -42,9 +43,16 @@ async def run() -> None:
     ]
     if settings.enable_api:
         app = create_app(settings, state, feeds, risk)
-        server = uvicorn.Server(uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning"))
+        server = uvicorn.Server(
+            uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
+        )
         tasks.append(asyncio.create_task(server.serve(), name="api"))
-    log_event(logger, "bot_started", mode="live" if settings.live_enabled else "paper")
+    log_event(
+        logger,
+        "bot_started",
+        mode="paper",
+        auto_discover_market=settings.auto_discover_market,
+    )
     try:
         await asyncio.gather(*tasks)
     finally:
