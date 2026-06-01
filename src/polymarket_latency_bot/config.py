@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     execution_workers: int = Field(default=2, gt=0, le=128)
     order_rate_per_sec: float = Field(default=10.0, gt=0, le=80)
     order_burst: int = Field(default=20, gt=0, le=500)
+    # Applies only to PaperExecutor. LiveExecutor always keeps rate limiting enabled.
+    paper_disable_order_rate_limit: bool = True
 
     # Hardened Paper portfolio simulation
     paper_hold_sec: int = Field(default=60, ge=5, le=900)
