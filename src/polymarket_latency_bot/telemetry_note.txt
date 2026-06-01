@@ -1,1 +1,0 @@
-Latency telemetry module placeholder.
