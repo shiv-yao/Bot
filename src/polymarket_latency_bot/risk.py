@@ -24,8 +24,8 @@ class RiskManager:
 
     async def check(self, intent: TradeIntent) -> tuple[bool, str]:
         async with self.lock:
-            max_order = self.settings.account_equity_usd * self.settings.max_order_equity_fraction
-            max_loss = self.snapshot.day_start_equity * self.settings.max_daily_loss_fraction
+            max_order = self.settings.account_equity_usd * self.settings.effective_max_order_equity_fraction
+            max_loss = self.snapshot.day_start_equity * self.settings.effective_max_daily_loss_fraction
             if self.snapshot.realized_pnl <= -max_loss:
                 self.snapshot.halted = True
                 self.snapshot.halt_reason = "daily_loss_limit"
@@ -35,7 +35,7 @@ class RiskManager:
                 return False, "stale_signal"
             if intent.notional_usd > max_order + 1e-9:
                 return False, "max_single_order"
-            if self.snapshot.open_notional + intent.notional_usd > self.settings.max_open_notional_usd:
+            if self.snapshot.open_notional + intent.notional_usd > self.settings.effective_max_open_notional_usd:
                 return False, "max_open_notional"
             self.snapshot.open_notional += intent.notional_usd
             return True, "ok"
@@ -48,7 +48,7 @@ class RiskManager:
     async def manual_pnl_adjustment(self, delta: float) -> RiskSnapshot:
         async with self.lock:
             self.snapshot.realized_pnl += delta
-            max_loss = self.snapshot.day_start_equity * self.settings.max_daily_loss_fraction
+            max_loss = self.snapshot.day_start_equity * self.settings.effective_max_daily_loss_fraction
             if self.snapshot.realized_pnl <= -max_loss:
                 self.snapshot.halted = True
                 self.snapshot.halt_reason = "daily_loss_limit"
@@ -62,7 +62,7 @@ class RiskManager:
 
     async def resume(self) -> RiskSnapshot:
         async with self.lock:
-            max_loss = self.snapshot.day_start_equity * self.settings.max_daily_loss_fraction
+            max_loss = self.snapshot.day_start_equity * self.settings.effective_max_daily_loss_fraction
             if self.snapshot.realized_pnl <= -max_loss:
                 self.snapshot.halted = True
                 self.snapshot.halt_reason = "daily_loss_limit"
