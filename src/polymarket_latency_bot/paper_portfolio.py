@@ -23,6 +23,7 @@ class PaperPosition:
     last_mark_price: float
     high_water_price: float
     unrealized_pnl: float = 0.0
+    order_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +43,7 @@ class PaperTrade:
     hold_ms: int
     close_reason: str
     market_slug: str
+    order_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,15 +106,19 @@ class PaperPortfolio:
                 self._reject(reason)
                 await self._publish_locked()
                 return False
-            if token_id in self.pending_tokens or token_id in self.positions:
+            # Existing token positions may receive additional Paper orders. They are
+            # aggregated into one weighted-average position to avoid unbounded objects.
+            if token_id in self.pending_tokens and token_id not in self.positions:
                 self.skipped_duplicates += 1
-                self._reject("duplicate_or_pending_token")
+                self._reject("duplicate_pending_token")
                 await self._publish_locked()
                 return False
-            if len(self.positions) + len(self.pending_tokens) >= self.settings.paper_max_open_positions:
-                self._reject("paper_max_open_positions")
-                await self._publish_locked()
-                return False
+            if token_id not in self.positions:
+                limit = int(self.settings.paper_max_open_positions)
+                if limit > 0 and len(self.positions) + len(self.pending_tokens) >= limit:
+                    self._reject("paper_max_open_positions")
+                    await self._publish_locked()
+                    return False
             self.pending_tokens.add(token_id)
             return True
 
@@ -123,18 +129,37 @@ class PaperPortfolio:
     async def open_position(self, intent: TradeIntent) -> dict[str, Any]:
         async with self.lock:
             self.pending_tokens.discard(intent.token_id)
-            if intent.token_id in self.positions:
-                self.skipped_duplicates += 1
-                self._reject("duplicate_open_position")
-                await self._publish_locked()
-                return {"accepted": False, "reason": "duplicate_open_position"}
-            if len(self.positions) >= self.settings.paper_max_open_positions:
-                self._reject("paper_max_open_positions")
-                await self._publish_locked()
-                return {"accepted": False, "reason": "paper_max_open_positions"}
             price = max(float(intent.market_price), 1e-9)
             market = self.state.current_market or {}
             slug = str(market.get("slug") or "")
+            existing = self.positions.get(intent.token_id)
+            if existing is not None:
+                added_notional = float(intent.notional_usd)
+                added_shares = added_notional / price
+                existing.notional_usd += added_notional
+                existing.shares += added_shares
+                existing.entry_price = existing.notional_usd / existing.shares
+                existing.last_mark_price = price
+                existing.high_water_price = max(existing.high_water_price, price)
+                existing.order_count += 1
+                self.rules.record_open(slug)
+                await self._publish_locked()
+                log_event(self.logger, "paper_position_aggregated", position=existing.to_dict())
+                return {
+                    "accepted": True,
+                    "mode": "paper",
+                    "aggregated": True,
+                    "token_id": existing.token_id,
+                    "order_count": existing.order_count,
+                    "notional_usd": existing.notional_usd,
+                    "entry_price": existing.entry_price,
+                    "shares": existing.shares,
+                }
+            limit = int(self.settings.paper_max_open_positions)
+            if limit > 0 and len(self.positions) >= limit:
+                self._reject("paper_max_open_positions")
+                await self._publish_locked()
+                return {"accepted": False, "reason": "paper_max_open_positions"}
             position = PaperPosition(
                 token_id=intent.token_id,
                 direction=intent.direction.value,
@@ -155,6 +180,7 @@ class PaperPortfolio:
                 "accepted": True,
                 "mode": "paper",
                 "token_id": position.token_id,
+                "order_count": position.order_count,
                 "notional_usd": position.notional_usd,
                 "entry_price": position.entry_price,
                 "shares": position.shares,
@@ -219,6 +245,7 @@ class PaperPortfolio:
                 hold_ms=closed_ms - position.opened_ms,
                 close_reason=reason,
                 market_slug=position.market_slug,
+                order_count=position.order_count,
             )
             self.closed_trades.append(trade)
             self.closed_trades = self.closed_trades[-self.settings.recent_trade_limit:]
@@ -247,6 +274,7 @@ class PaperPortfolio:
                 "losses": self.losses,
                 "flat": self.flat,
                 "open_positions": len(self.positions),
+                "open_order_count": sum(p.order_count for p in self.positions.values()),
                 "closed_trades": self.total_closed_trades,
                 "skipped_duplicates": self.skipped_duplicates,
                 "win_rate": round(self.wins / max(1, self.wins + self.losses), 4),
