@@ -13,6 +13,21 @@ class BotState:
         self.books: dict[str, BookTop] = {}
         self.predictions: dict[str, Prediction] = {}
         self.btc_prices: deque[tuple[int, float]] = deque(maxlen=512)
+        self.external_prices: dict[str, list[tuple[int, float]]] = {
+            "chainlink": [],
+            "binance": [],
+            "coinbase": [],
+        }
+        self.source_status: dict[str, dict[str, Any]] = {
+            "chainlink": {"connected": False},
+            "binance": {"connected": False},
+            "coinbase": {"connected": False},
+        }
+        self.fusion_snapshot: dict[str, Any] = {
+            "status": "waiting_for_sources",
+            "source_count": 0,
+            "required_sources": 2,
+        }
         self.current_market: dict[str, Any] | None = None
         self.market_discovery_status = "pending"
         self.last_market_discovery_ms: int | None = None
@@ -38,19 +53,32 @@ class BotState:
             },
             "open_positions": [],
             "closed_trades": [],
+            "rejection_counts": {},
+            "rules": {},
         }
         self.started_ms = now_ms()
 
     async def snapshot(self) -> dict[str, Any]:
         async with self.lock:
+            timestamp = now_ms()
+            source_status = {}
+            for source, status in self.source_status.items():
+                item = dict(status)
+                last_update = item.get("last_update_ms")
+                if isinstance(last_update, int):
+                    item["age_ms"] = max(0, timestamp - last_update)
+                source_status[source] = item
             return {
-                "uptime_ms": now_ms() - self.started_ms,
+                "uptime_ms": timestamp - self.started_ms,
                 "current_market": self.current_market,
                 "market_discovery_status": self.market_discovery_status,
                 "last_market_discovery_ms": self.last_market_discovery_ms,
                 "books": {k: v.to_dict() for k, v in self.books.items()},
                 "predictions": {k: v.to_dict() for k, v in self.predictions.items()},
                 "btc_prices_tail": list(self.btc_prices)[-10:],
+                "external_prices": self.external_prices,
+                "source_status": source_status,
+                "fusion_snapshot": self.fusion_snapshot,
                 "paper_portfolio": self.paper_portfolio,
                 "last_intent": self.last_intent.to_dict() if self.last_intent else None,
                 "last_order_result": self.last_order_result,
