@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # BTC Up/Down 5-minute market discovery.
     auto_discover_market: bool = True
+    force_btc_5m_market: bool = True
     market_slug_prefix: str = "btc-updown-5m-"
     market_interval_sec: int = Field(default=300, ge=60)
     market_discovery_refresh_sec: float = Field(default=5.0, gt=0)
@@ -121,6 +122,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_live(self) -> "Settings":
+        if self.force_btc_5m_market:
+            self.market_slug_prefix = "btc-updown-5m-"
+            self.market_interval_sec = 300
         if self.max_contract_price <= self.min_contract_price:
             raise ValueError("MAX_CONTRACT_PRICE must be greater than MIN_CONTRACT_PRICE")
         if self.paper_open_buffer_sec + self.paper_close_buffer_sec >= self.market_interval_sec:
