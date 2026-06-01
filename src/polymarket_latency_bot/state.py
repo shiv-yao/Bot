@@ -13,6 +13,9 @@ class BotState:
         self.books: dict[str, BookTop] = {}
         self.predictions: dict[str, Prediction] = {}
         self.btc_prices: deque[tuple[int, float]] = deque(maxlen=512)
+        self.current_market: dict[str, Any] | None = None
+        self.market_discovery_status = "pending"
+        self.last_market_discovery_ms: int | None = None
         self.last_intent: TradeIntent | None = None
         self.last_order_result: dict[str, Any] | None = None
         self.last_error: str | None = None
@@ -28,6 +31,9 @@ class BotState:
         async with self.lock:
             return {
                 "uptime_ms": now_ms() - self.started_ms,
+                "current_market": self.current_market,
+                "market_discovery_status": self.market_discovery_status,
+                "last_market_discovery_ms": self.last_market_discovery_ms,
                 "books": {k: v.to_dict() for k, v in self.books.items()},
                 "predictions": {k: v.to_dict() for k, v in self.predictions.items()},
                 "btc_prices_tail": list(self.btc_prices)[-10:],
