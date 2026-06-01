@@ -18,6 +18,28 @@ from .state import BotState
 from .strategy import LatencyStrategy
 
 
+def effective_config(settings: Settings) -> dict[str, object]:
+    return {
+        "mode": "paper",
+        "auto_discover_market": settings.auto_discover_market,
+        "account_equity_usd": settings.account_equity_usd,
+        "max_order_equity_fraction": settings.max_order_equity_fraction,
+        "max_daily_loss_fraction": settings.max_daily_loss_fraction,
+        "max_open_notional_usd": settings.max_open_notional_usd,
+        "min_edge": settings.min_edge,
+        "min_confidence": settings.min_confidence,
+        "signal_cooldown_ms": settings.signal_cooldown_ms,
+        "max_signal_age_ms": settings.max_signal_age_ms,
+        "execution_workers": settings.execution_workers,
+        "order_rate_per_sec": settings.order_rate_per_sec,
+        "order_burst": settings.order_burst,
+        "paper_hold_sec": settings.paper_hold_sec,
+        "paper_max_open_positions": settings.paper_max_open_positions,
+        "paper_mark_interval_sec": settings.paper_mark_interval_sec,
+        "rtds_prediction_window_sec": settings.rtds_prediction_window_sec,
+    }
+
+
 async def run() -> None:
     settings = Settings()
     setup_logging(settings.log_level)
@@ -47,6 +69,7 @@ async def run() -> None:
     ]
     if settings.enable_api:
         app = create_app(settings, state, feeds, risk)
+        app.add_api_route("/config", lambda: effective_config(settings), methods=["GET"])
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
@@ -59,6 +82,10 @@ async def run() -> None:
         rtds_feed="chainlink_btc_usd",
         paper_hold_sec=settings.paper_hold_sec,
         paper_max_open_positions=settings.paper_max_open_positions,
+        min_edge=settings.min_edge,
+        min_confidence=settings.min_confidence,
+        signal_cooldown_ms=settings.signal_cooldown_ms,
+        max_daily_loss_fraction=settings.max_daily_loss_fraction,
     )
     try:
         await asyncio.gather(*tasks)
