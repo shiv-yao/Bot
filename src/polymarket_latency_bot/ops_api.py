@@ -5,8 +5,8 @@ from dataclasses import asdict
 from time import perf_counter
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .models import Prediction, now_ms
@@ -36,12 +36,30 @@ const row=(a,b)=>`<div class="row"><span>${a}</span><strong>${b}</strong></div>`
 """
 
 
+def _secret_ready(value: str) -> bool:
+    return bool(value and value != "change-me" and len(value) >= 16)
+
+
 def _require_secret(expected: str, actual: str) -> None:
-    if not expected or actual != expected:
+    if not _secret_ready(expected):
+        raise HTTPException(status_code=503, detail="WEBHOOK_SECRET is not configured")
+    if actual != expected:
         raise HTTPException(status_code=401, detail="invalid webhook secret")
 
 
 def register_ops_routes(app: FastAPI, settings: Any, state: Any, feeds: Any, risk: Any, portfolio: Any) -> None:
+    protected_paths = {
+        "/feeds/prediction", "/risk/pnl-adjustment", "/risk/halt", "/risk/resume",
+        "/feeds/tradingview", "/feeds/cryptoquant", "/loadtest/paper",
+    }
+
+    @app.middleware("http")
+    async def protect_default_secret(request: Request, call_next: Any) -> Any:
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path in protected_paths:
+            if not _secret_ready(settings.webhook_secret):
+                return JSONResponse(status_code=503, content={"detail": "WEBHOOK_SECRET is not configured"})
+        return await call_next(request)
+
     @app.get("/ops", response_class=HTMLResponse)
     async def ops() -> HTMLResponse:
         return HTMLResponse(OPS_HTML)
@@ -65,7 +83,7 @@ def register_ops_routes(app: FastAPI, settings: Any, state: Any, feeds: Any, ris
         return {
             "mode": "paper",
             "live_enabled": bool(settings.live_enabled),
-            "webhook_secret_configured": bool(settings.webhook_secret and settings.webhook_secret != "change-me"),
+            "webhook_secret_configured": _secret_ready(settings.webhook_secret),
             "paper_db_path": portfolio.store.db_path,
         }
 
