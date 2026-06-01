@@ -70,7 +70,7 @@ class PaperPortfolio:
                 max_consecutive_losses_per_market=settings.paper_max_consecutive_losses_per_market,
             )
         )
-        self.store = PaperStore(settings.paper_db_path)
+        self.store = self._open_store(settings.paper_db_path)
         summary = self.store.summary()
         self.total_realized_pnl = float(summary.get("realized_pnl", 0.0))
         self.total_closed_trades = int(summary.get("closed_trades", 0))
@@ -80,10 +80,23 @@ class PaperPortfolio:
         for item in reversed(self.store.recent_trades(settings.recent_trade_limit)):
             self.closed_trades.append(PaperTrade(**item))
 
+    def _open_store(self, configured_path: str) -> PaperStore:
+        try:
+            return PaperStore(configured_path)
+        except OSError as exc:
+            fallback = "/tmp/polymarket_paper.db"
+            log_event(self.logger, "paper_store_fallback", configured_path=configured_path, fallback=fallback, error=str(exc))
+            return PaperStore(fallback)
+
     def _reject(self, reason: str) -> None:
         self.rejection_counts[reason] = self.rejection_counts.get(reason, 0) + 1
 
-    async def reserve_intent(self, intent: TradeIntent) -> bool:
+    async def publish(self) -> None:
+        async with self.lock:
+            await self._publish_locked()
+
+    async def reserve_intent(self, token_or_intent: TradeIntent | str) -> bool:
+        token_id = token_or_intent.token_id if isinstance(token_or_intent, TradeIntent) else str(token_or_intent)
         async with self.lock:
             market = self.state.current_market or {}
             allowed, reason = self.rules.market_is_open_for_entries(market, now_ms())
@@ -91,7 +104,7 @@ class PaperPortfolio:
                 self._reject(reason)
                 await self._publish_locked()
                 return False
-            if intent.token_id in self.pending_tokens or intent.token_id in self.positions:
+            if token_id in self.pending_tokens or token_id in self.positions:
                 self.skipped_duplicates += 1
                 self._reject("duplicate_or_pending_token")
                 await self._publish_locked()
@@ -100,7 +113,7 @@ class PaperPortfolio:
                 self._reject("paper_max_open_positions")
                 await self._publish_locked()
                 return False
-            self.pending_tokens.add(intent.token_id)
+            self.pending_tokens.add(token_id)
             return True
 
     async def release_pending(self, token_id: str) -> None:
@@ -148,6 +161,7 @@ class PaperPortfolio:
             }
 
     async def mark_loop(self) -> None:
+        await self.publish()
         while True:
             try:
                 await self.mark_once()
@@ -241,7 +255,7 @@ class PaperPortfolio:
             "closed_trades": [t.to_dict() for t in reversed(self.closed_trades[-20:])],
             "rejection_counts": dict(sorted(self.rejection_counts.items())),
             "rules": self.rules.snapshot(),
-            "persistence": {"db_path": self.settings.paper_db_path, "restored_closed_trades": self.total_closed_trades},
+            "persistence": {"db_path": self.store.db_path, "restored_closed_trades": self.total_closed_trades},
         }
         async with self.state.lock:
             self.state.paper_portfolio = payload
