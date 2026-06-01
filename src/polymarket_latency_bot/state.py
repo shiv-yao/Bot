@@ -14,9 +14,7 @@ class BotState:
         self.predictions: dict[str, Prediction] = {}
         self.btc_prices: deque[tuple[int, float]] = deque(maxlen=512)
         self.external_prices: dict[str, list[tuple[int, float]]] = {
-            "chainlink": [],
-            "binance": [],
-            "coinbase": [],
+            "chainlink": [], "binance": [], "coinbase": [],
         }
         self.source_status: dict[str, dict[str, Any]] = {
             "chainlink": {"connected": False},
@@ -24,10 +22,10 @@ class BotState:
             "coinbase": {"connected": False},
         }
         self.fusion_snapshot: dict[str, Any] = {
-            "status": "waiting_for_sources",
-            "source_count": 0,
-            "required_sources": 2,
+            "status": "waiting_for_sources", "source_count": 0, "required_sources": 2,
         }
+        self.strategy_rejections: dict[str, int] = {}
+        self.last_strategy_snapshot: dict[str, Any] = {}
         self.current_market: dict[str, Any] | None = None
         self.market_discovery_status = "pending"
         self.last_market_discovery_ms: int | None = None
@@ -42,19 +40,10 @@ class BotState:
         self.ws_rtds_connected = False
         self.paper_portfolio: dict[str, Any] = {
             "summary": {
-                "realized_pnl": 0.0,
-                "unrealized_pnl": 0.0,
-                "wins": 0,
-                "losses": 0,
-                "flat": 0,
-                "open_positions": 0,
-                "closed_trades": 0,
-                "skipped_duplicates": 0,
+                "realized_pnl": 0.0, "unrealized_pnl": 0.0, "wins": 0, "losses": 0,
+                "flat": 0, "open_positions": 0, "closed_trades": 0, "skipped_duplicates": 0,
             },
-            "open_positions": [],
-            "closed_trades": [],
-            "rejection_counts": {},
-            "rules": {},
+            "open_positions": [], "closed_trades": [], "rejection_counts": {}, "rules": {},
         }
         self.started_ms = now_ms()
 
@@ -79,6 +68,8 @@ class BotState:
                 "external_prices": self.external_prices,
                 "source_status": source_status,
                 "fusion_snapshot": self.fusion_snapshot,
+                "strategy_rejections": self.strategy_rejections,
+                "last_strategy_snapshot": self.last_strategy_snapshot,
                 "paper_portfolio": self.paper_portfolio,
                 "last_intent": self.last_intent.to_dict() if self.last_intent else None,
                 "last_order_result": self.last_order_result,
