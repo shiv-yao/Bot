@@ -13,16 +13,25 @@ class LatencyStrategy:
         self.settings = settings
         self.state = state
         self._last_signal_ms: dict[str, int] = {}
+        self._last_evaluation_ms = 0
 
     async def build_intents(self) -> list[TradeIntent]:
+        now = now_ms()
+        if now - self._last_evaluation_ms < self.settings.strategy_evaluation_interval_ms:
+            return []
+        self._last_evaluation_ms = now
+
         async with self.state.lock:
-            now = now_ms()
             fresh = [
                 prediction
                 for prediction in self.state.predictions.values()
                 if now - prediction.timestamp_ms <= self.settings.max_signal_age_ms
                 and prediction.confidence >= self.settings.min_confidence
             ]
+            if self.settings.prefer_fusion_prediction:
+                fused = [prediction for prediction in fresh if prediction.source == "multi_source_fusion"]
+                if fused:
+                    fresh = fused
             yes_book = self.state.books.get(self.settings.yes_token_id)
             no_book = self.state.books.get(self.settings.no_token_id)
             btc_prices = list(self.state.btc_prices)
@@ -84,6 +93,7 @@ class LatencyStrategy:
             "confidence": confidence,
             "notional_usd": notional,
             "timestamp_ms": now,
+            "source_count": source_count,
         }
         if book is None:
             return await self._reject("book_missing", snapshot)
