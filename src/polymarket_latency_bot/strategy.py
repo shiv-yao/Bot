@@ -38,42 +38,81 @@ class LatencyStrategy:
         notional = self._notional_for_regime(btc_prices)
         intents: list[TradeIntent] = []
 
-        if yes_book and yes_book.best_ask is not None:
-            edge = fair_up - yes_book.best_ask
-            if edge >= self.settings.min_edge and self._cooldown_ok(Direction.BUY_YES.value, now):
-                intents.append(
-                    TradeIntent(
-                        direction=Direction.BUY_YES,
-                        token_id=self.settings.yes_token_id,
-                        expected_probability=fair_up,
-                        market_price=yes_book.best_ask,
-                        edge=edge,
-                        confidence=confidence,
-                        notional_usd=notional,
-                        created_ms=now,
-                        source_count=len(fresh),
-                    )
-                )
+        yes_intent = self._build_intent(
+            direction=Direction.BUY_YES,
+            token_id=self.settings.yes_token_id,
+            fair_probability=fair_up,
+            book=yes_book,
+            confidence=confidence,
+            notional=notional,
+            now=now,
+            source_count=len(fresh),
+        )
+        if yes_intent is not None:
+            intents.append(yes_intent)
 
-        fair_no = 1 - fair_up
-        if no_book and no_book.best_ask is not None:
-            edge = fair_no - no_book.best_ask
-            if edge >= self.settings.min_edge and self._cooldown_ok(Direction.BUY_NO.value, now):
-                intents.append(
-                    TradeIntent(
-                        direction=Direction.BUY_NO,
-                        token_id=self.settings.no_token_id,
-                        expected_probability=fair_no,
-                        market_price=no_book.best_ask,
-                        edge=edge,
-                        confidence=confidence,
-                        notional_usd=notional,
-                        created_ms=now,
-                        source_count=len(fresh),
-                    )
-                )
+        no_intent = self._build_intent(
+            direction=Direction.BUY_NO,
+            token_id=self.settings.no_token_id,
+            fair_probability=1 - fair_up,
+            book=no_book,
+            confidence=confidence,
+            notional=notional,
+            now=now,
+            source_count=len(fresh),
+        )
+        if no_intent is not None:
+            intents.append(no_intent)
 
         return intents
+
+    def _build_intent(
+        self,
+        *,
+        direction: Direction,
+        token_id: str,
+        fair_probability: float,
+        book: object | None,
+        confidence: float,
+        notional: float,
+        now: int,
+        source_count: int,
+    ) -> TradeIntent | None:
+        if book is None:
+            return None
+        best_ask = getattr(book, "best_ask", None)
+        best_bid = getattr(book, "best_bid", None)
+        if best_ask is None or best_bid is None:
+            return None
+
+        ask = float(best_ask)
+        bid = float(best_bid)
+        if not self.settings.min_contract_price <= ask <= self.settings.max_contract_price:
+            return None
+
+        spread = max(0.0, ask - bid)
+        if spread > self.settings.max_spread:
+            return None
+
+        raw_edge = fair_probability - ask
+        net_edge = raw_edge - spread
+        if raw_edge < self.settings.min_edge or net_edge < self.settings.min_net_edge:
+            return None
+
+        if not self._cooldown_ok(direction.value, now):
+            return None
+
+        return TradeIntent(
+            direction=direction,
+            token_id=token_id,
+            expected_probability=fair_probability,
+            market_price=ask,
+            edge=net_edge,
+            confidence=confidence,
+            notional_usd=notional,
+            created_ms=now,
+            source_count=source_count,
+        )
 
     def _cooldown_ok(self, key: str, now: int) -> bool:
         previous = self._last_signal_ms.get(key, 0)
