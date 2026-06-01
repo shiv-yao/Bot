@@ -20,6 +20,8 @@ from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
 from .state import BotState
 from .strategy import LatencyStrategy
+from .watchdog import RuntimeWatchdog
+from .watchdog_api import register_watchdog_routes
 
 
 async def run() -> None:
@@ -31,6 +33,7 @@ async def run() -> None:
     portfolio = PaperPortfolio(settings, state, risk, logging.getLogger("paper_portfolio"))
     strategy = LatencyStrategy(settings, state)
     executor = MeasuredPaperExecutor(settings, state, risk, portfolio)
+    watchdog = RuntimeWatchdog(settings, state, risk, portfolio)
 
     async def evaluate() -> None:
         started_ms = now_ms()
@@ -56,6 +59,7 @@ async def run() -> None:
         asyncio.create_task(feeds.user_ws_loop(), name="user-ws"),
         asyncio.create_task(feeds.external_poll_loop(), name="external-poll"),
         asyncio.create_task(portfolio.mark_loop(), name="paper-portfolio-mark"),
+        asyncio.create_task(watchdog.loop(), name="runtime-watchdog"),
     ]
     tasks += [
         asyncio.create_task(executor.worker(i), name=f"executor-{i}")
@@ -66,6 +70,7 @@ async def run() -> None:
         app = create_app(settings, state, feeds, risk)
         register_monitoring_routes(app, settings, state, risk, portfolio)
         register_ops_routes(app, settings, state, feeds, risk, portfolio)
+        register_watchdog_routes(app, watchdog)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
