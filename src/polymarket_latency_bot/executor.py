@@ -48,6 +48,10 @@ class BaseExecutor:
     def retain_risk_reservation_after_success(self) -> bool:
         return False
 
+    @property
+    def rate_limit_enabled(self) -> bool:
+        return True
+
     async def submit(self, intent: TradeIntent) -> bool:
         try:
             self.queue.put_nowait(intent)
@@ -81,7 +85,8 @@ class BaseExecutor:
                     log_event(self.logger, "risk_reject", worker_id=worker_id, reason=reason, intent=intent.to_dict())
                     continue
                 reserved = True
-                await self.bucket.acquire()
+                if self.rate_limit_enabled:
+                    await self.bucket.acquire()
                 started = now_ms()
                 result = await asyncio.wait_for(
                     self.place_order(intent),
@@ -142,6 +147,10 @@ class PaperExecutor(BaseExecutor):
     @property
     def retain_risk_reservation_after_success(self) -> bool:
         return True
+
+    @property
+    def rate_limit_enabled(self) -> bool:
+        return not self.settings.paper_disable_order_rate_limit
 
     async def submit(self, intent: TradeIntent) -> bool:
         accepted = await self.portfolio.reserve_intent(intent.token_id)
