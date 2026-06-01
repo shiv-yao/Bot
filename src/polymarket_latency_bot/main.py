@@ -12,6 +12,7 @@ from .executor import PaperExecutor
 from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
 from .risk import RiskManager
+from .rtds_chainlink import chainlink_rtds_loop
 from .state import BotState
 from .strategy import LatencyStrategy
 
@@ -33,7 +34,7 @@ async def run() -> None:
     tasks: list[asyncio.Task[object]] = [
         asyncio.create_task(feeds.market_discovery_loop(), name="market-discovery"),
         asyncio.create_task(feeds.market_ws_loop(), name="market-ws"),
-        asyncio.create_task(feeds.rtds_loop(), name="rtds-ws"),
+        asyncio.create_task(chainlink_rtds_loop(settings, state, feeds), name="rtds-chainlink"),
         asyncio.create_task(feeds.user_ws_loop(), name="user-ws"),
         asyncio.create_task(feeds.external_poll_loop(), name="external-poll"),
     ]
@@ -52,6 +53,7 @@ async def run() -> None:
         "bot_started",
         mode="paper",
         auto_discover_market=settings.auto_discover_market,
+        rtds_feed="chainlink_btc_usd",
     )
     try:
         await asyncio.gather(*tasks)
