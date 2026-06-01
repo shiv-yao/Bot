@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     max_spread: float = Field(default=0.04, ge=0, le=1)
     signal_cooldown_ms: int = Field(default=10000, ge=0)
     max_signal_age_ms: int = Field(default=1500, gt=0)
+    strategy_evaluation_interval_ms: int = Field(default=250, ge=25, le=5000)
+    prefer_fusion_prediction: bool = True
 
     # Paper order book depth and execution simulation
     depth_levels: int = Field(default=5, ge=1, le=20)
@@ -88,7 +90,9 @@ class Settings(BaseSettings):
     enable_binance_ws: bool = True
     enable_coinbase_ws: bool = True
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    binance_ws_fallback_urls: str = "wss://stream.binance.com:443/ws/btcusdt@trade,wss://data-stream.binance.vision/ws/btcusdt@trade"
     coinbase_ws_url: str = "wss://ws-feed.exchange.coinbase.com"
+    source_reconnect_delay_sec: float = Field(default=1.0, gt=0, le=60)
     external_price_max_age_ms: int = Field(default=3000, ge=250)
     external_price_window_sec: int = Field(default=60, ge=10, le=900)
 
