@@ -11,6 +11,7 @@ from .config import Settings
 from .executor import PaperExecutor
 from .feeds import FeedHub
 from .logging_utils import log_event, setup_logging
+from .models import now_ms
 from .monitoring import register_monitoring_routes
 from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
 from .paper_portfolio import PaperPortfolio
@@ -31,7 +32,12 @@ async def run() -> None:
     executor = PaperExecutor(settings, state, risk, portfolio)
 
     async def evaluate() -> None:
-        for intent in await strategy.build_intents():
+        started_ms = now_ms()
+        intents = await strategy.build_intents()
+        await state.record_latency("strategy_ms", now_ms() - started_ms)
+        if intents:
+            await state.increment_counter("strategy_intents", len(intents))
+        for intent in intents:
             await executor.submit(intent)
 
     feeds = FeedHub(settings, state, evaluate)
