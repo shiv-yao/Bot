@@ -5,7 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python -m polymarket_latency_bot.btc5m_event_main",
+    "startCommand": "python -m polymarket_latency_bot.btc5m_event_main_v4",
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 120,
     "restartPolicyType": "ON_FAILURE",
