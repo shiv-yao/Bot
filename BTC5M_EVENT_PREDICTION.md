@@ -1,11 +1,12 @@
-# BTC 5m Event Prediction Only
+# BTC 5m Event Prediction + Scale In
 
-This is the active Railway runtime.
+This is the active Railway BTC five-minute prediction-market Paper runtime.
 
 It has one purpose:
 
 ```text
-Predict whether BTC will move UP or DOWN in the current Polymarket 5-minute market.
+Predict whether BTC will move UP or DOWN in the current Polymarket 5-minute market
+and simulate a capped three-stage scale-in position.
 ```
 
 The Docker entrypoint is:
@@ -27,6 +28,7 @@ Coinbase BTC/USD WebSocket
 multi-source fusion
 TradingView forecast adapter
 CryptoQuant forecast adapter
+Paper-only BTC 5m scale-in engine
 read-only dashboard and status API
 ```
 
@@ -34,12 +36,9 @@ It does not start:
 
 ```text
 general event market scanner
-Paper order workers
-position simulation
-trade replay
-trade settlement
 live orders
 wallet signing
+real-money execution
 ```
 
 ## Prediction output
@@ -55,21 +54,38 @@ WAIT
 Logic:
 
 ```text
-YES edge = fused probability up - YES ask
-NO edge  = (1 - fused probability up) - NO ask
+YES = predicted probability up is above the configured direction margin
+NO  = predicted probability up is below the configured direction margin
+WAIT = confidence or direction margin is insufficient
 ```
 
-A directional signal is returned only when:
+## Scale-in strategy
+
+Each BTC five-minute market has one capped Paper budget. The engine may create at most three simulated entries:
 
 ```text
-confidence >= MIN_CONFIDENCE
-selected edge >= MIN_EDGE
+Stage 1: 50% of the round budget
+Stage 2: 30% of the round budget
+Stage 3: 20% of the round budget
 ```
 
-Otherwise the output is:
+Default timing:
 
 ```text
-WAIT
+Stage 1: after 0 seconds
+Stage 2: after 100 seconds
+Stage 3: after 200 seconds
+```
+
+Every stage revalidates the signal. Stage 2 and Stage 3 are rejected when the prediction direction changes after the first entry. The engine does not create unlimited micro-orders and does not average down blindly.
+
+Example with a `100 USDC` Paper budget:
+
+```text
+Stage 1: 50 USDC
+Stage 2: 30 USDC
+Stage 3: 20 USDC
+Total:   100 USDC
 ```
 
 ## Dashboard
@@ -90,14 +106,19 @@ selected edge
 current BTC 5-minute market
 market slug
 market question
+Paper portfolio
+scale-in entries
 source health
 ```
 
-## Read-only API
+## API
 
 ```text
 /status
 /healthz
+/paper/status
+/paper/winrate
+/paper/rounds
 /docs
 ```
 
@@ -123,7 +144,7 @@ curl -X POST "$BASE_URL/feeds/cryptoquant" \
   -d '{"probability_up":0.54,"confidence":0.68}'
 ```
 
-## Railway Variables
+## Railway variables
 
 Keep:
 
@@ -140,8 +161,19 @@ MIN_EDGE=0.02
 WEBHOOK_SECRET=replace-with-a-random-secret-at-least-16-characters
 ```
 
-Live trading variables are not used by this runtime.
+Add or verify:
+
+```env
+BTC5M_PAPER_MAX_ROUND_NOTIONAL_USD=25
+BTC5M_PAPER_SCALE_IN_WEIGHTS=0.50,0.30,0.20
+BTC5M_PAPER_SCALE_IN_AFTER_SEC=0,100,200
+BTC5M_PAPER_CLOSE_BUFFER_SEC=15
+BTC5M_PAPER_MIN_CONFIDENCE=0.58
+BTC5M_PAPER_MIN_PROBABILITY_MARGIN=0.015
+```
+
+Live-trading variables are not used by this runtime.
 
 ## Safety boundary
 
-This deployment is prediction-only. It does not place Paper or live orders.
+This deployment remains Paper-only. It simulates entries and settlement for evaluation, but it does not place live Polymarket orders, sign wallets or move funds.
