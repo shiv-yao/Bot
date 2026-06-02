@@ -35,6 +35,13 @@ def _secret_ready(value: str) -> bool:
     return bool(value and value != "change-me" and len(value) >= 16)
 
 
+def _first_not_none(*values: Any, default: float) -> float:
+    for value in values:
+        if value is not None:
+            return float(value)
+    return float(default)
+
+
 def _preview_direction(
     *,
     probability_up: float,
@@ -122,8 +129,8 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
     predictions = snapshot.get("predictions", {}) or {}
     fusion = snapshot.get("fusion_snapshot", {}) or {}
     selected = predictions.get("multi_source_fusion") or predictions.get("rtds_momentum_fallback") or fusion
-    probability_up = float(selected.get("probability_up") or fusion.get("probability_up") or 0.5)
-    confidence = float(selected.get("confidence") or fusion.get("confidence") or 0.0)
+    probability_up = _first_not_none(selected.get("probability_up"), fusion.get("probability_up"), default=0.5)
+    confidence = _first_not_none(selected.get("confidence"), fusion.get("confidence"), default=0.0)
 
     market = snapshot.get("current_market") or {}
     yes_token_id = str(market.get("yes_token_id") or getattr(settings, "yes_token_id", "") or "")
@@ -273,6 +280,10 @@ async def run() -> None:
             drift_min_samples=round_engine.drift_min_samples,
             drift_win_rate_drop_threshold=round_engine.drift_win_rate_drop_threshold,
             drift_brier_increase_threshold=round_engine.drift_brier_increase_threshold,
+            walk_forward_train_min_samples=round_engine.walk_forward_train_min_samples,
+            walk_forward_validation_samples=round_engine.walk_forward_validation_samples,
+            walk_forward_win_rate_drop_threshold=round_engine.walk_forward_win_rate_drop_threshold,
+            walk_forward_brier_increase_threshold=round_engine.walk_forward_brier_increase_threshold,
         )
         return {
             "mode": MODE_NAME,
