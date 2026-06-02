@@ -264,6 +264,8 @@ async def run() -> None:
             paper,
             cooldown_after_losses=round_engine.cooldown_after_losses,
             min_samples_for_review=round_engine.analytics_min_samples,
+            min_group_samples_for_review=round_engine.review_min_group_samples,
+            review_win_rate_threshold=round_engine.review_win_rate_threshold,
         )
         return {
             "mode": MODE_NAME,
