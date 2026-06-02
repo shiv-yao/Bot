@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from polymarket_latency_bot.btc5m_event_main import MODE_NAME, STRATEGY_NAME, build_mode_status, build_status
+from polymarket_latency_bot.btc5m_event_main import MODE_NAME, STRATEGY_NAME, _fusion_health, build_mode_status, build_status
 from polymarket_latency_bot.state import BotState
 
 
@@ -123,6 +123,68 @@ class BTC5mEventPredictionTests(unittest.TestCase):
             self.assertEqual(payload["ai"]["preview_reason"], "confidence_too_low")
 
         asyncio.run(run())
+
+    def test_fusion_health_is_ready_only_with_clean_ready_sources(self) -> None:
+        payload = {
+            "market": {"discovery_status": "ready"},
+            "sources": {
+                "chainlink": {"connected": True},
+                "binance": {"connected": True},
+                "coinbase": {"connected": True},
+            },
+            "fusion": {
+                "status": "ready",
+                "clean_source_count": 2,
+                "outlier_count": 1,
+                "dispersion_bps": 3.5,
+            },
+        }
+        health = _fusion_health(payload, required_sources=2)
+        self.assertTrue(health["ok"])
+        self.assertTrue(health["fusion_ready"])
+        self.assertEqual(health["connected_sources"], 3)
+        self.assertEqual(health["clean_sources"], 2)
+        self.assertEqual(health["outlier_count"], 1)
+
+    def test_fusion_health_blocks_high_dispersion(self) -> None:
+        payload = {
+            "market": {"discovery_status": "ready"},
+            "sources": {
+                "chainlink": {"connected": True},
+                "binance": {"connected": True},
+                "coinbase": {"connected": True},
+            },
+            "fusion": {
+                "status": "price_dispersion_high",
+                "clean_source_count": 3,
+                "outlier_count": 0,
+                "dispersion_bps": 45.0,
+            },
+        }
+        health = _fusion_health(payload, required_sources=2)
+        self.assertFalse(health["ok"])
+        self.assertFalse(health["fusion_ready"])
+        self.assertEqual(health["fusion_status"], "price_dispersion_high")
+
+    def test_fusion_health_blocks_when_clean_sources_are_insufficient(self) -> None:
+        payload = {
+            "market": {"discovery_status": "ready"},
+            "sources": {
+                "chainlink": {"connected": True},
+                "binance": {"connected": True},
+                "coinbase": {"connected": True},
+            },
+            "fusion": {
+                "status": "waiting_for_clean_sources",
+                "clean_source_count": 1,
+                "outlier_count": 2,
+                "dispersion_bps": 0.0,
+            },
+        }
+        health = _fusion_health(payload, required_sources=2)
+        self.assertFalse(health["ok"])
+        self.assertFalse(health["fusion_ready"])
+        self.assertEqual(health["clean_sources"], 1)
 
 
 if __name__ == "__main__":
