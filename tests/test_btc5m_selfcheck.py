@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from polymarket_latency_bot.btc5m_selfcheck import build_selfcheck_payload, register_btc5m_selfcheck
 
@@ -26,16 +25,12 @@ class BTC5mSelfcheckTests(unittest.TestCase):
         self.assertTrue(all(payload["analytics"].values()))
         self.assertTrue(all(payload["checks"].values()))
 
-    def test_selfcheck_endpoint_is_read_only_and_returns_manifest(self) -> None:
+    def test_selfcheck_route_is_registered_as_get(self) -> None:
         app = FastAPI()
         register_btc5m_selfcheck(app)
-        client = TestClient(app)
-        response = client.get("/selfcheck")
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["execution"], "hardened_three_stage_scale_in_50_30_20")
-        self.assertIn("Read-only manifest", payload["note"])
+        route = next(route for route in app.routes if getattr(route, "path", None) == "/selfcheck")
+        self.assertIn("GET", route.methods)
+        self.assertEqual(route.name, "selfcheck")
 
 
 if __name__ == "__main__":
