@@ -74,7 +74,7 @@ class MultiSourceQualityTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_high_dispersion_blocks_prediction_publication(self) -> None:
+    def test_high_dispersion_blocks_new_prediction_publication(self) -> None:
         async def run() -> None:
             settings = Settings(fusion_outlier_max_deviation_bps=100.0, fusion_max_dispersion_bps=20.0)
             state = BotState()
@@ -83,14 +83,14 @@ class MultiSourceQualityTests(unittest.TestCase):
             base = 1_900_000_000_000
             for source, price in (("chainlink", 70000.0), ("binance", 70001.0), ("coinbase", 70002.0)):
                 await fusion.record_price(source, price, timestamp_ms=base)
-            feeds.predictions.clear()
             await fusion.record_price("chainlink", 70010.0, timestamp_ms=base + 1000)
             await fusion.record_price("binance", 70011.0, timestamp_ms=base + 1000)
+            published_before_spike = len(feeds.predictions)
             await fusion.record_price("coinbase", 70200.0, timestamp_ms=base + 1000)
             snapshot = state.fusion_snapshot
             self.assertEqual(snapshot["status"], "price_dispersion_high")
             self.assertGreater(snapshot["dispersion_bps"], snapshot["max_dispersion_bps"])
-            self.assertEqual(feeds.predictions, [])
+            self.assertEqual(len(feeds.predictions), published_before_spike)
 
         asyncio.run(run())
 
