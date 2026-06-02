@@ -270,6 +270,9 @@ async def run() -> None:
             rolling_window=round_engine.rolling_window,
             calibration_min_bucket_samples=round_engine.calibration_min_bucket_samples,
             overconfidence_gap_threshold=round_engine.overconfidence_gap_threshold,
+            drift_min_samples=round_engine.drift_min_samples,
+            drift_win_rate_drop_threshold=round_engine.drift_win_rate_drop_threshold,
+            drift_brier_increase_threshold=round_engine.drift_brier_increase_threshold,
         )
         return {
             "mode": MODE_NAME,
