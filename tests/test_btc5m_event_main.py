@@ -17,11 +17,11 @@ class Settings(SimpleNamespace):
 
 
 class BTC5mEventPredictionTests(unittest.TestCase):
-    def test_mode_status_is_guarded_paper_scale_in(self) -> None:
+    def test_mode_status_is_adaptive_guarded_paper_scale_in(self) -> None:
         payload = build_mode_status()
         self.assertEqual(payload["mode"], MODE_NAME)
         self.assertEqual(payload["strategy"], STRATEGY_NAME)
-        self.assertEqual(payload["execution"], "guarded_three_stage_scale_in_50_30_20")
+        self.assertEqual(payload["execution"], "adaptive_guarded_three_stage_scale_in_50_30_20")
         self.assertEqual(payload["outputs"], ["YES", "NO", "WAIT"])
         self.assertEqual(payload["rules"]["scale_in_weights"], [0.50, 0.30, 0.20])
         self.assertEqual(payload["rules"]["max_entries_per_market"], 3)
@@ -30,10 +30,13 @@ class BTC5mEventPredictionTests(unittest.TestCase):
         self.assertTrue(payload["rules"]["require_fresh_book"])
         self.assertTrue(payload["rules"]["require_net_edge"])
         self.assertTrue(payload["rules"]["require_book_depth"])
+        self.assertTrue(payload["rules"]["adaptive_cooldown"])
+        self.assertFalse(payload["rules"]["auto_tuning_enabled"])
         self.assertTrue(payload["safety"]["paper_predictions_enabled"])
         self.assertTrue(payload["safety"]["paper_orders_enabled"])
         self.assertTrue(payload["safety"]["paper_positions_enabled"])
         self.assertTrue(payload["safety"]["scale_in_enabled"])
+        self.assertTrue(payload["safety"]["adaptive_cooldown_enabled"])
         self.assertTrue(payload["safety"]["paper_only"])
         self.assertFalse(payload["safety"]["live_orders_enabled"])
         self.assertFalse(payload["safety"]["general_event_scanner_enabled"])
@@ -51,7 +54,7 @@ class BTC5mEventPredictionTests(unittest.TestCase):
             )
             payload = await build_status(Settings(), state)
             self.assertEqual(payload["mode"], MODE_NAME)
-            self.assertEqual(payload["execution"], "guarded_three_stage_scale_in_50_30_20")
+            self.assertEqual(payload["execution"], "adaptive_guarded_three_stage_scale_in_50_30_20")
             self.assertEqual(payload["ai"]["direction"], "WAIT")
             self.assertEqual(payload["ai"]["preview_reason"], "waiting_for_order_book")
             self.assertIn("paper", payload)
