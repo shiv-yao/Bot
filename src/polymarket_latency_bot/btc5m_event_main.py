@@ -33,6 +33,27 @@ def _secret_ready(value: str) -> bool:
     return bool(value and value != "change-me" and len(value) >= 16)
 
 
+def _preview_direction(
+    *,
+    probability_up: float,
+    confidence: float,
+    yes_ask: float | None,
+    no_ask: float | None,
+    min_confidence: float,
+    min_edge: float,
+) -> tuple[str, str]:
+    if confidence < min_confidence:
+        return "WAIT", "confidence_too_low"
+    if yes_ask is None or no_ask is None:
+        return "WAIT", "waiting_for_order_book"
+    yes_edge = probability_up - float(yes_ask)
+    no_edge = (1 - probability_up) - float(no_ask)
+    selected_edge = max(yes_edge, no_edge)
+    if selected_edge < min_edge:
+        return "WAIT", "edge_too_low"
+    return ("YES", "preview_yes_edge") if yes_edge >= no_edge else ("NO", "preview_no_edge")
+
+
 def build_mode_status() -> dict[str, Any]:
     return {
         "mode": MODE_NAME,
@@ -55,6 +76,8 @@ def build_mode_status() -> dict[str, Any]:
         },
         "safety": {
             "paper_predictions_enabled": True,
+            "paper_orders_enabled": True,
+            "paper_positions_enabled": True,
             "scale_in_enabled": True,
             "paper_only": True,
             "live_orders_enabled": False,
@@ -75,8 +98,8 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
     confidence = float(selected.get("confidence") or fusion.get("confidence") or 0.0)
 
     market = snapshot.get("current_market") or {}
-    yes_token_id = str(market.get("yes_token_id") or settings.yes_token_id or "")
-    no_token_id = str(market.get("no_token_id") or settings.no_token_id or "")
+    yes_token_id = str(market.get("yes_token_id") or getattr(settings, "yes_token_id", "") or "")
+    no_token_id = str(market.get("no_token_id") or getattr(settings, "no_token_id", "") or "")
     books = snapshot.get("books", {}) or {}
     yes_book = books.get(yes_token_id, {}) or {}
     no_book = books.get(no_token_id, {}) or {}
@@ -85,8 +108,23 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
     yes_edge = probability_up - float(yes_ask) if yes_ask is not None else 0.0
     no_edge = (1 - probability_up) - float(no_ask) if no_ask is not None else 0.0
 
+    min_confidence = float(getattr(settings, "min_confidence", 0.56))
+    min_edge = float(getattr(settings, "min_edge", 0.02))
+    min_probability_margin = float(getattr(settings, "ai_min_probability_margin", 0.006))
+    preview_direction, preview_reason = _preview_direction(
+        probability_up=probability_up,
+        confidence=confidence,
+        yes_ask=yes_ask,
+        no_ask=no_ask,
+        min_confidence=min_confidence,
+        min_edge=min_edge,
+    )
+
     paper = snapshot.get("paper_portfolio", {}) or {}
     current_round = paper.get("current_round") or {}
+    round_direction = str(current_round.get("direction") or "")
+    direction = round_direction if round_direction in {"YES", "NO"} else preview_direction
+    reason = current_round.get("reason") or paper.get("last_reason") or preview_reason
     return {
         **build_mode_status(),
         "market": {
@@ -102,16 +140,19 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
             "no_book_age_ms": max(0, now_ms() - int(no_book.get("timestamp_ms") or 0)) if no_book else None,
         },
         "ai": {
-            "direction": current_round.get("direction") or "WAIT",
-            "reason": current_round.get("reason") or paper.get("last_reason") or "starting",
+            "direction": direction,
+            "reason": reason,
+            "preview_direction": preview_direction,
+            "preview_reason": preview_reason,
             "probability_up": probability_up,
             "confidence": confidence,
             "yes_edge": round(yes_edge, 6),
             "no_edge": round(no_edge, 6),
             "selected_edge": round(max(yes_edge, no_edge), 6),
             "last_signal_quality": current_round.get("last_signal_quality") or {},
-            "min_confidence": settings.min_confidence,
-            "min_probability_margin": settings.ai_min_probability_margin,
+            "min_confidence": min_confidence,
+            "min_edge": min_edge,
+            "min_probability_margin": min_probability_margin,
         },
         "paper": paper,
         "execution_metrics": {
@@ -207,12 +248,13 @@ async def run() -> None:
         market_ready = payload["market"]["discovery_status"] == "ready"
         sources = payload.get("sources", {})
         source_count = sum(1 for source in sources.values() if source.get("connected"))
+        required_sources = int(getattr(settings, "fusion_min_sources", 2))
         return {
-            "ok": market_ready and source_count >= settings.fusion_min_sources,
+            "ok": market_ready and source_count >= required_sources,
             "mode": payload["mode"],
             "market_ready": market_ready,
             "connected_sources": source_count,
-            "required_sources": settings.fusion_min_sources,
+            "required_sources": required_sources,
         }
 
     async def upsert_external(source: str, body: ForecastIn, secret: str) -> dict[str, Any]:
