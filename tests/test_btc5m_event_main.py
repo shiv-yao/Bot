@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from polymarket_latency_bot.btc5m_event_main import build_status
+from polymarket_latency_bot.btc5m_event_main import build_mode_status, build_status
 from polymarket_latency_bot.state import BotState
 
 
@@ -16,6 +16,17 @@ class Settings(SimpleNamespace):
 
 
 class BTC5mEventPredictionTests(unittest.TestCase):
+    def test_mode_status_is_prediction_only(self) -> None:
+        payload = build_mode_status()
+        self.assertEqual(payload["mode"], "btc_5m_event_prediction_only")
+        self.assertEqual(payload["execution"], "prediction_only")
+        self.assertEqual(payload["outputs"], ["YES", "NO", "WAIT"])
+        self.assertFalse(payload["safety"]["orders_enabled"])
+        self.assertFalse(payload["safety"]["paper_positions_enabled"])
+        self.assertFalse(payload["safety"]["general_event_scanner_enabled"])
+        self.assertFalse(payload["safety"]["wallet_signing_enabled"])
+        self.assertFalse(payload["safety"]["live_trading_enabled"])
+
     def test_wait_without_books(self) -> None:
         async def run() -> None:
             state = BotState()
