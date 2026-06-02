@@ -1,32 +1,100 @@
-# Polymarket Paper Bot Ops Guide
+# Polymarket BTC 5m Balanced HF Paper Bot Ops Guide
 
 ## Runtime mode
 
-The current application starts `PaperExecutor` only. It does not send live orders.
+The current application runs `MeasuredPaperExecutor` only. It does not send live orders.
 
-## Railway Variables to verify
+The active Paper profile is:
+
+```text
+balanced_btc5m_hf
+```
+
+It forces BTC Up / Down 5-minute market discovery, AI single-direction YES / NO decisions, balanced high-frequency Paper sampling, and an isolated SQLite history file.
+
+## Railway Volume
+
+Attach a Railway Volume at:
+
+```text
+/data
+```
+
+The active 5-minute history file is:
+
+```text
+/data/polymarket_paper_btc5m_balanced.db
+```
+
+The legacy file remains preserved for comparison:
+
+```text
+/data/polymarket_paper.db
+```
+
+## Railway Variables
+
+Use the repository template:
+
+```text
+.env.btc5m-balanced.example
+```
+
+Important values:
 
 ```env
 LIVE_TRADING=false
-PAPER_DB_PATH=/data/polymarket_paper.db
+AUTO_DISCOVER_MARKET=true
+FORCE_BTC_5M_MARKET=true
+MARKET_INTERVAL_SEC=300
+PAPER_HIGH_FREQUENCY_PROFILE=true
+PAPER_DB_PATH=/data/polymarket_paper_btc5m_balanced.db
 PAPER_MAX_TRADES_PER_MARKET=0
 PAPER_MAX_OPEN_POSITIONS=0
 PAPER_DISABLE_ORDER_RATE_LIMIT=true
 WEBHOOK_SECRET=replace-with-a-random-secret-at-least-16-characters
 ```
 
-A Railway Volume should be attached at `/data`.
+## Mobile dashboard
+
+Open:
+
+```text
+/dashboard5m
+```
+
+The root page `/` redirects to this dashboard.
+
+The page shows:
+
+- BTC live price
+- AI decision: `BUY_YES`, `BUY_NO`, or `WAIT`
+- realized PnL and win rate for the isolated BTC 5-minute history series
+- current market slug and question
+- balanced high-frequency profile parameters
+- whether the isolated database is active
 
 ## Read-only pages
 
+- `/dashboard5m` BTC 5-minute mobile dashboard
+- `/ai/status` current AI YES / NO decision
+- `/risk/profile` effective Paper high-frequency risk profile
+- `/history/status` active isolated database and legacy database status
 - `/monitor` market feed, fusion, order book, VWAP and rejection dashboard
 - `/ops` latency, performance, risk and security dashboard
-- `/latency` bounded latency statistics and runtime counters
+- `/diagnostics` consolidated runtime warnings
+- `/startup-check` startup diagnostics
+- `/latency` bounded latency statistics, throughput and queue high-water mark
 - `/performance` SQLite-backed Paper performance statistics
 - `/security/status` mode, secret configuration state and database path
 - `/risk/status` current risk state
 - `/debug/sources` source connection diagnostics
 - `/debug/rejections` strategy and Paper rejection counts
+- `/watchdog` watchdog status
+- `/alerts` recent watchdog alerts
+- `/metrics/runtime` runtime JSON metrics
+- `/metrics/prometheus` Prometheus text metrics
+- `/healthz` external health endpoint
 
 ## Protected write APIs
 
@@ -71,7 +139,7 @@ curl -X POST "$BASE_URL/feeds/cryptoquant" \
 This endpoint does not create orders or positions. It only measures async task throughput.
 
 ```bash
-curl -X POST "$BASE_URL/loadtest/paper" \
+curl -X POST "$BASE_URL/loadtest/pipeline" \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
   -d '{"operations":1000,"concurrency":100}'
@@ -93,4 +161,10 @@ curl -X POST "$BASE_URL/loadtest/paper" \
 
 ## Latency fields
 
-`/latency` currently includes bounded in-memory percentile statistics for strategy evaluation. Additional queue and execution timing instrumentation can be added without enabling live orders.
+`/latency` includes bounded in-memory percentile statistics for:
+
+- strategy evaluation
+- queue wait
+- Paper execution
+- signal-to-result latency
+- dry-run pipeline timing
