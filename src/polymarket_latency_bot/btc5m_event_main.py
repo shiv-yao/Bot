@@ -90,13 +90,13 @@ def build_mode_status() -> dict[str, Any]:
     return {
         "mode": MODE_NAME,
         "strategy": STRATEGY_NAME,
-        "execution": "adaptive_guarded_three_stage_scale_in_50_30_20",
+        "execution": "guarded_three_stage_scale_in_50_30_20",
         "market": {"asset": "BTC", "interval_minutes": 5},
         "outputs": ["YES", "NO", "WAIT"],
         "rules": {
             "YES": "BTC close price is higher than BTC open price after 5 minutes",
             "NO": "BTC close price is lower than BTC open price after 5 minutes",
-            "WAIT": "A quality gate or adaptive cooldown rejected the Paper entry",
+            "WAIT": "A quality gate rejected the Paper entry",
             "max_entries_per_market": 3,
             "scale_in_weights": [0.50, 0.30, 0.20],
             "require_same_direction_revalidation": True,
@@ -104,7 +104,7 @@ def build_mode_status() -> dict[str, Any]:
             "require_fresh_book": True,
             "require_net_edge": True,
             "require_book_depth": True,
-            "adaptive_cooldown": True,
+            "adaptive_cooldown": False,
             "auto_tuning_enabled": False,
             "settlement": "btc_close_vs_btc_open",
         },
@@ -113,7 +113,7 @@ def build_mode_status() -> dict[str, Any]:
             "paper_orders_enabled": True,
             "paper_positions_enabled": True,
             "scale_in_enabled": True,
-            "adaptive_cooldown_enabled": True,
+            "adaptive_cooldown_enabled": False,
             "paper_only": True,
             "live_orders_enabled": False,
             "wallet_signing_enabled": False,
@@ -220,7 +220,7 @@ async def run() -> None:
     round_engine = BTC5mAdaptiveRoundPredictionEngine(settings, state)
     await round_engine.publish_state()
 
-    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In Adaptive Guarded")
+    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Guarded Scale In")
     register_btc5m_prediction_market_ui(app)
 
     @app.get("/", include_in_schema=False)
