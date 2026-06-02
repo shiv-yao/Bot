@@ -20,8 +20,7 @@ class MultiSourceFusion:
     Fresh prices are compared with the cross-source median. Outliers are removed
     before fusion. A short rolling median-price series then detects choppy,
     abnormally volatile and excessively flat regimes. When quality degrades, a
-    neutral prediction is published immediately so an older directional signal
-    cannot remain actionable until its normal expiry.
+    neutral prediction replaces the previous direction immediately.
     """
 
     def __init__(self, settings: Any, state: Any, feeds: Any) -> None:
@@ -201,12 +200,14 @@ class MultiSourceFusion:
         }
 
     async def _publish_neutral_prediction(self, timestamp: int, reason: str) -> None:
-        await self.feeds.upsert_prediction(Prediction(
+        neutral = Prediction(
             source="multi_source_fusion",
             probability_up=0.5,
             confidence=0.0,
             timestamp_ms=timestamp,
-        ))
+        )
+        async with self.state.lock:
+            self.state.predictions["multi_source_fusion"] = neutral
         log_event(self.logger, "fusion_neutralized", reason=reason, timestamp_ms=timestamp)
 
     async def _publish_fusion(self, timestamp: int) -> None:
