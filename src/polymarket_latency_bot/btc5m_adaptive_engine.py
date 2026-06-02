@@ -26,6 +26,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
         self.cooldown_after_losses = max(1, int(os.getenv("BTC5M_PAPER_COOLDOWN_AFTER_LOSSES", "3")))
         self.cooldown_sec = max(1, int(os.getenv("BTC5M_PAPER_COOLDOWN_SEC", "900")))
         self.analytics_min_samples = max(1, int(os.getenv("BTC5M_PAPER_ANALYTICS_MIN_SAMPLES", "30")))
+        self.review_min_group_samples = max(1, int(os.getenv("BTC5M_PAPER_REVIEW_MIN_GROUP_SAMPLES", "10")))
+        self.review_win_rate_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_REVIEW_WIN_RATE_THRESHOLD", "0.45"))))
         self.cooldown_until_ms = 0
         self.cooldown_trigger_round: str | None = None
 
@@ -35,6 +37,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
             snapshot.get("paper_portfolio", {}),
             cooldown_after_losses=self.cooldown_after_losses,
             min_samples_for_review=self.analytics_min_samples,
+            min_group_samples_for_review=self.review_min_group_samples,
+            review_win_rate_threshold=self.review_win_rate_threshold,
         )
 
     async def _publish_adaptive_guard(self, analytics: dict[str, Any], timestamp_ms: int) -> None:
@@ -49,6 +53,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "cooldown_sec": self.cooldown_sec,
                 "auto_tuning_enabled": False,
                 "analytics_min_samples": self.analytics_min_samples,
+                "review_min_group_samples": self.review_min_group_samples,
+                "review_win_rate_threshold": self.review_win_rate_threshold,
             })
             paper["rules"] = rules
             paper["analytics"] = analytics
@@ -62,6 +68,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "cooldown_trigger_round": self.cooldown_trigger_round,
                 "auto_tuning_enabled": False,
                 "analytics_min_samples": self.analytics_min_samples,
+                "review_min_group_samples": self.review_min_group_samples,
+                "review_win_rate_threshold": self.review_win_rate_threshold,
             }
             self.state.paper_portfolio = paper
 
