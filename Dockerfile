@@ -1,4 +1,5 @@
 FROM python:3.12-slim
+LABEL app.rebuild="btc5m-paper-winrate-20260602-1"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
