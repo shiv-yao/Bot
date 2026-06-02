@@ -1,4 +1,4 @@
-# BTC 5m Event Prediction + Scale In
+# BTC 5m Event Prediction + Guarded Scale In
 
 This is the active Railway BTC five-minute prediction-market Paper runtime.
 
@@ -6,7 +6,7 @@ It has one purpose:
 
 ```text
 Predict whether BTC will move UP or DOWN in the current Polymarket 5-minute market
-and simulate a capped three-stage scale-in position.
+and simulate a capped three-stage scale-in position with quality gates.
 ```
 
 The Docker entrypoint is:
@@ -28,7 +28,7 @@ Coinbase BTC/USD WebSocket
 multi-source fusion
 TradingView forecast adapter
 CryptoQuant forecast adapter
-Paper-only BTC 5m scale-in engine
+Paper-only guarded BTC 5m scale-in engine
 read-only dashboard and status API
 ```
 
@@ -56,10 +56,10 @@ Logic:
 ```text
 YES = predicted probability up is above the configured direction margin
 NO  = predicted probability up is below the configured direction margin
-WAIT = confidence or direction margin is insufficient
+WAIT = one or more quality gates rejected the Paper entry
 ```
 
-## Scale-in strategy
+## Guarded scale-in strategy
 
 Each BTC five-minute market has one capped Paper budget. The engine may create at most three simulated entries:
 
@@ -77,7 +77,28 @@ Stage 2: after 100 seconds
 Stage 3: after 200 seconds
 ```
 
-Every stage revalidates the signal. Stage 2 and Stage 3 are rejected when the prediction direction changes after the first entry. The engine does not create unlimited micro-orders and does not average down blindly.
+Default confidence and net-edge requirements become stricter for later entries:
+
+```text
+Stage 1: confidence >= 58%, net edge >= 0.8%
+Stage 2: confidence >= 62%, net edge >= 1.2%
+Stage 3: confidence >= 66%, net edge >= 1.8%
+```
+
+Every stage revalidates:
+
+```text
+signal freshness
+order-book freshness
+same direction as the first entry
+contract price range
+bid-ask spread
+order-book depth
+estimated VWAP
+net edge after slippage buffer
+```
+
+Stage 2 and Stage 3 are rejected when the prediction direction changes after the first entry. The engine does not create unlimited micro-orders and does not average down blindly.
 
 Example with a `100 USDC` Paper budget:
 
@@ -102,12 +123,19 @@ The page shows:
 AI direction
 probability up
 confidence
-selected edge
 current BTC 5-minute market
-market slug
-market question
+YES / NO asks
+market book age
 Paper portfolio
 scale-in entries
+latest signal quality
+signal source
+signal age
+book age
+spread
+edge and net edge
+order-book depth
+rejection counters
 source health
 ```
 
@@ -121,6 +149,8 @@ source health
 /paper/rounds
 /docs
 ```
+
+The `/healthz` endpoint reports healthy only when the current market is ready and enough external price sources are connected.
 
 ## Optional external forecasts
 
@@ -167,9 +197,20 @@ Add or verify:
 BTC5M_PAPER_MAX_ROUND_NOTIONAL_USD=25
 BTC5M_PAPER_SCALE_IN_WEIGHTS=0.50,0.30,0.20
 BTC5M_PAPER_SCALE_IN_AFTER_SEC=0,100,200
+BTC5M_PAPER_SCALE_IN_MIN_CONFIDENCE=0.58,0.62,0.66
+BTC5M_PAPER_SCALE_IN_MIN_NET_EDGE=0.008,0.012,0.018
 BTC5M_PAPER_CLOSE_BUFFER_SEC=15
 BTC5M_PAPER_MIN_CONFIDENCE=0.58
 BTC5M_PAPER_MIN_PROBABILITY_MARGIN=0.015
+BTC5M_PAPER_MAX_SIGNAL_AGE_MS=1200
+BTC5M_PAPER_MAX_BOOK_AGE_MS=2500
+BTC5M_PAPER_MIN_CONTRACT_PRICE=0.10
+BTC5M_PAPER_MAX_CONTRACT_PRICE=0.90
+BTC5M_PAPER_MAX_SPREAD=0.04
+BTC5M_PAPER_SLIPPAGE_BUFFER=0.003
+BTC5M_PAPER_REQUIRE_BOOK_DEPTH=true
+BTC5M_PAPER_MIN_DEPTH_MULTIPLE=1.50
+BTC5M_PAPER_LOOP_INTERVAL_MS=200
 ```
 
 Live-trading variables are not used by this runtime.
