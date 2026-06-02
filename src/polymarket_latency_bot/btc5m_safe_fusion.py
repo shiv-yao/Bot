@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .models import now_ms
 from .multi_source import MultiSourceFusion
 
 
@@ -29,3 +30,16 @@ class BTC5mSafeFusion(MultiSourceFusion):
             status = str((self.state.fusion_snapshot or {}).get("status") or "")
         if status == "waiting_for_sources":
             await self._publish_neutral_prediction(timestamp, "waiting_for_sources")
+
+    async def mark_disconnected(
+        self,
+        source: str,
+        error: str,
+        endpoint: str | None = None,
+        reconnect_delay_sec: float | None = None,
+    ) -> None:
+        await super().mark_disconnected(source, error, endpoint, reconnect_delay_sec)
+        prices = self._prices.get(source)
+        if prices is not None:
+            prices.clear()
+        await self._publish_fusion(now_ms())
