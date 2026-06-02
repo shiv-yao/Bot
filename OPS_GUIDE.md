@@ -74,9 +74,40 @@ The page shows:
 - balanced high-frequency profile parameters
 - whether the isolated database is active
 
+## Evaluation dashboard
+
+Open:
+
+```text
+/evaluation
+```
+
+This page compares the new isolated BTC 5-minute Balanced HF history with the preserved legacy history. The databases are shown separately and are never merged.
+
+The sample stage is also available as JSON:
+
+```text
+/evaluation/status
+```
+
+Stages:
+
+- `collecting_initial_sample`: fewer than 100 closed trades
+- `early_evaluation`: 100 to 499 closed trades
+- `evaluation_ready`: 500 or more closed trades
+
+The separated performance comparison is available at:
+
+```text
+/performance/compare
+```
+
 ## Read-only pages
 
 - `/dashboard5m` BTC 5-minute mobile dashboard
+- `/evaluation` BTC 5-minute evaluation dashboard
+- `/evaluation/status` isolated sample stage and recommendation
+- `/performance/compare` new BTC 5-minute series versus preserved legacy history
 - `/ai/status` current AI YES / NO decision
 - `/risk/profile` effective Paper high-frequency risk profile
 - `/history/status` active isolated database and legacy database status
