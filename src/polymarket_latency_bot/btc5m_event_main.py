@@ -20,6 +20,10 @@ from .runtime_profile import apply_balanced_btc5m_paper_profile
 from .state import BotState
 
 
+STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V2_GUARDED"
+MODE_NAME = "btc_5m_prediction_market_paper_scale_in_guarded"
+
+
 class ForecastIn(BaseModel):
     probability_up: float = Field(ge=0, le=1)
     confidence: float = Field(default=0.7, ge=0, le=1)
@@ -31,18 +35,22 @@ def _secret_ready(value: str) -> bool:
 
 def build_mode_status() -> dict[str, Any]:
     return {
-        "mode": "btc_5m_prediction_market_paper_scale_in",
-        "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
-        "execution": "three_stage_scale_in_50_30_20",
+        "mode": MODE_NAME,
+        "strategy": STRATEGY_NAME,
+        "execution": "guarded_three_stage_scale_in_50_30_20",
         "market": {"asset": "BTC", "interval_minutes": 5},
         "outputs": ["YES", "NO", "WAIT"],
         "rules": {
             "YES": "BTC close price is higher than BTC open price after 5 minutes",
             "NO": "BTC close price is lower than BTC open price after 5 minutes",
-            "WAIT": "AI confidence or direction margin is insufficient; no Paper entry is created",
+            "WAIT": "A quality gate rejected the Paper entry",
             "max_entries_per_market": 3,
             "scale_in_weights": [0.50, 0.30, 0.20],
             "require_same_direction_revalidation": True,
+            "require_fresh_signal": True,
+            "require_fresh_book": True,
+            "require_net_edge": True,
+            "require_book_depth": True,
             "settlement": "btc_close_vs_btc_open",
         },
         "safety": {
@@ -60,18 +68,23 @@ def build_mode_status() -> dict[str, Any]:
 
 async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
     snapshot = await state.snapshot()
-    predictions = snapshot.get("predictions", {})
-    fusion = snapshot.get("fusion_snapshot", {})
-    selected = predictions.get("multi_source_fusion") or predictions.get("rtds_momentum_fallback") or {}
+    predictions = snapshot.get("predictions", {}) or {}
+    fusion = snapshot.get("fusion_snapshot", {}) or {}
+    selected = predictions.get("multi_source_fusion") or predictions.get("rtds_momentum_fallback") or fusion
     probability_up = float(selected.get("probability_up") or fusion.get("probability_up") or 0.5)
     confidence = float(selected.get("confidence") or fusion.get("confidence") or 0.0)
-    books = snapshot.get("books", {})
-    yes_book = books.get(settings.yes_token_id, {})
-    no_book = books.get(settings.no_token_id, {})
+
+    market = snapshot.get("current_market") or {}
+    yes_token_id = str(market.get("yes_token_id") or settings.yes_token_id or "")
+    no_token_id = str(market.get("no_token_id") or settings.no_token_id or "")
+    books = snapshot.get("books", {}) or {}
+    yes_book = books.get(yes_token_id, {}) or {}
+    no_book = books.get(no_token_id, {}) or {}
     yes_ask = yes_book.get("best_ask")
     no_ask = no_book.get("best_ask")
     yes_edge = probability_up - float(yes_ask) if yes_ask is not None else 0.0
     no_edge = (1 - probability_up) - float(no_ask) if no_ask is not None else 0.0
+
     paper = snapshot.get("paper_portfolio", {}) or {}
     current_round = paper.get("current_round") or {}
     return {
@@ -80,9 +93,13 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
             "asset": "BTC",
             "interval_minutes": 5,
             "discovery_status": snapshot.get("market_discovery_status"),
-            "current": snapshot.get("current_market"),
+            "current": market,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
             "yes_ask": yes_ask,
             "no_ask": no_ask,
+            "yes_book_age_ms": max(0, now_ms() - int(yes_book.get("timestamp_ms") or 0)) if yes_book else None,
+            "no_book_age_ms": max(0, now_ms() - int(no_book.get("timestamp_ms") or 0)) if no_book else None,
         },
         "ai": {
             "direction": current_round.get("direction") or "WAIT",
@@ -92,6 +109,7 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
             "yes_edge": round(yes_edge, 6),
             "no_edge": round(no_edge, 6),
             "selected_edge": round(max(yes_edge, no_edge), 6),
+            "last_signal_quality": current_round.get("last_signal_quality") or {},
             "min_confidence": settings.min_confidence,
             "min_probability_margin": settings.ai_min_probability_margin,
         },
@@ -126,7 +144,7 @@ async def run() -> None:
     round_engine = BTC5mRoundPredictionEngine(settings, state)
     await round_engine.publish_state()
 
-    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In")
+    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In Guarded")
     register_btc5m_prediction_market_ui(app)
 
     @app.get("/", include_in_schema=False)
@@ -145,8 +163,8 @@ async def run() -> None:
     async def paper_status() -> dict[str, Any]:
         snapshot = await state.snapshot()
         return {
-            "mode": "btc_5m_prediction_market_paper_scale_in",
-            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
+            "mode": MODE_NAME,
+            "strategy": STRATEGY_NAME,
             "portfolio": snapshot.get("paper_portfolio", {}),
             "predictions_submitted": snapshot.get("orders_submitted", 0),
         }
@@ -157,8 +175,8 @@ async def run() -> None:
         summary = (snapshot.get("paper_portfolio", {}) or {}).get("summary", {}) or {}
         closed_trades = int(summary.get("closed_trades", 0) or 0)
         return {
-            "mode": "btc_5m_prediction_market_paper_scale_in",
-            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
+            "mode": MODE_NAME,
+            "strategy": STRATEGY_NAME,
             "win_rate": float(summary.get("win_rate", 0.0) or 0.0),
             "wins": int(summary.get("wins", 0) or 0),
             "losses": int(summary.get("losses", 0) or 0),
@@ -166,6 +184,7 @@ async def run() -> None:
             "closed_rounds": closed_trades,
             "open_rounds": int(summary.get("open_positions", 0) or 0),
             "skipped_wait": int(summary.get("skipped_wait", 0) or 0),
+            "rejection_counts": summary.get("rejection_counts", {}),
             "sample_status": "collecting" if closed_trades < 100 else "review_ready",
         }
 
@@ -174,8 +193,8 @@ async def run() -> None:
         snapshot = await state.snapshot()
         paper = snapshot.get("paper_portfolio", {}) or {}
         return {
-            "mode": "btc_5m_prediction_market_paper_scale_in",
-            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
+            "mode": MODE_NAME,
+            "strategy": STRATEGY_NAME,
             "current_round": paper.get("current_round"),
             "closed_rounds": paper.get("closed_trades", []),
             "skipped_rounds": paper.get("skipped_rounds", []),
@@ -185,14 +204,28 @@ async def run() -> None:
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         payload = await build_status(settings, state)
-        return {"ok": payload["market"]["discovery_status"] == "ready", "mode": payload["mode"]}
+        market_ready = payload["market"]["discovery_status"] == "ready"
+        sources = payload.get("sources", {})
+        source_count = sum(1 for source in sources.values() if source.get("connected"))
+        return {
+            "ok": market_ready and source_count >= settings.fusion_min_sources,
+            "mode": payload["mode"],
+            "market_ready": market_ready,
+            "connected_sources": source_count,
+            "required_sources": settings.fusion_min_sources,
+        }
 
     async def upsert_external(source: str, body: ForecastIn, secret: str) -> dict[str, Any]:
         if not _secret_ready(settings.webhook_secret):
             raise HTTPException(status_code=503, detail="WEBHOOK_SECRET is not configured")
         if secret != settings.webhook_secret:
             raise HTTPException(status_code=401, detail="invalid webhook secret")
-        prediction = Prediction(source=source, probability_up=body.probability_up, confidence=body.confidence, timestamp_ms=now_ms())
+        prediction = Prediction(
+            source=source,
+            probability_up=body.probability_up,
+            confidence=body.confidence,
+            timestamp_ms=now_ms(),
+        )
         await feeds.upsert_prediction(prediction)
         return {"accepted": True, "source": source, "prediction": prediction.to_dict()}
 
