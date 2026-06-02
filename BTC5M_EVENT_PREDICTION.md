@@ -25,7 +25,7 @@ Polymarket market WebSocket
 Chainlink BTC/USD RTDS
 Binance BTC/USDT WebSocket
 Coinbase BTC/USD WebSocket
-multi-source fusion
+multi-source fusion with outlier isolation
 TradingView forecast adapter
 CryptoQuant forecast adapter
 Paper-only guarded BTC 5m scale-in engine
@@ -108,6 +108,68 @@ Stage 2: 30 USDC
 Stage 3: 20 USDC
 Total:   100 USDC
 ```
+
+## BTC multi-source quality guard
+
+The BTC signal uses Chainlink, Binance and Coinbase prices. Before publishing a fused prediction, the runtime now compares each fresh price with the cross-source median.
+
+```text
+normal source   -> included in fusion
+outlier source  -> excluded from fusion
+not enough clean sources -> wait
+clean sources still disagree too much -> block new fused prediction
+```
+
+Default guard values:
+
+```text
+outlier isolation threshold: 35 bps from median
+maximum clean-source dispersion: 20 bps
+minimum clean sources: 2
+```
+
+The fusion snapshot exposes:
+
+```text
+status
+median_price
+dispersion_bps
+clean_source_count
+outlier_count
+samples
+outliers
+```
+
+Each source status also exposes:
+
+```text
+fusion_deviation_bps
+fusion_outlier
+fusion_median_price
+reconnect_delay_sec
+```
+
+Possible fusion statuses:
+
+```text
+ready
+waiting_for_sources
+waiting_for_clean_sources
+price_dispersion_high
+low_agreement
+```
+
+A single exchange or oracle tick can no longer move the fused BTC prediction by itself.
+
+## WebSocket reconnect backoff
+
+Binance and Coinbase WebSocket reconnect loops use bounded exponential backoff:
+
+```text
+1 sec -> 2 sec -> 4 sec -> 8 sec ... -> maximum 30 sec
+```
+
+A successful reconnect resets the delay to the initial value. This reduces reconnect storms during upstream outages.
 
 ## Dashboard
 
@@ -211,6 +273,10 @@ BTC5M_PAPER_SLIPPAGE_BUFFER=0.003
 BTC5M_PAPER_REQUIRE_BOOK_DEPTH=true
 BTC5M_PAPER_MIN_DEPTH_MULTIPLE=1.50
 BTC5M_PAPER_LOOP_INTERVAL_MS=200
+SOURCE_RECONNECT_DELAY_SEC=1
+SOURCE_RECONNECT_MAX_DELAY_SEC=30
+FUSION_OUTLIER_MAX_DEVIATION_BPS=35
+FUSION_MAX_DISPERSION_BPS=20
 ```
 
 Live-trading variables are not used by this runtime.
