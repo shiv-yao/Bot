@@ -266,6 +266,9 @@ async def run() -> None:
             min_samples_for_review=round_engine.analytics_min_samples,
             min_group_samples_for_review=round_engine.review_min_group_samples,
             review_win_rate_threshold=round_engine.review_win_rate_threshold,
+            rolling_window=round_engine.rolling_window,
+            calibration_min_bucket_samples=round_engine.calibration_min_bucket_samples,
+            overconfidence_gap_threshold=round_engine.overconfidence_gap_threshold,
         )
         return {
             "mode": MODE_NAME,
