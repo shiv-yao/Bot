@@ -54,6 +54,29 @@ def _preview_direction(
     return ("YES", "preview_yes_edge") if yes_edge >= no_edge else ("NO", "preview_no_edge")
 
 
+def _fusion_health(payload: dict[str, Any], required_sources: int) -> dict[str, Any]:
+    market_ready = payload.get("market", {}).get("discovery_status") == "ready"
+    sources = payload.get("sources", {}) or {}
+    connected_sources = sum(1 for source in sources.values() if source.get("connected"))
+    fusion = payload.get("fusion", {}) or {}
+    fusion_status = str(fusion.get("status") or "waiting_for_sources")
+    clean_sources = int(fusion.get("clean_source_count", fusion.get("source_count", 0)) or 0)
+    outlier_count = int(fusion.get("outlier_count", 0) or 0)
+    dispersion_bps = float(fusion.get("dispersion_bps", 0.0) or 0.0)
+    fusion_ready = fusion_status == "ready" and clean_sources >= required_sources
+    return {
+        "ok": market_ready and connected_sources >= required_sources and fusion_ready,
+        "market_ready": market_ready,
+        "connected_sources": connected_sources,
+        "clean_sources": clean_sources,
+        "required_sources": required_sources,
+        "fusion_ready": fusion_ready,
+        "fusion_status": fusion_status,
+        "outlier_count": outlier_count,
+        "dispersion_bps": round(dispersion_bps, 6),
+    }
+
+
 def build_mode_status() -> dict[str, Any]:
     return {
         "mode": MODE_NAME,
@@ -245,17 +268,8 @@ async def run() -> None:
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         payload = await build_status(settings, state)
-        market_ready = payload["market"]["discovery_status"] == "ready"
-        sources = payload.get("sources", {})
-        source_count = sum(1 for source in sources.values() if source.get("connected"))
         required_sources = int(getattr(settings, "fusion_min_sources", 2))
-        return {
-            "ok": market_ready and source_count >= required_sources,
-            "mode": payload["mode"],
-            "market_ready": market_ready,
-            "connected_sources": source_count,
-            "required_sources": required_sources,
-        }
+        return {"mode": payload["mode"], **_fusion_health(payload, required_sources)}
 
     async def upsert_external(source: str, body: ForecastIn, secret: str) -> dict[str, Any]:
         if not _secret_ready(settings.webhook_secret):
