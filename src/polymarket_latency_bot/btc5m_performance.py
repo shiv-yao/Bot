@@ -125,6 +125,17 @@ def _rolling_stats(orders: Iterable[dict[str, Any]], window: int) -> dict[str, A
     }
 
 
+def _brier_score(orders: Iterable[dict[str, Any]]) -> float | None:
+    squared_errors: list[float] = []
+    for order in orders:
+        if order.get("expected_probability") is None or order.get("won") is None:
+            continue
+        probability = min(1.0, max(0.0, float(order.get("expected_probability") or 0.0)))
+        outcome = 1.0 if order.get("won") is True else 0.0
+        squared_errors.append((probability - outcome) ** 2)
+    return round(sum(squared_errors) / len(squared_errors), 8) if squared_errors else None
+
+
 def _calibration_stats(
     orders: Iterable[dict[str, Any]],
     *,
@@ -136,7 +147,6 @@ def _calibration_stats(
         if order.get("expected_probability") is not None and order.get("won") is not None
     ]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    squared_errors: list[float] = []
     predicted_total = 0.0
     actual_total = 0.0
     for order in eligible:
@@ -144,7 +154,6 @@ def _calibration_stats(
         outcome = 1.0 if order.get("won") is True else 0.0
         predicted_total += probability
         actual_total += outcome
-        squared_errors.append((probability - outcome) ** 2)
         grouped[_bucket_probability(probability)].append(order)
 
     buckets: dict[str, dict[str, Any]] = {}
@@ -173,13 +182,61 @@ def _calibration_stats(
     samples = len(eligible)
     return {
         "samples": samples,
-        "brier_score": round(sum(squared_errors) / samples, 8) if samples else None,
+        "brier_score": _brier_score(eligible),
         "average_expected_probability": round(predicted_total / samples, 6) if samples else None,
         "observed_win_rate": round(actual_total / samples, 6) if samples else None,
         "overconfidence_gap_threshold": round(float(overconfidence_gap_threshold), 6),
         "min_bucket_samples": max(1, int(min_bucket_samples)),
         "buckets": buckets,
         "overconfidence_reviews": overconfidence_reviews,
+    }
+
+
+def _drift_stats(
+    orders: Iterable[dict[str, Any]],
+    *,
+    rolling_window: int,
+    min_samples: int,
+    win_rate_drop_threshold: float,
+    brier_increase_threshold: float,
+) -> dict[str, Any]:
+    ordered = sorted(orders, key=lambda order: int(order.get("created_ms") or 0))
+    window = max(1, int(rolling_window))
+    recent = ordered[-window:]
+    overall_wins = sum(1 for order in ordered if order.get("won") is True)
+    overall_losses = sum(1 for order in ordered if order.get("won") is False)
+    recent_wins = sum(1 for order in recent if order.get("won") is True)
+    recent_losses = sum(1 for order in recent if order.get("won") is False)
+    overall_win_rate = _rate(overall_wins, overall_losses)
+    recent_win_rate = _rate(recent_wins, recent_losses)
+    win_rate_drop = round(overall_win_rate - recent_win_rate, 6)
+    overall_brier = _brier_score(ordered)
+    recent_brier = _brier_score(recent)
+    brier_increase = (
+        round(float(recent_brier) - float(overall_brier), 8)
+        if overall_brier is not None and recent_brier is not None
+        else None
+    )
+    reasons: list[str] = []
+    enough_samples = len(recent) >= max(1, int(min_samples))
+    if enough_samples and win_rate_drop > float(win_rate_drop_threshold):
+        reasons.append("rolling_win_rate_deterioration")
+    if enough_samples and brier_increase is not None and brier_increase > float(brier_increase_threshold):
+        reasons.append("rolling_brier_deterioration")
+    return {
+        "window": window,
+        "samples": len(recent),
+        "min_samples": max(1, int(min_samples)),
+        "overall_win_rate": overall_win_rate,
+        "rolling_win_rate": recent_win_rate,
+        "win_rate_drop": win_rate_drop,
+        "win_rate_drop_threshold": round(float(win_rate_drop_threshold), 6),
+        "overall_brier_score": overall_brier,
+        "rolling_brier_score": recent_brier,
+        "brier_increase": brier_increase,
+        "brier_increase_threshold": round(float(brier_increase_threshold), 6),
+        "review_only": bool(reasons),
+        "reasons": reasons,
     }
 
 
@@ -193,6 +250,9 @@ def build_paper_analytics(
     rolling_window: int = 30,
     calibration_min_bucket_samples: int = 10,
     overconfidence_gap_threshold: float = 0.10,
+    drift_min_samples: int = 20,
+    drift_win_rate_drop_threshold: float = 0.15,
+    drift_brier_increase_threshold: float = 0.10,
 ) -> dict[str, Any]:
     paper = paper_portfolio or {}
     rounds = list(paper.get("closed_trades") or [])
@@ -220,6 +280,13 @@ def build_paper_analytics(
         min_bucket_samples=calibration_min_bucket_samples,
         overconfidence_gap_threshold=overconfidence_gap_threshold,
     )
+    drift = _drift_stats(
+        orders,
+        rolling_window=rolling_window,
+        min_samples=drift_min_samples,
+        win_rate_drop_threshold=drift_win_rate_drop_threshold,
+        brier_increase_threshold=drift_brier_increase_threshold,
+    )
 
     return {
         "samples": wins + losses,
@@ -229,6 +296,7 @@ def build_paper_analytics(
         "sample_status": "review_ready" if wins + losses >= max(1, int(min_samples_for_review)) else "collecting",
         "rolling": _rolling_stats(orders, rolling_window),
         "calibration": calibration,
+        "drift": drift,
         "cooldown": {
             **streak,
             "threshold": max(1, int(cooldown_after_losses)),
@@ -242,12 +310,13 @@ def build_paper_analytics(
         "review": {
             "min_group_samples": min_group_samples,
             "win_rate_threshold": threshold,
-            "recommendation_count": review_count + len(calibration["overconfidence_reviews"]),
+            "recommendation_count": review_count + len(calibration["overconfidence_reviews"]) + (1 if drift["review_only"] else 0),
             "recommendations": review_recommendations,
             "overconfidence": calibration["overconfidence_reviews"],
+            "drift": drift if drift["review_only"] else None,
         },
         "guidance": {
             "auto_tuning_enabled": False,
-            "note": "Recommendations are observational only. Review split metrics and calibration before changing Paper thresholds.",
+            "note": "Recommendations are observational only. Review split metrics, calibration and drift before changing Paper thresholds.",
         },
     }
