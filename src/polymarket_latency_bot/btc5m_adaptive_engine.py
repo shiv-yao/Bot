@@ -9,13 +9,12 @@ from .models import now_ms
 
 
 class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
-    """Wrap the guarded Paper engine with a conservative loss-streak cooldown.
+    """Wrap the guarded Paper engine with conservative adaptive safeguards.
 
     The base scale-in logic remains unchanged. After a configurable number of
     consecutive losing rounds, this wrapper temporarily pauses new evaluations.
-    Existing Paper rounds continue to settle while the cooldown is active.
-    Threshold auto-tuning intentionally remains disabled until enough Paper
-    samples have been reviewed.
+    Existing Paper rounds continue to settle while cooldown is active.
+    Analytics, calibration and review recommendations remain observational only.
     """
 
     STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V3_ADAPTIVE_GUARDED"
@@ -28,6 +27,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
         self.analytics_min_samples = max(1, int(os.getenv("BTC5M_PAPER_ANALYTICS_MIN_SAMPLES", "30")))
         self.review_min_group_samples = max(1, int(os.getenv("BTC5M_PAPER_REVIEW_MIN_GROUP_SAMPLES", "10")))
         self.review_win_rate_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_REVIEW_WIN_RATE_THRESHOLD", "0.45"))))
+        self.rolling_window = max(1, int(os.getenv("BTC5M_PAPER_ROLLING_WINDOW", "30")))
+        self.calibration_min_bucket_samples = max(1, int(os.getenv("BTC5M_PAPER_CALIBRATION_MIN_BUCKET_SAMPLES", "10")))
+        self.overconfidence_gap_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_OVERCONFIDENCE_GAP_THRESHOLD", "0.10"))))
         self.cooldown_until_ms = 0
         self.cooldown_trigger_round: str | None = None
 
@@ -39,6 +41,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
             min_samples_for_review=self.analytics_min_samples,
             min_group_samples_for_review=self.review_min_group_samples,
             review_win_rate_threshold=self.review_win_rate_threshold,
+            rolling_window=self.rolling_window,
+            calibration_min_bucket_samples=self.calibration_min_bucket_samples,
+            overconfidence_gap_threshold=self.overconfidence_gap_threshold,
         )
 
     async def _publish_adaptive_guard(self, analytics: dict[str, Any], timestamp_ms: int) -> None:
@@ -55,6 +60,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "analytics_min_samples": self.analytics_min_samples,
                 "review_min_group_samples": self.review_min_group_samples,
                 "review_win_rate_threshold": self.review_win_rate_threshold,
+                "rolling_window": self.rolling_window,
+                "calibration_min_bucket_samples": self.calibration_min_bucket_samples,
+                "overconfidence_gap_threshold": self.overconfidence_gap_threshold,
             })
             paper["rules"] = rules
             paper["analytics"] = analytics
@@ -70,6 +78,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "analytics_min_samples": self.analytics_min_samples,
                 "review_min_group_samples": self.review_min_group_samples,
                 "review_win_rate_threshold": self.review_win_rate_threshold,
+                "rolling_window": self.rolling_window,
+                "calibration_min_bucket_samples": self.calibration_min_bucket_samples,
+                "overconfidence_gap_threshold": self.overconfidence_gap_threshold,
             }
             self.state.paper_portfolio = paper
 
