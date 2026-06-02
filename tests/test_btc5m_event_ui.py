@@ -25,11 +25,16 @@ class BTC5mEventUITests(unittest.TestCase):
         self.assertIn("/healthz", DASHBOARD_HTML)
         self.assertIn("/docs", DASHBOARD_HTML)
 
-    def test_ui_does_not_include_trade_controls(self) -> None:
+    def test_ui_does_not_include_live_trade_controls(self) -> None:
         self.assertNotIn("/buy", DASHBOARD_HTML)
         self.assertNotIn("/sell", DASHBOARD_HTML)
         self.assertNotIn("/trade", DASHBOARD_HTML)
-        self.assertNotIn("wallet", DASHBOARD_HTML.lower())
+        self.assertNotIn("private_key", DASHBOARD_HTML.lower())
+        self.assertNotIn("seed phrase", DASHBOARD_HTML.lower())
+
+    def test_ui_explicitly_shows_wallet_signing_is_off(self) -> None:
+        self.assertIn("錢包簽名", DASHBOARD_HTML)
+        self.assertIn('id="wallet">OFF', DASHBOARD_HTML)
 
 
 if __name__ == "__main__":
