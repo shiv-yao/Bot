@@ -23,6 +23,13 @@ class PaperMicroOrder:
     created_ms: int
     scale_stage: int = 1
     scale_weight: float = 0.5
+    expected_probability: float = 0.5
+    edge: float = 0.0
+    net_edge: float = 0.0
+    spread: float = 0.0
+    estimated_vwap: float | None = None
+    signal_age_ms: int = 0
+    book_age_ms: int = 0
     outcome: str | None = None
     won: bool | None = None
     pnl: float = 0.0
@@ -62,21 +69,27 @@ class RoundPrediction:
     last_direction_change_ms: int | None = None
     initial_direction: str | None = None
     next_scale_stage: int = 1
+    rejection_counts: dict[str, int] = field(default_factory=dict)
+    last_rejection_key: str | None = None
+    last_signal_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class BTC5mRoundPredictionEngine:
-    """Paper-only BTC five-minute prediction engine with capped scale-in entries.
+    """Paper-only BTC five-minute prediction engine with guarded scale-in entries.
 
-    Each market round may create at most three simulated entries. The total
-    per-round budget is split into 50%, 30% and 20% stages. Every additional
-    stage must pass the signal checks again and must keep the original direction.
+    Each round may create at most three simulated entries. The round budget is
+    split into 50%, 30% and 20% stages. Every additional stage must pass stricter
+    signal, edge, freshness and order-book checks while keeping the first
+    direction. The runtime never places live orders.
     """
 
     DEFAULT_SCALE_WEIGHTS = (0.50, 0.30, 0.20)
     DEFAULT_SCALE_AFTER_SEC = (0, 100, 200)
+    DEFAULT_STAGE_MIN_CONFIDENCE = (0.58, 0.62, 0.66)
+    DEFAULT_STAGE_MIN_NET_EDGE = (0.008, 0.012, 0.018)
 
     def __init__(self, settings: Any, state: Any, db_path: str | None = None) -> None:
         self.settings = settings
@@ -89,6 +102,16 @@ class BTC5mRoundPredictionEngine:
         self.close_buffer_sec = max(0, int(os.getenv("BTC5M_PAPER_CLOSE_BUFFER_SEC", "15")))
         self.min_confidence = float(os.getenv("BTC5M_PAPER_MIN_CONFIDENCE", "0.58"))
         self.min_probability_margin = float(os.getenv("BTC5M_PAPER_MIN_PROBABILITY_MARGIN", "0.015"))
+        self.max_signal_age_ms = max(1, int(os.getenv("BTC5M_PAPER_MAX_SIGNAL_AGE_MS", str(getattr(settings, "max_signal_age_ms", 1200)))))
+        self.max_book_age_ms = max(1, int(os.getenv("BTC5M_PAPER_MAX_BOOK_AGE_MS", "2500")))
+        self.min_contract_price = float(os.getenv("BTC5M_PAPER_MIN_CONTRACT_PRICE", str(getattr(settings, "min_contract_price", 0.10))))
+        self.max_contract_price = float(os.getenv("BTC5M_PAPER_MAX_CONTRACT_PRICE", str(getattr(settings, "max_contract_price", 0.90))))
+        self.max_spread = max(0.0, float(os.getenv("BTC5M_PAPER_MAX_SPREAD", str(getattr(settings, "max_spread", 0.06)))))
+        self.slippage_buffer = max(0.0, float(os.getenv("BTC5M_PAPER_SLIPPAGE_BUFFER", str(getattr(settings, "slippage_buffer", 0.002)))))
+        self.min_depth_multiple = max(1.0, float(os.getenv("BTC5M_PAPER_MIN_DEPTH_MULTIPLE", str(getattr(settings, "min_depth_multiple", 1.25)))))
+        self.enforce_depth = self._env_bool("BTC5M_PAPER_REQUIRE_BOOK_DEPTH", True)
+        self.depth_levels = max(1, int(getattr(settings, "depth_levels", 5)))
+        self.loop_interval_sec = max(0.05, int(os.getenv("BTC5M_PAPER_LOOP_INTERVAL_MS", "200")) / 1000)
         self.scale_weights = self._parse_float_tuple(
             os.getenv("BTC5M_PAPER_SCALE_IN_WEIGHTS", "0.50,0.30,0.20"),
             self.DEFAULT_SCALE_WEIGHTS,
@@ -97,9 +120,24 @@ class BTC5mRoundPredictionEngine:
             os.getenv("BTC5M_PAPER_SCALE_IN_AFTER_SEC", "0,100,200"),
             self.DEFAULT_SCALE_AFTER_SEC,
         )
+        self.stage_min_confidence = self._parse_float_tuple(
+            os.getenv("BTC5M_PAPER_SCALE_IN_MIN_CONFIDENCE", "0.58,0.62,0.66"),
+            self.DEFAULT_STAGE_MIN_CONFIDENCE,
+        )
+        self.stage_min_net_edge = self._parse_float_tuple(
+            os.getenv("BTC5M_PAPER_SCALE_IN_MIN_NET_EDGE", "0.008,0.012,0.018"),
+            self.DEFAULT_STAGE_MIN_NET_EDGE,
+        )
         self._validate_scale_config()
         self._init_db()
         self._load_recent()
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _parse_float_tuple(raw: str, fallback: tuple[float, ...]) -> tuple[float, ...]:
@@ -124,6 +162,12 @@ class BTC5mRoundPredictionEngine:
             self.scale_after_sec = self.DEFAULT_SCALE_AFTER_SEC
         if tuple(sorted(self.scale_after_sec)) != self.scale_after_sec:
             self.scale_after_sec = self.DEFAULT_SCALE_AFTER_SEC
+        if len(self.stage_min_confidence) != 3 or any(not 0 <= value <= 1 for value in self.stage_min_confidence):
+            self.stage_min_confidence = self.DEFAULT_STAGE_MIN_CONFIDENCE
+        if len(self.stage_min_net_edge) != 3 or any(value < 0 for value in self.stage_min_net_edge):
+            self.stage_min_net_edge = self.DEFAULT_STAGE_MIN_NET_EDGE
+        if not 0 < self.min_contract_price < self.max_contract_price < 1:
+            self.min_contract_price, self.max_contract_price = 0.10, 0.90
 
     def _connect(self) -> sqlite3.Connection:
         path = Path(self.db_path)
@@ -242,6 +286,31 @@ class BTC5mRoundPredictionEngine:
         fusion = snapshot.get("fusion_snapshot", {}) or {}
         return predictions.get("multi_source_fusion") or predictions.get("rtds_momentum_fallback") or fusion
 
+    @staticmethod
+    def _book_depth_usd(book: dict[str, Any]) -> float:
+        return round(sum(float(level["price"]) * float(level["size"]) for level in (book.get("ask_levels") or [])), 8)
+
+    @staticmethod
+    def _estimate_buy_vwap(book: dict[str, Any], notional_usd: float) -> float | None:
+        remaining = float(notional_usd)
+        spent = 0.0
+        shares = 0.0
+        for level in book.get("ask_levels") or []:
+            price = float(level["price"])
+            size = float(level["size"])
+            available_usd = price * size
+            take_usd = min(remaining, available_usd)
+            if take_usd <= 0 or price <= 0:
+                continue
+            spent += take_usd
+            shares += take_usd / price
+            remaining -= take_usd
+            if remaining <= 1e-9:
+                break
+        if remaining > 1e-9 or shares <= 0:
+            return None
+        return spent / shares
+
     def _next_stage(self, item: RoundPrediction, elapsed_sec: float) -> tuple[int, float] | None:
         stage = item.order_count + 1
         if stage > len(self.scale_weights):
@@ -249,6 +318,16 @@ class BTC5mRoundPredictionEngine:
         if elapsed_sec < self.scale_after_sec[stage - 1]:
             return None
         return stage, self.scale_weights[stage - 1]
+
+    async def _reject_locked(self, item: RoundPrediction, reason: str, stage: int | None = None) -> None:
+        rejection_key = f"{stage or 0}:{reason}"
+        if item.last_rejection_key != rejection_key:
+            item.rejection_counts[reason] = item.rejection_counts.get(reason, 0) + 1
+            item.last_rejection_key = rejection_key
+        item.reason = reason
+        self.last_reason = reason
+        self._save(item)
+        await self.publish_state_locked()
 
     async def evaluate(self) -> None:
         snapshot = await self.state.snapshot()
@@ -271,6 +350,7 @@ class BTC5mRoundPredictionEngine:
 
         async with self.lock:
             item = self.rounds.get(slug)
+            changed = False
             if item is None:
                 item = RoundPrediction(
                     slug=slug,
@@ -279,9 +359,12 @@ class BTC5mRoundPredictionEngine:
                     question=str(market.get("question") or ""),
                 )
                 self.rounds[slug] = item
+                changed = True
             if item.btc_open is None:
                 item.btc_open = self._first_price_at_or_after(prices, start_ms) or latest[1]
-            self._save(item)
+                changed = True
+            if changed:
+                self._save(item)
 
         await self.settle_due_rounds(prices)
 
@@ -295,39 +378,39 @@ class BTC5mRoundPredictionEngine:
             open_buffer_ms = int(getattr(self.settings, "paper_open_buffer_sec", 2)) * 1000
             close_buffer_ms = self.close_buffer_sec * 1000
             if timestamp < start_ms + open_buffer_ms:
-                item.reason = "market_open_buffer"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+                await self._reject_locked(item, "market_open_buffer")
                 return
             if timestamp >= end_ms - close_buffer_ms:
-                item.reason = "signal_window_closed"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+                await self._reject_locked(item, "signal_window_closed")
                 return
 
             elapsed_sec = max(0.0, (timestamp - start_ms) / 1000)
             next_stage = self._next_stage(item, elapsed_sec)
             if next_stage is None:
-                item.reason = "scale_in_complete" if item.order_count >= 3 else "waiting_for_next_scale_stage"
-                self.last_reason = item.reason
-                self._save(item)
+                reason = "scale_in_complete" if item.order_count >= 3 else "waiting_for_next_scale_stage"
+                if item.reason != reason:
+                    item.reason = reason
+                    self.last_reason = reason
+                    self._save(item)
                 await self.publish_state_locked()
                 return
             stage, scale_weight = next_stage
+            notional = round(self.max_round_notional_usd * scale_weight, 8)
 
             selected = self._selected_prediction(snapshot)
             probability_up = float(selected.get("probability_up") or 0.5)
             confidence = float(selected.get("confidence") or 0.0)
+            signal_timestamp = int(selected.get("timestamp_ms") or 0)
+            signal_age_ms = timestamp - signal_timestamp if signal_timestamp > 0 else self.max_signal_age_ms + 1
             item.probability_up = probability_up
             item.confidence = confidence
 
-            if confidence < self.min_confidence:
-                item.reason = "confidence_too_low"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+            if signal_age_ms < 0 or signal_age_ms > self.max_signal_age_ms:
+                await self._reject_locked(item, "signal_stale", stage)
+                return
+            min_stage_confidence = max(self.min_confidence, self.stage_min_confidence[stage - 1])
+            if confidence < min_stage_confidence:
+                await self._reject_locked(item, "confidence_too_low", stage)
                 return
 
             if probability_up >= 0.5 + self.min_probability_margin:
@@ -335,17 +418,12 @@ class BTC5mRoundPredictionEngine:
             elif probability_up <= 0.5 - self.min_probability_margin:
                 direction = "NO"
             else:
-                item.reason = "direction_margin_too_low"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+                await self._reject_locked(item, "direction_margin_too_low", stage)
                 return
 
             if item.initial_direction is not None and direction != item.initial_direction:
-                item.reason = "scale_in_direction_changed"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+                item.last_direction_change_ms = timestamp
+                await self._reject_locked(item, "scale_in_direction_changed", stage)
                 return
 
             books = snapshot.get("books", {}) or {}
@@ -353,33 +431,82 @@ class BTC5mRoundPredictionEngine:
             no_book = books.get(str(market.get("no_token_id") or ""), {}) or {}
             item.yes_ask = yes_book.get("best_ask")
             item.no_ask = no_book.get("best_ask")
-            entry_price = item.yes_ask if direction == "YES" else item.no_ask
-            if entry_price is None or not 0 < float(entry_price) < 1:
-                item.reason = "contract_price_missing"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+            book = yes_book if direction == "YES" else no_book
+            entry_price = book.get("best_ask")
+            best_bid = book.get("best_bid")
+            if entry_price is None:
+                await self._reject_locked(item, "contract_price_missing", stage)
+                return
+            entry_price = float(entry_price)
+            if not self.min_contract_price <= entry_price <= self.max_contract_price:
+                await self._reject_locked(item, "contract_price_out_of_range", stage)
                 return
 
-            notional = round(self.max_round_notional_usd * scale_weight, 8)
-            if notional <= 0:
-                item.reason = "round_notional_limit"
-                self.last_reason = item.reason
-                self._save(item)
-                await self.publish_state_locked()
+            book_timestamp = int(book.get("timestamp_ms") or 0)
+            book_age_ms = timestamp - book_timestamp if book_timestamp > 0 else self.max_book_age_ms + 1
+            if book_age_ms < 0 or book_age_ms > self.max_book_age_ms:
+                await self._reject_locked(item, "book_stale", stage)
+                return
+
+            spread = max(0.0, entry_price - float(best_bid)) if best_bid is not None else 0.0
+            if best_bid is not None and spread > self.max_spread:
+                await self._reject_locked(item, "spread_too_wide", stage)
+                return
+
+            ask_depth_usd = self._book_depth_usd(book)
+            estimated_vwap = self._estimate_buy_vwap(book, notional)
+            if self.enforce_depth and (
+                ask_depth_usd < notional * self.min_depth_multiple or estimated_vwap is None
+            ):
+                await self._reject_locked(item, "insufficient_book_depth", stage)
+                return
+
+            effective_entry_price = float(estimated_vwap or entry_price)
+            expected_probability = probability_up if direction == "YES" else 1 - probability_up
+            edge = expected_probability - effective_entry_price
+            net_edge = edge - self.slippage_buffer
+            min_stage_net_edge = self.stage_min_net_edge[stage - 1]
+            quality = {
+                "stage": stage,
+                "direction": direction,
+                "probability_up": round(probability_up, 8),
+                "expected_probability": round(expected_probability, 8),
+                "confidence": round(confidence, 8),
+                "min_confidence": round(min_stage_confidence, 8),
+                "entry_price": round(entry_price, 8),
+                "estimated_vwap": round(effective_entry_price, 8),
+                "edge": round(edge, 8),
+                "net_edge": round(net_edge, 8),
+                "min_net_edge": round(min_stage_net_edge, 8),
+                "spread": round(spread, 8),
+                "ask_depth_usd": round(ask_depth_usd, 8),
+                "required_depth_usd": round(notional * self.min_depth_multiple, 8),
+                "signal_age_ms": signal_age_ms,
+                "book_age_ms": book_age_ms,
+            }
+            item.last_signal_quality = quality
+            if net_edge < min_stage_net_edge:
+                await self._reject_locked(item, "net_edge_too_low", stage)
                 return
 
             order = PaperMicroOrder(
                 order_id=f"{slug}-scale-{stage}-{timestamp}",
                 direction=direction,
-                entry_price=float(entry_price),
+                entry_price=effective_entry_price,
                 notional_usd=notional,
-                shares=round(notional / float(entry_price), 8),
+                shares=round(notional / effective_entry_price, 8),
                 probability_up=probability_up,
                 confidence=confidence,
                 created_ms=timestamp,
                 scale_stage=stage,
                 scale_weight=scale_weight,
+                expected_probability=expected_probability,
+                edge=edge,
+                net_edge=net_edge,
+                spread=spread,
+                estimated_vwap=estimated_vwap,
+                signal_age_ms=signal_age_ms,
+                book_age_ms=book_age_ms,
             )
             item.orders.append(order.to_dict())
             item.order_count = len(item.orders)
@@ -391,7 +518,8 @@ class BTC5mRoundPredictionEngine:
             item.direction = direction
             item.status = "predicted"
             item.reason = f"paper_scale_in_stage_{stage}_placed"
-            item.entry_price = float(entry_price)
+            item.last_rejection_key = None
+            item.entry_price = effective_entry_price
             item.notional_usd = item.total_notional_usd
             item.shares = round(sum(float(entry.get("shares") or 0.0) for entry in item.orders), 8)
             item.created_ms = item.created_ms or timestamp
@@ -401,7 +529,7 @@ class BTC5mRoundPredictionEngine:
         async with self.state.lock:
             self.state.orders_submitted += 1
             self.state.last_order_result = {
-                "mode": "btc_5m_prediction_market_paper_scale_in",
+                "mode": "btc_5m_prediction_market_paper_scale_in_guarded",
                 "accepted": True,
                 "slug": slug,
                 "direction": order.direction,
@@ -409,6 +537,11 @@ class BTC5mRoundPredictionEngine:
                 "notional_usd": order.notional_usd,
                 "scale_stage": order.scale_stage,
                 "scale_weight": order.scale_weight,
+                "edge": order.edge,
+                "net_edge": order.net_edge,
+                "spread": order.spread,
+                "signal_age_ms": order.signal_age_ms,
+                "book_age_ms": order.book_age_ms,
                 "round_order_count": item.order_count,
                 "round_total_notional_usd": item.total_notional_usd,
             }
@@ -481,6 +614,10 @@ class BTC5mRoundPredictionEngine:
         round_wins = sum(1 for item in settled_rounds if item.won is True)
         round_losses = sum(1 for item in settled_rounds if item.won is False)
         round_flat = sum(1 for item in settled_rounds if item.won is None)
+        rejection_counts: dict[str, int] = {}
+        for item in rounds:
+            for reason, count in item.rejection_counts.items():
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + int(count)
         return {
             "realized_pnl": round(sum(item.pnl for item in settled_rounds), 8),
             "unrealized_pnl": 0.0,
@@ -498,6 +635,7 @@ class BTC5mRoundPredictionEngine:
             "closed_rounds": len(settled_rounds),
             "total_orders": len(settled_orders) + len(open_orders),
             "round_win_rate": round(round_wins / max(1, round_wins + round_losses), 6),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
         }
 
     async def publish_state_locked(self) -> None:
@@ -511,16 +649,27 @@ class BTC5mRoundPredictionEngine:
             "closed_trades": [item.to_dict() for item in rounds if item.status == "settled"][:100],
             "skipped_rounds": [item.to_dict() for item in rounds if item.status == "skipped"][:100],
             "rules": {
-                "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
+                "strategy": "BTC_5M_EVENT_SCALE_IN_V2_GUARDED",
                 "paper_only": True,
                 "scale_in_enabled": True,
                 "scale_in_weights": list(self.scale_weights),
                 "scale_in_after_sec": list(self.scale_after_sec),
+                "stage_min_confidence": list(self.stage_min_confidence),
+                "stage_min_net_edge": list(self.stage_min_net_edge),
                 "max_entries_per_round": 3,
                 "require_same_direction_revalidation": True,
+                "require_fresh_signal": True,
+                "max_signal_age_ms": self.max_signal_age_ms,
+                "require_fresh_book": True,
+                "max_book_age_ms": self.max_book_age_ms,
+                "require_book_depth": self.enforce_depth,
+                "min_depth_multiple": self.min_depth_multiple,
                 "max_round_notional_usd": self.max_round_notional_usd,
+                "min_contract_price": self.min_contract_price,
+                "max_contract_price": self.max_contract_price,
+                "max_spread": self.max_spread,
+                "slippage_buffer": self.slippage_buffer,
                 "close_buffer_sec": self.close_buffer_sec,
-                "min_confidence": self.min_confidence,
                 "min_probability_margin": self.min_probability_margin,
                 "settlement": "btc_close_vs_btc_open",
                 "wait_excluded_from_win_rate": True,
@@ -544,4 +693,4 @@ class BTC5mRoundPredictionEngine:
             except Exception as exc:
                 async with self.state.lock:
                     self.state.last_error = f"btc5m_round_prediction: {exc}"
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(self.loop_interval_sec)
