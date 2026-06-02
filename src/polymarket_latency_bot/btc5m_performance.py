@@ -142,10 +142,7 @@ def _calibration_stats(
     min_bucket_samples: int,
     overconfidence_gap_threshold: float,
 ) -> dict[str, Any]:
-    eligible = [
-        order for order in orders
-        if order.get("expected_probability") is not None and order.get("won") is not None
-    ]
+    eligible = [order for order in orders if order.get("expected_probability") is not None and order.get("won") is not None]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     predicted_total = 0.0
     actual_total = 0.0
@@ -172,12 +169,7 @@ def _calibration_stats(
         }
         buckets[key] = row
         if samples >= max(1, int(min_bucket_samples)) and calibration_gap > float(overconfidence_gap_threshold):
-            overconfidence_reviews.append({
-                "bucket": key,
-                **row,
-                "action": "review_only",
-                "reason": "overconfidence_gap",
-            })
+            overconfidence_reviews.append({"bucket": key, **row, "action": "review_only", "reason": "overconfidence_gap"})
 
     samples = len(eligible)
     return {
@@ -212,11 +204,7 @@ def _drift_stats(
     win_rate_drop = round(overall_win_rate - recent_win_rate, 6)
     overall_brier = _brier_score(ordered)
     recent_brier = _brier_score(recent)
-    brier_increase = (
-        round(float(recent_brier) - float(overall_brier), 8)
-        if overall_brier is not None and recent_brier is not None
-        else None
-    )
+    brier_increase = round(float(recent_brier) - float(overall_brier), 8) if overall_brier is not None and recent_brier is not None else None
     reasons: list[str] = []
     enough_samples = len(recent) >= max(1, int(min_samples))
     if enough_samples and win_rate_drop > float(win_rate_drop_threshold):
@@ -240,6 +228,54 @@ def _drift_stats(
     }
 
 
+def _walk_forward_stats(
+    orders: Iterable[dict[str, Any]],
+    *,
+    train_min_samples: int,
+    validation_samples: int,
+    win_rate_drop_threshold: float,
+    brier_increase_threshold: float,
+) -> dict[str, Any]:
+    ordered = sorted(orders, key=lambda order: int(order.get("created_ms") or 0))
+    validation_count = max(1, int(validation_samples))
+    baseline = ordered[:-validation_count] if len(ordered) > validation_count else []
+    validation = ordered[-validation_count:] if len(ordered) >= validation_count else ordered
+    required_train = max(1, int(train_min_samples))
+    collecting = len(baseline) < required_train or len(validation) < validation_count
+    baseline_wins = sum(1 for order in baseline if order.get("won") is True)
+    baseline_losses = sum(1 for order in baseline if order.get("won") is False)
+    validation_wins = sum(1 for order in validation if order.get("won") is True)
+    validation_losses = sum(1 for order in validation if order.get("won") is False)
+    baseline_win_rate = _rate(baseline_wins, baseline_losses)
+    validation_win_rate = _rate(validation_wins, validation_losses)
+    win_rate_delta = round(validation_win_rate - baseline_win_rate, 6)
+    baseline_brier = _brier_score(baseline)
+    validation_brier = _brier_score(validation)
+    brier_delta = round(float(validation_brier) - float(baseline_brier), 8) if baseline_brier is not None and validation_brier is not None else None
+    reasons: list[str] = []
+    if not collecting and -win_rate_delta > float(win_rate_drop_threshold):
+        reasons.append("validation_win_rate_below_baseline")
+    if not collecting and brier_delta is not None and brier_delta > float(brier_increase_threshold):
+        reasons.append("validation_brier_worse_than_baseline")
+    return {
+        "status": "collecting" if collecting else "ready",
+        "baseline_samples": len(baseline),
+        "validation_samples": len(validation),
+        "required_train_samples": required_train,
+        "required_validation_samples": validation_count,
+        "baseline_win_rate": baseline_win_rate,
+        "validation_win_rate": validation_win_rate,
+        "win_rate_delta": win_rate_delta,
+        "win_rate_drop_threshold": round(float(win_rate_drop_threshold), 6),
+        "baseline_brier_score": baseline_brier,
+        "validation_brier_score": validation_brier,
+        "brier_delta": brier_delta,
+        "brier_increase_threshold": round(float(brier_increase_threshold), 6),
+        "review_only": bool(reasons),
+        "reasons": reasons,
+    }
+
+
 def build_paper_analytics(
     paper_portfolio: dict[str, Any] | None,
     *,
@@ -253,6 +289,10 @@ def build_paper_analytics(
     drift_min_samples: int = 20,
     drift_win_rate_drop_threshold: float = 0.15,
     drift_brier_increase_threshold: float = 0.10,
+    walk_forward_train_min_samples: int = 30,
+    walk_forward_validation_samples: int = 20,
+    walk_forward_win_rate_drop_threshold: float = 0.10,
+    walk_forward_brier_increase_threshold: float = 0.05,
 ) -> dict[str, Any]:
     paper = paper_portfolio or {}
     rounds = list(paper.get("closed_trades") or [])
@@ -267,7 +307,6 @@ def build_paper_analytics(
     by_signal_source = _group_stats(orders, lambda order: str(order.get("signal_source") or "unknown"))
     min_group_samples = max(1, int(min_group_samples_for_review))
     threshold = min(1.0, max(0.0, float(review_win_rate_threshold)))
-
     review_recommendations = {
         "scale_stage": _review_groups(by_scale_stage, min_samples=min_group_samples, min_win_rate=threshold),
         "net_edge": _review_groups(by_net_edge, min_samples=min_group_samples, min_win_rate=threshold),
@@ -275,19 +314,9 @@ def build_paper_analytics(
         "signal_source": _review_groups(by_signal_source, min_samples=min_group_samples, min_win_rate=threshold),
     }
     review_count = sum(len(items) for items in review_recommendations.values())
-    calibration = _calibration_stats(
-        orders,
-        min_bucket_samples=calibration_min_bucket_samples,
-        overconfidence_gap_threshold=overconfidence_gap_threshold,
-    )
-    drift = _drift_stats(
-        orders,
-        rolling_window=rolling_window,
-        min_samples=drift_min_samples,
-        win_rate_drop_threshold=drift_win_rate_drop_threshold,
-        brier_increase_threshold=drift_brier_increase_threshold,
-    )
-
+    calibration = _calibration_stats(orders, min_bucket_samples=calibration_min_bucket_samples, overconfidence_gap_threshold=overconfidence_gap_threshold)
+    drift = _drift_stats(orders, rolling_window=rolling_window, min_samples=drift_min_samples, win_rate_drop_threshold=drift_win_rate_drop_threshold, brier_increase_threshold=drift_brier_increase_threshold)
+    walk_forward = _walk_forward_stats(orders, train_min_samples=walk_forward_train_min_samples, validation_samples=walk_forward_validation_samples, win_rate_drop_threshold=walk_forward_win_rate_drop_threshold, brier_increase_threshold=walk_forward_brier_increase_threshold)
     return {
         "samples": wins + losses,
         "wins": wins,
@@ -297,12 +326,8 @@ def build_paper_analytics(
         "rolling": _rolling_stats(orders, rolling_window),
         "calibration": calibration,
         "drift": drift,
-        "cooldown": {
-            **streak,
-            "threshold": max(1, int(cooldown_after_losses)),
-            "recommended": cooldown_recommended,
-            "reason": "consecutive_round_losses" if cooldown_recommended else None,
-        },
+        "walk_forward": walk_forward,
+        "cooldown": {**streak, "threshold": max(1, int(cooldown_after_losses)), "recommended": cooldown_recommended, "reason": "consecutive_round_losses" if cooldown_recommended else None},
         "by_scale_stage": by_scale_stage,
         "by_net_edge": by_net_edge,
         "by_direction": by_direction,
@@ -310,13 +335,11 @@ def build_paper_analytics(
         "review": {
             "min_group_samples": min_group_samples,
             "win_rate_threshold": threshold,
-            "recommendation_count": review_count + len(calibration["overconfidence_reviews"]) + (1 if drift["review_only"] else 0),
+            "recommendation_count": review_count + len(calibration["overconfidence_reviews"]) + (1 if drift["review_only"] else 0) + (1 if walk_forward["review_only"] else 0),
             "recommendations": review_recommendations,
             "overconfidence": calibration["overconfidence_reviews"],
             "drift": drift if drift["review_only"] else None,
+            "walk_forward": walk_forward if walk_forward["review_only"] else None,
         },
-        "guidance": {
-            "auto_tuning_enabled": False,
-            "note": "Recommendations are observational only. Review split metrics, calibration and drift before changing Paper thresholds.",
-        },
+        "guidance": {"auto_tuning_enabled": False, "note": "Recommendations are observational only. Review split metrics, calibration, drift and walk-forward validation before changing Paper thresholds."},
     }
