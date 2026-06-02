@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .btc5m_analytics_v4 import build_paper_analytics
 from .btc5m_hardened_round_prediction import BTC5mHardenedRoundPredictionEngine
-from .btc5m_performance import build_paper_analytics
 from .models import now_ms
 
 
@@ -12,8 +12,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
     """Run V4 hardened Paper scale-in with observational analytics only.
 
     Adaptive cooldown is intentionally disabled. Loss streaks, calibration,
-    drift and walk-forward diagnostics remain visible for review, but they do
-    not pause new Paper evaluations or alter strategy thresholds automatically.
+    drift, walk-forward, EV and Shadow A/B diagnostics remain visible for
+    review, but they do not pause new Paper evaluations or alter strategy
+    thresholds automatically.
     """
 
     STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V4_HARDENED"
