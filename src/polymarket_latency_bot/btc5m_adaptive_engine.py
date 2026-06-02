@@ -14,7 +14,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
     The base scale-in logic remains unchanged. After a configurable number of
     consecutive losing rounds, this wrapper temporarily pauses new evaluations.
     Existing Paper rounds continue to settle while cooldown is active.
-    Analytics, calibration, drift and review recommendations remain observational only.
+    Analytics, calibration, drift and walk-forward recommendations remain
+    observational only.
     """
 
     STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V3_ADAPTIVE_GUARDED"
@@ -33,6 +34,10 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
         self.drift_min_samples = max(1, int(os.getenv("BTC5M_PAPER_DRIFT_MIN_SAMPLES", "20")))
         self.drift_win_rate_drop_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_DRIFT_WIN_RATE_DROP_THRESHOLD", "0.15"))))
         self.drift_brier_increase_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_DRIFT_BRIER_INCREASE_THRESHOLD", "0.10"))))
+        self.walk_forward_train_min_samples = max(1, int(os.getenv("BTC5M_PAPER_WALK_FORWARD_TRAIN_MIN_SAMPLES", "30")))
+        self.walk_forward_validation_samples = max(1, int(os.getenv("BTC5M_PAPER_WALK_FORWARD_VALIDATION_SAMPLES", "20")))
+        self.walk_forward_win_rate_drop_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_WALK_FORWARD_WIN_RATE_DROP_THRESHOLD", "0.10"))))
+        self.walk_forward_brier_increase_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_WALK_FORWARD_BRIER_INCREASE_THRESHOLD", "0.05"))))
         self.cooldown_until_ms = 0
         self.cooldown_trigger_round: str | None = None
 
@@ -50,6 +55,10 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
             drift_min_samples=self.drift_min_samples,
             drift_win_rate_drop_threshold=self.drift_win_rate_drop_threshold,
             drift_brier_increase_threshold=self.drift_brier_increase_threshold,
+            walk_forward_train_min_samples=self.walk_forward_train_min_samples,
+            walk_forward_validation_samples=self.walk_forward_validation_samples,
+            walk_forward_win_rate_drop_threshold=self.walk_forward_win_rate_drop_threshold,
+            walk_forward_brier_increase_threshold=self.walk_forward_brier_increase_threshold,
         )
 
     async def _publish_adaptive_guard(self, analytics: dict[str, Any], timestamp_ms: int) -> None:
@@ -72,6 +81,10 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "drift_min_samples": self.drift_min_samples,
                 "drift_win_rate_drop_threshold": self.drift_win_rate_drop_threshold,
                 "drift_brier_increase_threshold": self.drift_brier_increase_threshold,
+                "walk_forward_train_min_samples": self.walk_forward_train_min_samples,
+                "walk_forward_validation_samples": self.walk_forward_validation_samples,
+                "walk_forward_win_rate_drop_threshold": self.walk_forward_win_rate_drop_threshold,
+                "walk_forward_brier_increase_threshold": self.walk_forward_brier_increase_threshold,
             })
             paper["rules"] = rules
             paper["analytics"] = analytics
@@ -93,6 +106,10 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 "drift_min_samples": self.drift_min_samples,
                 "drift_win_rate_drop_threshold": self.drift_win_rate_drop_threshold,
                 "drift_brier_increase_threshold": self.drift_brier_increase_threshold,
+                "walk_forward_train_min_samples": self.walk_forward_train_min_samples,
+                "walk_forward_validation_samples": self.walk_forward_validation_samples,
+                "walk_forward_win_rate_drop_threshold": self.walk_forward_win_rate_drop_threshold,
+                "walk_forward_brier_increase_threshold": self.walk_forward_brier_increase_threshold,
             }
             self.state.paper_portfolio = paper
 
