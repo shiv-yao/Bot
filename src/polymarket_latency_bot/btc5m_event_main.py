@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from .btc5m_event_paper_ui import register_btc5m_event_paper_ui
+from .btc5m_prediction_market_ui import register_btc5m_prediction_market_ui
 from .btc5m_round_prediction import BTC5mRoundPredictionEngine
 from .config import Settings
 from .measured_feeds import MeasuredFeedHub
@@ -123,7 +123,7 @@ async def run() -> None:
     await round_engine.publish_state()
 
     app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper")
-    register_btc5m_event_paper_ui(app)
+    register_btc5m_prediction_market_ui(app)
 
     @app.get("/", include_in_schema=False)
     async def dashboard() -> RedirectResponse:
