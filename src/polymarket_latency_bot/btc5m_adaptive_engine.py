@@ -42,6 +42,26 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
         self.cooldown_until_ms = 0
         self.cooldown_trigger_round: str | None = None
 
+    def _record_shadow_decisions(self, item: Any, quality: dict[str, Any], notional: float) -> None:
+        """Keep Shadow A/B observational data aligned with executable V4 quality."""
+
+        stage = int(quality.get("stage") or 1)
+        net_edge = float(quality.get("net_edge") or 0.0)
+        min_net_edge = float(quality.get("min_net_edge") or 0.0)
+        confirmation = dict(quality.get("confirmation") or {})
+        if net_edge < min_net_edge or not bool(confirmation.get("confirmed")):
+            return
+        if item.orders:
+            previous = item.orders[-1]
+            entry_price = float(quality.get("estimated_vwap") or quality.get("entry_price") or 0.0)
+            price_worsening = entry_price - float(previous.get("entry_price") or 0.0)
+            edge_decay = float(previous.get("net_edge") or 0.0) - net_edge
+            if price_worsening > self.stage_max_price_worsening[stage - 1]:
+                return
+            if edge_decay > self.stage_max_edge_decay[stage - 1]:
+                return
+        super()._record_shadow_decisions(item, quality, notional)
+
     async def _analytics(self) -> dict[str, Any]:
         snapshot = await self.state.snapshot()
         return build_paper_analytics(
