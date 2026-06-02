@@ -22,6 +22,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
     def __init__(self, settings: Any, state: Any, db_path: str | None = None) -> None:
         super().__init__(settings, state, db_path=db_path)
         self.cooldown_enabled = False
+        # Stage 1 may use a fresh RTDS fallback. Stages 2 and 3 remain strict.
+        self.stage_min_clean_sources = (0, self.stage_min_clean_sources[1], self.stage_min_clean_sources[2])
         self.cooldown_after_losses = max(1, int(os.getenv("BTC5M_PAPER_COOLDOWN_AFTER_LOSSES", "3")))
         self.cooldown_sec = max(1, int(os.getenv("BTC5M_PAPER_COOLDOWN_SEC", "900")))
         self.analytics_min_samples = max(1, int(os.getenv("BTC5M_PAPER_ANALYTICS_MIN_SAMPLES", "30")))
