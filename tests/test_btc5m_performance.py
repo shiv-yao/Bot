@@ -128,6 +128,27 @@ class BTC5mPerformanceTests(unittest.TestCase):
         self.assertEqual(calibration["overconfidence_reviews"][0]["reason"], "overconfidence_gap")
         self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
 
+    def test_drift_warning_is_observational_only(self) -> None:
+        rounds = []
+        for index in range(20):
+            won = index < 15
+            probability = 0.80 if index < 15 else 0.90
+            rows = [order(1, 0.020, won, probability=probability, created_ms=index)]
+            rounds.append(settled(f"r{index}", index, won, rows))
+        analytics = build_paper_analytics(
+            {"closed_trades": rounds},
+            rolling_window=5,
+            drift_min_samples=5,
+            drift_win_rate_drop_threshold=0.10,
+            drift_brier_increase_threshold=0.01,
+        )
+        drift = analytics["drift"]
+        self.assertTrue(drift["review_only"])
+        self.assertIn("rolling_win_rate_deterioration", drift["reasons"])
+        self.assertIn("rolling_brier_deterioration", drift["reasons"])
+        self.assertIsNotNone(analytics["review"]["drift"])
+        self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()
