@@ -9,6 +9,7 @@ import uvicorn
 from .ai_api import register_ai_routes
 from .api import create_app
 from .config import Settings
+from .dashboard5m import register_dashboard5m
 from .logging_utils import log_event, setup_logging
 from .measured_feeds import MeasuredFeedHub
 from .models import now_ms
@@ -19,6 +20,7 @@ from .paper_metrics import MeasuredPaperExecutor
 from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
+from .runtime_profile import apply_balanced_btc5m_paper_profile
 from .state import BotState
 from .strategy import LatencyStrategy
 from .watchdog import RuntimeWatchdog
@@ -27,6 +29,7 @@ from .watchdog_api import register_watchdog_routes
 
 async def run() -> None:
     settings = Settings()
+    apply_balanced_btc5m_paper_profile(settings)
     setup_logging(settings.log_level)
     logger = logging.getLogger("main")
     state = BotState()
@@ -69,6 +72,7 @@ async def run() -> None:
 
     if settings.enable_api:
         app = create_app(settings, state, feeds, risk)
+        register_dashboard5m(app)
         register_monitoring_routes(app, settings, state, risk, portfolio)
         register_ops_routes(app, settings, state, feeds, risk, portfolio)
         register_watchdog_routes(app, watchdog)
@@ -85,6 +89,7 @@ async def run() -> None:
         market_slug_prefix=settings.market_slug_prefix,
         market_interval_sec=settings.market_interval_sec,
         ai_mode="single_direction_yes_no",
+        paper_profile="balanced_btc5m_hf",
         auto_discover_market=settings.auto_discover_market,
         rtds_feed="chainlink_btc_usd",
         binance_ws=settings.enable_binance_ws,
