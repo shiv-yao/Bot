@@ -5,15 +5,27 @@ import unittest
 from polymarket_latency_bot.btc5m_performance import build_paper_analytics
 
 
-def order(stage: int, edge: float, won: bool, direction: str = "YES", source: str = "multi_source_fusion") -> dict:
-    return {
+def order(
+    stage: int,
+    edge: float,
+    won: bool,
+    direction: str = "YES",
+    source: str = "multi_source_fusion",
+    probability: float | None = None,
+    created_ms: int = 0,
+) -> dict:
+    row = {
         "scale_stage": stage,
         "net_edge": edge,
         "won": won,
         "direction": direction,
         "signal_source": source,
         "pnl": 1.0 if won else -1.0,
+        "created_ms": created_ms,
     }
+    if probability is not None:
+        row["expected_probability"] = probability
+    return row
 
 
 def settled(slug: str, start_ms: int, won: bool, orders: list[dict]) -> dict:
@@ -67,9 +79,8 @@ class BTC5mPerformanceTests(unittest.TestCase):
         for index in range(10):
             won = index < 3
             rounds.append(settled(f"r{index}", index, won, [order(2, 0.013, won, direction="NO")]))
-        paper = {"closed_trades": rounds}
         analytics = build_paper_analytics(
-            paper,
+            {"closed_trades": rounds},
             min_group_samples_for_review=10,
             review_win_rate_threshold=0.45,
         )
@@ -94,6 +105,28 @@ class BTC5mPerformanceTests(unittest.TestCase):
             review_win_rate_threshold=0.99,
         )
         self.assertEqual(analytics["review"]["recommendation_count"], 0)
+
+    def test_calibration_detects_overconfidence_and_rolling_window(self) -> None:
+        rounds = []
+        for index in range(10):
+            won = index < 2
+            rows = [order(1, 0.020, won, probability=0.85, created_ms=index)]
+            rounds.append(settled(f"r{index}", index, won, rows))
+        analytics = build_paper_analytics(
+            {"closed_trades": rounds},
+            rolling_window=5,
+            calibration_min_bucket_samples=10,
+            overconfidence_gap_threshold=0.10,
+        )
+        calibration = analytics["calibration"]
+        self.assertEqual(analytics["rolling"]["samples"], 5)
+        self.assertEqual(analytics["rolling"]["wins"], 0)
+        self.assertAlmostEqual(calibration["average_expected_probability"], 0.85)
+        self.assertAlmostEqual(calibration["observed_win_rate"], 0.20)
+        self.assertAlmostEqual(calibration["brier_score"], 0.5825)
+        self.assertEqual(len(calibration["overconfidence_reviews"]), 1)
+        self.assertEqual(calibration["overconfidence_reviews"][0]["reason"], "overconfidence_gap")
+        self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
 
 
 if __name__ == "__main__":
