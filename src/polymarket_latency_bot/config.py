@@ -118,6 +118,15 @@ class Settings(BaseSettings):
     fusion_outlier_max_deviation_bps: float = Field(default=35.0, ge=0, le=10000)
     fusion_max_dispersion_bps: float = Field(default=20.0, ge=0, le=10000)
 
+    # BTC short-horizon regime filter. It blocks noisy or uninformative samples.
+    fusion_regime_filter_enabled: bool = True
+    fusion_regime_window_sec: int = Field(default=12, ge=2, le=300)
+    fusion_regime_min_samples: int = Field(default=5, ge=3, le=1000)
+    fusion_regime_max_range_bps: float = Field(default=45.0, ge=0, le=10000)
+    fusion_regime_min_abs_move_bps: float = Field(default=1.5, ge=0, le=10000)
+    fusion_regime_max_flip_ratio: float = Field(default=0.60, ge=0, le=1)
+    fusion_regime_min_direction_consistency: float = Field(default=0.60, ge=0, le=1)
+
     external_poll_url: str = ""
     external_poll_api_key: str = ""
     external_poll_source: str = "cryptoquant"
