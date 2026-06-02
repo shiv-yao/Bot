@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+
+DASHBOARD_HTML_V4 = r"""
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BTC 5m V4 Hardened</title>
+<style>
+:root{color-scheme:dark;--bg:#07111f;--panel:#10213a;--line:#2a405e;--text:#eef5ff;--muted:#9fb2cc;--yes:#2ed573;--no:#ff6b6b;--wait:#f6c344}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1120px;margin:auto;padding:16px 14px 34px}.top{display:flex;justify-content:space-between;gap:12px}.title{font-size:24px;font-weight:900}.sub,.muted{color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);padding:8px 12px;border-radius:999px;font-weight:800;font-size:12px;background:#0c1b31}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}.card{grid-column:span 12;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px}.mini{grid-column:span 6}.quarter{grid-column:span 3}.label{color:var(--muted);font-size:13px}.value{font-size:29px;font-weight:900;margin-top:4px}.small{font-size:19px;font-weight:850;margin-top:4px}.row{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid rgba(159,178,204,.16)}.row:last-child{border-bottom:0}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}.yes{color:var(--yes)}.no{color:var(--no)}.wait{color:var(--wait)}a{color:#b9e6ff;text-decoration:none;margin-right:10px;display:inline-block;margin-top:8px}@media(max-width:720px){.mini,.quarter{grid-column:span 12}.title{font-size:21px}}
+</style>
+</head>
+<body><main class="wrap">
+<header class="top"><div><div class="title">BTC 5 分鐘預測市場</div><div class="sub">V4 Hardened · 50% → 30% → 20% · Paper Only</div></div><div id="system" class="pill">LOADING</div></header>
+<section class="grid">
+<article class="card mini"><div class="label">本輪 AI 判斷</div><div id="direction" class="value wait">WAIT</div><div id="reason" class="muted">等待資料同步</div></article>
+<article class="card mini"><div class="label">距離本輪結束</div><div id="countdown" class="value">--:--</div><div class="muted">五分鐘結束後自動結算</div></article>
+<article class="card quarter"><div class="label">Paper 勝率</div><div id="winRate" class="small">—</div></article>
+<article class="card quarter"><div class="label">Realized EV</div><div id="realizedEv" class="small">—</div></article>
+<article class="card quarter"><div class="label">Profit Factor</div><div id="profitFactor" class="small">—</div></article>
+<article class="card quarter"><div class="label">最大回撤</div><div id="maxDrawdown" class="small">—</div></article>
+<article class="card mini"><h3>V4 Hardened 品質</h3><div class="row"><span>Signal Source</span><strong id="signalSource">—</strong></div><div class="row"><span>Signal Age</span><strong id="signalAge">—</strong></div><div class="row"><span>Book Age</span><strong id="bookAge">—</strong></div><div class="row"><span>Spread</span><strong id="spread">—</strong></div><div class="row"><span>Net Edge</span><strong id="netEdge">—</strong></div><div class="row"><span>Clean Sources</span><strong id="cleanSources">—</strong></div><div class="row"><span>Fusion Ready</span><strong id="fusionReady">—</strong></div><div class="row"><span>Book Imbalance</span><strong id="imbalance">—</strong></div><div class="row"><span>Top 3 Imbalance</span><strong id="top3Imbalance">—</strong></div><div class="row"><span>Stage Confirmation</span><strong id="confirmation">—</strong></div><div class="row"><span>Price Worsening</span><strong id="priceWorsening">—</strong></div><div class="row"><span>Edge Decay</span><strong id="edgeDecay">—</strong></div></article>
+<article class="card mini"><h3>EV 與資料品質</h3><div class="row"><span>已實現 PnL</span><strong id="pnl">—</strong></div><div class="row"><span>Expected EV</span><strong id="expectedEv">—</strong></div><div class="row"><span>EV Calibration Gap</span><strong id="evGap">—</strong></div><div class="row"><span>平均進場價</span><strong id="avgEntry">—</strong></div><div class="row"><span>平均 Net Edge</span><strong id="avgEdge">—</strong></div><div class="row"><span>Invalid BTC Data</span><strong id="invalidData">0</strong></div><div class="row"><span>Validity Rate</span><strong id="validityRate">—</strong></div><div class="row"><span>Invalid Reasons</span><strong id="invalidReasons" class="mono">—</strong></div></article>
+<article class="card"><h3>Shadow A/B（純觀察）</h3><div id="shadow" class="mono">等待樣本...</div></article>
+<article class="card mini"><h3>安全模式</h3><div class="row"><span>執行模式</span><strong id="execution">—</strong></div><div class="row"><span>Paper</span><strong id="paper">ON</strong></div><div class="row"><span>真實下單</span><strong id="live">OFF</strong></div><div class="row"><span>錢包簽名</span><strong id="wallet">OFF</strong></div><div class="row"><span>Adaptive Cooldown</span><strong id="cooldown">OFF</strong></div></article>
+<article class="card mini"><h3>市場</h3><div class="row"><span>狀態</span><strong id="marketStatus">—</strong></div><div class="row"><span>Slug</span><strong id="slug" class="mono">—</strong></div><div class="row"><span>YES Ask</span><strong id="yesAsk">—</strong></div><div class="row"><span>NO Ask</span><strong id="noAsk">—</strong></div><div class="row"><span>加倉</span><strong id="scaleCount">0 / 3</strong></div></article>
+<article class="card"><a href="/mode">/mode</a><a href="/status">/status</a><a href="/paper/winrate">/paper/winrate</a><a href="/paper/analytics">/paper/analytics</a><a href="/paper/rounds">/paper/rounds</a><a href="/healthz">/healthz</a><a href="/docs">/docs</a><div id="updated" class="muted"></div></article>
+</section></main>
+<script>
+const $=id=>document.getElementById(id),pct=x=>Number.isFinite(Number(x))?`${(Number(x)*100).toFixed(2)}%`:'—',num=x=>Number.isFinite(Number(x))?Number(x).toFixed(4):'—',usd=x=>Number.isFinite(Number(x))?`$${Number(x).toFixed(4)}`:'—',ms=x=>Number.isFinite(Number(x))?`${Math.round(Number(x))} ms`:'—';
+function cd(c){let s=Number(c?.interval_start||0);if(!s){const m=String(c?.slug||'').match(/(\d{10})$/);if(m)s=Number(m[1])}if(!s)return'--:--';const r=Math.max(0,s+300-Math.floor(Date.now()/1000));return`${String(Math.floor(r/60)).padStart(2,'0')}:${String(r%60).padStart(2,'0')}`}
+function cls(d){return d==='YES'?'yes':d==='NO'?'no':'wait'}
+function shadowRows(profiles){return Object.entries(profiles||{}).map(([name,row])=>`${name}: orders=${row.settled_orders||0}, win=${pct(row.win_rate||0)}, EV=${pct(row.realized_ev||0)}, PnL=${usd(row.realized_pnl||0)}`).join('\n')||'等待樣本...'}
+async function refresh(){try{const [s,m]=await Promise.all([fetch('/status',{cache:'no-store'}).then(r=>r.json()),fetch('/mode',{cache:'no-store'}).then(r=>r.json())]);const paper=s.paper||{},round=paper.current_round||{},a=paper.analytics||{},ev=a.ev||{},dq=a.data_quality||{},shadow=(a.shadow_ab||paper.shadow_ab||{}).profiles||{},q=s.ai?.last_signal_quality||{},market=s.market||{},cur=market.current||{},safe=m.safety||{};const d=round.direction||s.ai?.direction||'WAIT';$('direction').textContent=d;$('direction').className=`value ${cls(d)}`;$('reason').textContent=round.reason||s.ai?.reason||'等待資料同步';$('countdown').textContent=cd(cur);$('winRate').textContent=pct(paper.summary?.win_rate||0);$('realizedEv').textContent=pct(ev.realized_ev);$('profitFactor').textContent=ev.profit_factor??'—';$('maxDrawdown').textContent=usd(ev.maximum_drawdown);$('pnl').textContent=usd(ev.realized_pnl);$('expectedEv').textContent=pct(ev.expected_ev);$('evGap').textContent=pct(ev.ev_calibration_gap);$('avgEntry').textContent=num(ev.average_entry_price);$('avgEdge').textContent=pct(ev.average_net_edge);$('invalidData').textContent=dq.invalid_rounds||0;$('validityRate').textContent=pct(dq.validity_rate);$('invalidReasons').textContent=JSON.stringify(dq.invalid_by_reason||{});$('shadow').textContent=shadowRows(shadow);$('signalSource').textContent=q.signal_source||'—';$('signalAge').textContent=ms(q.signal_age_ms);$('bookAge').textContent=ms(q.book_age_ms);$('spread').textContent=num(q.spread);$('netEdge').textContent=pct(q.net_edge);$('cleanSources').textContent=q.clean_sources??'—';$('fusionReady').textContent=q.fusion_ready===true?'YES':q.fusion_ready===false?'NO':'—';$('imbalance').textContent=pct(q.book_imbalance);$('top3Imbalance').textContent=pct(q.top3_book_imbalance);$('confirmation').textContent=q.confirmation?`${q.confirmation.samples||0}/${q.confirmation.required_samples||0}`:'—';$('priceWorsening').textContent=num(q.price_worsening);$('edgeDecay').textContent=num(q.edge_decay);$('execution').textContent=m.execution||'—';$('paper').textContent=safe.paper_only?'ON':'OFF';$('live').textContent=safe.live_orders_enabled?'ON':'OFF';$('wallet').textContent=safe.wallet_signing_enabled?'ON':'OFF';$('cooldown').textContent=safe.adaptive_cooldown_enabled?'ON':'OFF';$('marketStatus').textContent=market.discovery_status||'—';$('slug').textContent=cur.slug||'—';$('yesAsk').textContent=num(market.yes_ask);$('noAsk').textContent=num(market.no_ask);$('scaleCount').textContent=`${Number(round.order_count||0)} / 3`;const active=market.discovery_status==='ready';$('system').textContent=active?'SYSTEM ACTIVE':'WAITING';$('system').className=`pill ${active?'yes':'wait'}`;$('updated').textContent=`更新時間 ${new Date().toLocaleTimeString()}`}catch(e){$('system').textContent='OFFLINE';$('system').className='pill no'}}
+refresh();setInterval(refresh,1500);
+</script></body></html>
+"""
+
+
+def register_btc5m_prediction_market_ui_v4(app: FastAPI) -> None:
+    @app.get("/ui", response_class=HTMLResponse)
+    async def dedicated_ui() -> HTMLResponse:
+        return HTMLResponse(DASHBOARD_HTML_V4)
