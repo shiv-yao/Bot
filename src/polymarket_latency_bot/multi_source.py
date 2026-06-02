@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections import deque
 from statistics import median
 from typing import Any
@@ -14,12 +15,13 @@ from .models import Prediction, now_ms
 
 
 class MultiSourceFusion:
-    """Fuse BTC price momentum while isolating anomalous source prices.
+    """Fuse BTC momentum while isolating bad data and noisy regimes.
 
-    A single exchange or oracle tick must not move the Paper prediction by
-    itself. Fresh prices are compared with the cross-source median. Sources that
-    exceed the configured deviation threshold are excluded from fusion and are
-    exposed in source status for dashboard diagnostics.
+    Fresh prices are compared with the cross-source median. Outliers are removed
+    before fusion. A short rolling median-price series then detects choppy,
+    abnormally volatile and excessively flat regimes. When quality degrades, a
+    neutral prediction is published immediately so an older directional signal
+    cannot remain actionable until its normal expiry.
     """
 
     def __init__(self, settings: Any, state: Any, feeds: Any) -> None:
@@ -32,19 +34,60 @@ class MultiSourceFusion:
             "binance": deque(maxlen=1024),
             "coinbase": deque(maxlen=1024),
         }
+        self._median_prices: deque[tuple[int, float]] = deque(maxlen=2048)
         self._weights = {
             "chainlink": float(settings.fusion_source_weight_chainlink),
             "binance": float(settings.fusion_source_weight_binance),
             "coinbase": float(settings.fusion_source_weight_coinbase),
         }
 
+    def _setting_float(self, env_name: str, attr_name: str, default: float) -> float:
+        return float(os.getenv(env_name, str(getattr(self.settings, attr_name, default))))
+
+    def _setting_int(self, env_name: str, attr_name: str, default: int) -> int:
+        return int(os.getenv(env_name, str(getattr(self.settings, attr_name, default))))
+
+    def _setting_bool(self, env_name: str, attr_name: str, default: bool) -> bool:
+        raw = os.getenv(env_name)
+        if raw is None:
+            return bool(getattr(self.settings, attr_name, default))
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
     @property
     def outlier_max_deviation_bps(self) -> float:
-        return max(0.0, float(getattr(self.settings, "fusion_outlier_max_deviation_bps", 35.0)))
+        return max(0.0, self._setting_float("FUSION_OUTLIER_MAX_DEVIATION_BPS", "fusion_outlier_max_deviation_bps", 35.0))
 
     @property
     def max_dispersion_bps(self) -> float:
-        return max(0.0, float(getattr(self.settings, "fusion_max_dispersion_bps", 20.0)))
+        return max(0.0, self._setting_float("FUSION_MAX_DISPERSION_BPS", "fusion_max_dispersion_bps", 20.0))
+
+    @property
+    def regime_filter_enabled(self) -> bool:
+        return self._setting_bool("FUSION_REGIME_FILTER_ENABLED", "fusion_regime_filter_enabled", True)
+
+    @property
+    def regime_window_sec(self) -> int:
+        return max(2, self._setting_int("FUSION_REGIME_WINDOW_SEC", "fusion_regime_window_sec", 12))
+
+    @property
+    def regime_min_samples(self) -> int:
+        return max(3, self._setting_int("FUSION_REGIME_MIN_SAMPLES", "fusion_regime_min_samples", 5))
+
+    @property
+    def regime_max_range_bps(self) -> float:
+        return max(0.0, self._setting_float("FUSION_REGIME_MAX_RANGE_BPS", "fusion_regime_max_range_bps", 45.0))
+
+    @property
+    def regime_min_abs_move_bps(self) -> float:
+        return max(0.0, self._setting_float("FUSION_REGIME_MIN_ABS_MOVE_BPS", "fusion_regime_min_abs_move_bps", 1.5))
+
+    @property
+    def regime_max_flip_ratio(self) -> float:
+        return min(1.0, max(0.0, self._setting_float("FUSION_REGIME_MAX_FLIP_RATIO", "fusion_regime_max_flip_ratio", 0.60)))
+
+    @property
+    def regime_min_direction_consistency(self) -> float:
+        return min(1.0, max(0.0, self._setting_float("FUSION_REGIME_MIN_DIRECTION_CONSISTENCY", "fusion_regime_min_direction_consistency", 0.60)))
 
     async def record_price(self, source: str, price: float, timestamp_ms: int | None = None, endpoint: str | None = None) -> None:
         if source not in self._prices or price <= 0:
@@ -102,6 +145,69 @@ class MultiSourceFusion:
                     "fusion_quality_update_ms": timestamp,
                 })
                 self.state.source_status[source] = current
+
+    def _record_median_price(self, timestamp: int, median_price: float) -> None:
+        if self._median_prices and self._median_prices[-1][0] == timestamp:
+            self._median_prices[-1] = (timestamp, median_price)
+        else:
+            self._median_prices.append((timestamp, median_price))
+
+    def _regime_snapshot(self, timestamp: int) -> dict[str, Any]:
+        cutoff = timestamp - self.regime_window_sec * 1000
+        points = [(ts, price) for ts, price in self._median_prices if ts >= cutoff]
+        if len(points) < self.regime_min_samples:
+            return {
+                "status": "warming_up",
+                "sample_count": len(points),
+                "required_samples": self.regime_min_samples,
+                "window_sec": self.regime_window_sec,
+                "blocked": False,
+            }
+
+        prices = [float(price) for _, price in points]
+        moves = [prices[index] / prices[index - 1] - 1 for index in range(1, len(prices)) if prices[index - 1] > 0]
+        signs = [1 if move > 0 else -1 if move < 0 else 0 for move in moves]
+        non_zero_signs = [sign for sign in signs if sign != 0]
+        net_move_bps = (prices[-1] / prices[0] - 1) * 10_000 if prices[0] > 0 else 0.0
+        range_bps = (max(prices) / min(prices) - 1) * 10_000 if min(prices) > 0 else 0.0
+        net_sign = 1 if net_move_bps > 0 else -1 if net_move_bps < 0 else 0
+        direction_consistency = (
+            sum(1 for sign in non_zero_signs if sign == net_sign) / len(non_zero_signs)
+            if non_zero_signs and net_sign != 0
+            else 0.0
+        )
+        transitions = max(0, len(non_zero_signs) - 1)
+        flips = sum(1 for index in range(1, len(non_zero_signs)) if non_zero_signs[index] != non_zero_signs[index - 1])
+        flip_ratio = flips / transitions if transitions else 0.0
+
+        if range_bps > self.regime_max_range_bps:
+            status = "too_volatile"
+        elif abs(net_move_bps) < self.regime_min_abs_move_bps:
+            status = "too_flat"
+        elif flip_ratio > self.regime_max_flip_ratio or direction_consistency < self.regime_min_direction_consistency:
+            status = "choppy"
+        else:
+            status = "trend_ready"
+        return {
+            "status": status,
+            "sample_count": len(points),
+            "required_samples": self.regime_min_samples,
+            "window_sec": self.regime_window_sec,
+            "net_move_bps": round(net_move_bps, 6),
+            "range_bps": round(range_bps, 6),
+            "flip_ratio": round(flip_ratio, 6),
+            "direction_consistency": round(direction_consistency, 6),
+            "blocked": status in {"too_volatile", "too_flat", "choppy"},
+        }
+
+    async def _publish_neutral_prediction(self, timestamp: int, reason: str) -> None:
+        await self.feeds.upsert_prediction(Prediction(
+            source="multi_source_fusion",
+            probability_up=0.5,
+            confidence=0.0,
+            timestamp_ms=timestamp,
+        ))
+        log_event(self.logger, "fusion_neutralized", reason=reason, timestamp_ms=timestamp)
 
     async def _publish_fusion(self, timestamp: int) -> None:
         window_start = timestamp - self.settings.external_price_window_sec * 1000
@@ -163,6 +269,7 @@ class MultiSourceFusion:
             }
             async with self.state.lock:
                 self.state.fusion_snapshot = snapshot
+            await self._publish_neutral_prediction(timestamp, "waiting_for_clean_sources")
             return
 
         clean_prices = [float(sample["price"]) for sample in clean_samples]
@@ -174,10 +281,15 @@ class MultiSourceFusion:
         agreement = max(positive, negative) / len(clean_samples)
         probability_up = max(0.30, min(0.70, 0.50 + fused_momentum * self.settings.fusion_probability_scale))
         confidence = max(0.0, min(0.90, self.settings.fusion_base_confidence + abs(fused_momentum) * 80 + max(0.0, agreement - 0.5) * 0.30))
+
+        self._record_median_price(timestamp, median_price)
+        regime = self._regime_snapshot(timestamp)
         if dispersion_bps > self.max_dispersion_bps:
             status = "price_dispersion_high"
         elif agreement < self.settings.fusion_agreement_threshold:
             status = "low_agreement"
+        elif self.regime_filter_enabled and bool(regime.get("blocked")):
+            status = f"regime_{regime['status']}"
         else:
             status = "ready"
         snapshot = {
@@ -194,6 +306,7 @@ class MultiSourceFusion:
             "clean_source_count": len(clean_samples),
             "outlier_count": len(outliers),
             "required_sources": required_sources,
+            "regime": regime,
             "samples": clean_samples,
             "raw_samples": samples,
             "outliers": outliers,
@@ -208,6 +321,8 @@ class MultiSourceFusion:
                 confidence=confidence,
                 timestamp_ms=timestamp,
             ))
+        else:
+            await self._publish_neutral_prediction(timestamp, status)
 
 
 def _binance_endpoints(settings: Any) -> list[str]:
