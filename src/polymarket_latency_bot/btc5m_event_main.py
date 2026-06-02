@@ -149,6 +149,22 @@ async def run() -> None:
             "queue_depth": snapshot.get("queue_depth", 0),
         }
 
+    @app.get("/paper/winrate")
+    async def paper_winrate() -> dict[str, Any]:
+        snapshot = await state.snapshot()
+        summary = (snapshot.get("paper_portfolio", {}) or {}).get("summary", {}) or {}
+        closed_trades = int(summary.get("closed_trades", 0) or 0)
+        return {
+            "mode": "paper_simulation",
+            "win_rate": float(summary.get("win_rate", 0.0) or 0.0),
+            "wins": int(summary.get("wins", 0) or 0),
+            "losses": int(summary.get("losses", 0) or 0),
+            "flat": int(summary.get("flat", 0) or 0),
+            "closed_trades": closed_trades,
+            "open_positions": int(summary.get("open_positions", 0) or 0),
+            "sample_status": "collecting" if closed_trades < 100 else "review_ready",
+        }
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         payload = await build_status(settings, state)
