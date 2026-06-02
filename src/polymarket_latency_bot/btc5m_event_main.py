@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from typing import Any
 
@@ -14,9 +15,13 @@ from .config import Settings
 from .measured_feeds import MeasuredFeedHub
 from .models import Prediction, now_ms
 from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
+from .paper_metrics import MeasuredPaperExecutor
+from .paper_portfolio import PaperPortfolio
+from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
 from .runtime_profile import apply_balanced_btc5m_paper_profile
 from .state import BotState
+from .strategy import LatencyStrategy
 
 
 class ForecastIn(BaseModel):
@@ -30,13 +35,14 @@ def _secret_ready(value: str) -> bool:
 
 def build_mode_status() -> dict[str, Any]:
     return {
-        "mode": "btc_5m_event_prediction_only",
-        "execution": "prediction_only",
+        "mode": "btc_5m_event_prediction_paper",
+        "execution": "paper_simulation",
         "market": {"asset": "BTC", "interval_minutes": 5},
         "outputs": ["YES", "NO", "WAIT"],
         "safety": {
-            "orders_enabled": False,
-            "paper_positions_enabled": False,
+            "paper_orders_enabled": True,
+            "paper_positions_enabled": True,
+            "live_orders_enabled": False,
             "general_event_scanner_enabled": False,
             "wallet_signing_enabled": False,
             "live_trading_enabled": False,
@@ -62,6 +68,7 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
     direction = "WAIT"
     if confidence >= settings.min_confidence and selected_edge >= settings.min_edge:
         direction = "YES" if yes_edge >= no_edge else "NO"
+    paper = snapshot.get("paper_portfolio", {}) or {}
     return {
         **build_mode_status(),
         "market": {
@@ -82,6 +89,14 @@ async def build_status(settings: Settings, state: BotState) -> dict[str, Any]:
             "min_edge": settings.min_edge,
             "min_confidence": settings.min_confidence,
         },
+        "paper": paper,
+        "execution_metrics": {
+            "orders_submitted": snapshot.get("orders_submitted", 0),
+            "orders_rejected": snapshot.get("orders_rejected", 0),
+            "queue_depth": snapshot.get("queue_depth", 0),
+            "queue_high_water": snapshot.get("queue_high_water", 0),
+            "last_order_result": snapshot.get("last_order_result"),
+        },
         "sources": snapshot.get("source_status", {}),
         "fusion": fusion,
         "connections": snapshot.get("connections", {}),
@@ -93,13 +108,22 @@ async def run() -> None:
     settings = Settings()
     apply_balanced_btc5m_paper_profile(settings)
     state = BotState()
+    risk = RiskManager(settings)
+    portfolio = PaperPortfolio(settings, state, risk, logging.getLogger("btc5m_event_paper"))
+    strategy = LatencyStrategy(settings, state)
+    executor = MeasuredPaperExecutor(settings, state, risk, portfolio)
 
     async def evaluate() -> None:
         await state.record_event("prediction_evaluation")
+        intents = await strategy.build_intents()
+        if intents:
+            await state.increment_counter("paper_strategy_intents", len(intents))
+        for intent in intents:
+            await executor.submit(intent)
 
     feeds = MeasuredFeedHub(settings, state, evaluate)
     fusion = MultiSourceFusion(settings, state, feeds)
-    app = FastAPI(title="BTC 5m Event Prediction")
+    app = FastAPI(title="BTC 5m Event Prediction Paper")
     register_btc5m_event_ui(app)
 
     @app.get("/", include_in_schema=False)
@@ -113,6 +137,17 @@ async def run() -> None:
     @app.get("/status")
     async def status() -> dict[str, Any]:
         return await build_status(settings, state)
+
+    @app.get("/paper/status")
+    async def paper_status() -> dict[str, Any]:
+        snapshot = await state.snapshot()
+        return {
+            "mode": "paper_simulation",
+            "portfolio": snapshot.get("paper_portfolio", {}),
+            "orders_submitted": snapshot.get("orders_submitted", 0),
+            "orders_rejected": snapshot.get("orders_rejected", 0),
+            "queue_depth": snapshot.get("queue_depth", 0),
+        }
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -143,6 +178,11 @@ async def run() -> None:
         asyncio.create_task(binance_ws_loop(settings, state, fusion), name="binance-ws"),
         asyncio.create_task(coinbase_ws_loop(settings, state, fusion), name="coinbase-ws"),
         asyncio.create_task(feeds.external_poll_loop(), name="external-poll"),
+        asyncio.create_task(portfolio.mark_loop(), name="paper-portfolio-mark"),
+    ]
+    tasks += [
+        asyncio.create_task(executor.worker(worker_id), name=f"paper-executor-{worker_id}")
+        for worker_id in range(settings.execution_workers)
     ]
     server = uvicorn.Server(uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning"))
     tasks.append(asyncio.create_task(server.serve(), name="api"))
