@@ -23,6 +23,7 @@ from .paper_portfolio import PaperPortfolio
 from .risk import RiskManager
 from .rtds_chainlink import chainlink_rtds_loop
 from .runtime_profile import apply_balanced_btc5m_paper_profile
+from .runtime_snapshots import RuntimeSnapshotRecorder, register_snapshot_routes
 from .state import BotState
 from .strategy import LatencyStrategy
 from .watchdog import RuntimeWatchdog
@@ -40,6 +41,7 @@ async def run() -> None:
     strategy = LatencyStrategy(settings, state)
     executor = MeasuredPaperExecutor(settings, state, risk, portfolio)
     watchdog = RuntimeWatchdog(settings, state, risk, portfolio)
+    snapshots = RuntimeSnapshotRecorder(state, risk, portfolio, interval_sec=60)
 
     async def evaluate() -> None:
         started_ms = now_ms()
@@ -66,6 +68,7 @@ async def run() -> None:
         asyncio.create_task(feeds.external_poll_loop(), name="external-poll"),
         asyncio.create_task(portfolio.mark_loop(), name="paper-portfolio-mark"),
         asyncio.create_task(watchdog.loop(), name="runtime-watchdog"),
+        asyncio.create_task(snapshots.loop(), name="runtime-snapshots"),
     ]
     tasks += [
         asyncio.create_task(executor.worker(i), name=f"executor-{i}")
@@ -81,6 +84,7 @@ async def run() -> None:
         register_ai_routes(app, settings, state)
         register_history_routes(app, settings, portfolio)
         register_evaluation_routes(app, portfolio)
+        register_snapshot_routes(app, snapshots)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
@@ -94,6 +98,7 @@ async def run() -> None:
         market_interval_sec=settings.market_interval_sec,
         ai_mode="single_direction_yes_no",
         paper_profile="balanced_btc5m_hf",
+        profile_version="2026-06-02.1",
         auto_discover_market=settings.auto_discover_market,
         rtds_feed="chainlink_btc_usd",
         binance_ws=settings.enable_binance_ws,
