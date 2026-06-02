@@ -16,13 +16,14 @@ class Settings(SimpleNamespace):
 
 
 class BTC5mEventPredictionTests(unittest.TestCase):
-    def test_mode_status_is_prediction_only(self) -> None:
+    def test_mode_status_is_paper_simulation(self) -> None:
         payload = build_mode_status()
-        self.assertEqual(payload["mode"], "btc_5m_event_prediction_only")
-        self.assertEqual(payload["execution"], "prediction_only")
+        self.assertEqual(payload["mode"], "btc_5m_event_prediction_paper")
+        self.assertEqual(payload["execution"], "paper_simulation")
         self.assertEqual(payload["outputs"], ["YES", "NO", "WAIT"])
-        self.assertFalse(payload["safety"]["orders_enabled"])
-        self.assertFalse(payload["safety"]["paper_positions_enabled"])
+        self.assertTrue(payload["safety"]["paper_orders_enabled"])
+        self.assertTrue(payload["safety"]["paper_positions_enabled"])
+        self.assertFalse(payload["safety"]["live_orders_enabled"])
         self.assertFalse(payload["safety"]["general_event_scanner_enabled"])
         self.assertFalse(payload["safety"]["wallet_signing_enabled"])
         self.assertFalse(payload["safety"]["live_trading_enabled"])
@@ -37,9 +38,11 @@ class BTC5mEventPredictionTests(unittest.TestCase):
                 to_dict=lambda: {"probability_up": 0.62, "confidence": 0.80, "timestamp_ms": 1},
             )
             payload = await build_status(Settings(), state)
-            self.assertEqual(payload["mode"], "btc_5m_event_prediction_only")
-            self.assertEqual(payload["execution"], "prediction_only")
+            self.assertEqual(payload["mode"], "btc_5m_event_prediction_paper")
+            self.assertEqual(payload["execution"], "paper_simulation")
             self.assertEqual(payload["ai"]["direction"], "WAIT")
+            self.assertIn("paper", payload)
+            self.assertIn("execution_metrics", payload)
 
         asyncio.run(run())
 
