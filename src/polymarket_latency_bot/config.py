@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     binance_ws_fallback_urls: str = "wss://stream.binance.com:443/ws/btcusdt@trade,wss://data-stream.binance.vision/ws/btcusdt@trade"
     coinbase_ws_url: str = "wss://ws-feed.exchange.coinbase.com"
     source_reconnect_delay_sec: float = Field(default=1.0, gt=0, le=60)
+    source_reconnect_max_delay_sec: float = Field(default=30.0, gt=0, le=300)
     external_price_max_age_ms: int = Field(default=3000, ge=250)
     external_price_window_sec: int = Field(default=20, ge=10, le=900)
 
@@ -114,6 +115,8 @@ class Settings(BaseSettings):
     fusion_source_weight_chainlink: float = Field(default=1.0, ge=0)
     fusion_source_weight_binance: float = Field(default=1.0, ge=0)
     fusion_source_weight_coinbase: float = Field(default=1.0, ge=0)
+    fusion_outlier_max_deviation_bps: float = Field(default=35.0, ge=0, le=10000)
+    fusion_max_dispersion_bps: float = Field(default=20.0, ge=0, le=10000)
 
     external_poll_url: str = ""
     external_poll_api_key: str = ""
@@ -155,6 +158,8 @@ class Settings(BaseSettings):
             raise ValueError("MAX_CONTRACT_PRICE must be greater than MIN_CONTRACT_PRICE")
         if self.paper_open_buffer_sec + self.paper_close_buffer_sec >= self.market_interval_sec:
             raise ValueError("paper market buffers must be shorter than MARKET_INTERVAL_SEC")
+        if self.source_reconnect_max_delay_sec < self.source_reconnect_delay_sec:
+            raise ValueError("SOURCE_RECONNECT_MAX_DELAY_SEC must be >= SOURCE_RECONNECT_DELAY_SEC")
         if self.live_trading and self.live_confirmation != "I_UNDERSTAND_LIVE_ORDERS":
             raise ValueError("LIVE_TRADING requires LIVE_CONFIRMATION=I_UNDERSTAND_LIVE_ORDERS")
         if self.live_enabled:
