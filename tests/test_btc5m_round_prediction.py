@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from polymarket_latency_bot.btc5m_round_prediction import BTC5mRoundPredictionEngine
 from polymarket_latency_bot.models import BookTop, Prediction
@@ -45,29 +46,74 @@ def build_state(*, start_ms: int, probability_up: float, confidence: float) -> B
 
 
 class BTC5mRoundPredictionTests(unittest.TestCase):
-    def test_same_market_creates_only_one_prediction(self) -> None:
+    def test_scale_in_uses_50_30_20_and_stops_after_three_entries(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
-                start_ms = 1_780_000_000_000
+                start_ms = 1_900_000_000_000
                 state = build_state(start_ms=start_ms, probability_up=0.70, confidence=0.80)
-                engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
-                await engine.evaluate()
-                await engine.evaluate()
+                env = {
+                    "BTC5M_PAPER_MAX_ROUND_NOTIONAL_USD": "100",
+                    "BTC5M_PAPER_CLOSE_BUFFER_SEC": "0",
+                    "BTC5M_PAPER_SCALE_IN_AFTER_SEC": "0,100,200",
+                    "BTC5M_PAPER_SCALE_IN_WEIGHTS": "0.50,0.30,0.20",
+                }
+                with patch.dict("os.environ", env, clear=False):
+                    engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
+                for timestamp in (start_ms + 1_000, start_ms + 101_000, start_ms + 201_000, start_ms + 202_000):
+                    with patch("polymarket_latency_bot.btc5m_round_prediction.now_ms", return_value=timestamp):
+                        await engine.evaluate()
                 payload = await state.snapshot()
-                self.assertEqual(payload["orders_submitted"], 1)
                 current = payload["paper_portfolio"]["current_round"]
-                self.assertEqual(current["direction"], "YES")
-                self.assertEqual(current["status"], "predicted")
+                self.assertEqual(payload["orders_submitted"], 3)
+                self.assertEqual(current["order_count"], 3)
+                self.assertEqual(current["total_notional_usd"], 100.0)
+                self.assertEqual([order["scale_stage"] for order in current["orders"]], [1, 2, 3])
+                self.assertEqual([order["scale_weight"] for order in current["orders"]], [0.5, 0.3, 0.2])
+                self.assertEqual([order["notional_usd"] for order in current["orders"]], [50.0, 30.0, 20.0])
+                self.assertEqual(current["reason"], "scale_in_complete")
+
+        asyncio.run(run())
+
+    def test_direction_change_blocks_additional_scale_in(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                start_ms = 1_900_000_000_000
+                state = build_state(start_ms=start_ms, probability_up=0.70, confidence=0.80)
+                env = {
+                    "BTC5M_PAPER_MAX_ROUND_NOTIONAL_USD": "100",
+                    "BTC5M_PAPER_CLOSE_BUFFER_SEC": "0",
+                    "BTC5M_PAPER_SCALE_IN_AFTER_SEC": "0,100,200",
+                }
+                with patch.dict("os.environ", env, clear=False):
+                    engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
+                with patch("polymarket_latency_bot.btc5m_round_prediction.now_ms", return_value=start_ms + 1_000):
+                    await engine.evaluate()
+                state.predictions["multi_source_fusion"] = Prediction(
+                    source="multi_source_fusion",
+                    probability_up=0.30,
+                    confidence=0.80,
+                    timestamp_ms=start_ms + 101_000,
+                )
+                with patch("polymarket_latency_bot.btc5m_round_prediction.now_ms", return_value=start_ms + 101_000):
+                    await engine.evaluate()
+                payload = await state.snapshot()
+                current = payload["paper_portfolio"]["current_round"]
+                self.assertEqual(payload["orders_submitted"], 1)
+                self.assertEqual(current["order_count"], 1)
+                self.assertEqual(current["reason"], "scale_in_direction_changed")
 
         asyncio.run(run())
 
     def test_yes_prediction_settles_as_win_when_btc_closes_higher(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
-                start_ms = 1_780_000_000_000
+                start_ms = 1_900_000_000_000
                 state = build_state(start_ms=start_ms, probability_up=0.70, confidence=0.80)
-                engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
-                await engine.evaluate()
+                env = {"BTC5M_PAPER_CLOSE_BUFFER_SEC": "0"}
+                with patch.dict("os.environ", env, clear=False):
+                    engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
+                with patch("polymarket_latency_bot.btc5m_round_prediction.now_ms", return_value=start_ms + 1_000):
+                    await engine.evaluate()
                 state.btc_prices.append((start_ms + 300_000, 70100.0))
                 await engine.settle_due_rounds()
                 payload = await state.snapshot()
@@ -85,10 +131,13 @@ class BTC5mRoundPredictionTests(unittest.TestCase):
     def test_wait_is_skipped_and_excluded_from_win_rate(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
-                start_ms = 1_780_000_000_000
+                start_ms = 1_900_000_000_000
                 state = build_state(start_ms=start_ms, probability_up=0.70, confidence=0.20)
-                engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
-                await engine.evaluate()
+                env = {"BTC5M_PAPER_CLOSE_BUFFER_SEC": "0"}
+                with patch.dict("os.environ", env, clear=False):
+                    engine = BTC5mRoundPredictionEngine(Settings(), state, str(Path(directory) / "rounds.db"))
+                with patch("polymarket_latency_bot.btc5m_round_prediction.now_ms", return_value=start_ms + 1_000):
+                    await engine.evaluate()
                 state.btc_prices.append((start_ms + 300_000, 70100.0))
                 await engine.settle_due_rounds()
                 payload = await state.snapshot()
