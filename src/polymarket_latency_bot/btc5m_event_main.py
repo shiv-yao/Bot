@@ -31,20 +31,24 @@ def _secret_ready(value: str) -> bool:
 
 def build_mode_status() -> dict[str, Any]:
     return {
-        "mode": "btc_5m_prediction_market_paper",
-        "execution": "one_prediction_per_round",
+        "mode": "btc_5m_prediction_market_paper_scale_in",
+        "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
+        "execution": "three_stage_scale_in_50_30_20",
         "market": {"asset": "BTC", "interval_minutes": 5},
         "outputs": ["YES", "NO", "WAIT"],
         "rules": {
             "YES": "BTC close price is higher than BTC open price after 5 minutes",
             "NO": "BTC close price is lower than BTC open price after 5 minutes",
-            "WAIT": "AI confidence or direction margin is insufficient; no Paper bet is created",
-            "max_predictions_per_market": 1,
+            "WAIT": "AI confidence or direction margin is insufficient; no Paper entry is created",
+            "max_entries_per_market": 3,
+            "scale_in_weights": [0.50, 0.30, 0.20],
+            "require_same_direction_revalidation": True,
             "settlement": "btc_close_vs_btc_open",
         },
         "safety": {
             "paper_predictions_enabled": True,
-            "one_prediction_per_market": True,
+            "scale_in_enabled": True,
+            "paper_only": True,
             "live_orders_enabled": False,
             "wallet_signing_enabled": False,
             "live_trading_enabled": False,
@@ -122,7 +126,7 @@ async def run() -> None:
     round_engine = BTC5mRoundPredictionEngine(settings, state)
     await round_engine.publish_state()
 
-    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper")
+    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In")
     register_btc5m_prediction_market_ui(app)
 
     @app.get("/", include_in_schema=False)
@@ -141,7 +145,8 @@ async def run() -> None:
     async def paper_status() -> dict[str, Any]:
         snapshot = await state.snapshot()
         return {
-            "mode": "btc_5m_prediction_market_paper",
+            "mode": "btc_5m_prediction_market_paper_scale_in",
+            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
             "portfolio": snapshot.get("paper_portfolio", {}),
             "predictions_submitted": snapshot.get("orders_submitted", 0),
         }
@@ -152,7 +157,8 @@ async def run() -> None:
         summary = (snapshot.get("paper_portfolio", {}) or {}).get("summary", {}) or {}
         closed_trades = int(summary.get("closed_trades", 0) or 0)
         return {
-            "mode": "btc_5m_prediction_market_paper",
+            "mode": "btc_5m_prediction_market_paper_scale_in",
+            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
             "win_rate": float(summary.get("win_rate", 0.0) or 0.0),
             "wins": int(summary.get("wins", 0) or 0),
             "losses": int(summary.get("losses", 0) or 0),
@@ -168,7 +174,8 @@ async def run() -> None:
         snapshot = await state.snapshot()
         paper = snapshot.get("paper_portfolio", {}) or {}
         return {
-            "mode": "btc_5m_prediction_market_paper",
+            "mode": "btc_5m_prediction_market_paper_scale_in",
+            "strategy": "BTC_5M_EVENT_SCALE_IN_V1",
             "current_round": paper.get("current_round"),
             "closed_rounds": paper.get("closed_trades", []),
             "skipped_rounds": paper.get("skipped_rounds", []),
