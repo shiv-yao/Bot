@@ -11,6 +11,7 @@ from .api import create_app
 from .config import Settings
 from .dashboard5m import register_dashboard5m
 from .evaluation_api import register_evaluation_routes
+from .event_prediction import EventPredictionEngine, register_event_prediction_routes
 from .history_api import register_history_routes
 from .logging_utils import log_event, setup_logging
 from .measured_feeds import MeasuredFeedHub
@@ -42,6 +43,7 @@ async def run() -> None:
     executor = MeasuredPaperExecutor(settings, state, risk, portfolio)
     watchdog = RuntimeWatchdog(settings, state, risk, portfolio)
     snapshots = RuntimeSnapshotRecorder(state, risk, portfolio, interval_sec=60)
+    event_prediction = EventPredictionEngine(settings.gamma_api_url, settings.webhook_secret)
 
     async def evaluate() -> None:
         started_ms = now_ms()
@@ -69,6 +71,7 @@ async def run() -> None:
         asyncio.create_task(portfolio.mark_loop(), name="paper-portfolio-mark"),
         asyncio.create_task(watchdog.loop(), name="runtime-watchdog"),
         asyncio.create_task(snapshots.loop(), name="runtime-snapshots"),
+        asyncio.create_task(event_prediction.loop(), name="event-prediction-scanner"),
     ]
     tasks += [
         asyncio.create_task(executor.worker(i), name=f"executor-{i}")
@@ -85,6 +88,7 @@ async def run() -> None:
         register_history_routes(app, settings, portfolio)
         register_evaluation_routes(app, portfolio)
         register_snapshot_routes(app, snapshots)
+        register_event_prediction_routes(app, event_prediction)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
@@ -99,6 +103,7 @@ async def run() -> None:
         ai_mode="single_direction_yes_no",
         paper_profile="balanced_btc5m_hf",
         profile_version="2026-06-02.1",
+        event_prediction="paper_scanner",
         auto_discover_market=settings.auto_discover_market,
         rtds_feed="chainlink_btc_usd",
         binance_ws=settings.enable_binance_ws,
