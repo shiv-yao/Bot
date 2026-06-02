@@ -6,4 +6,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN pip install --no-cache-dir -e .
 EXPOSE 8080
-CMD ["python", "-m", "polymarket_latency_bot.main"]
+CMD ["python", "-m", "polymarket_latency_bot.btc5m_event_main"]
