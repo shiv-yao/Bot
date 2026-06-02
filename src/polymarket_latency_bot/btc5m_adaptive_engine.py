@@ -18,6 +18,8 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
     samples have been reviewed.
     """
 
+    STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V3_ADAPTIVE_GUARDED"
+
     def __init__(self, settings: Any, state: Any, db_path: str | None = None) -> None:
         super().__init__(settings, state, db_path=db_path)
         self.cooldown_enabled = self._env_bool("BTC5M_PAPER_ADAPTIVE_COOLDOWN_ENABLED", True)
@@ -39,6 +41,16 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
         active = self.cooldown_enabled and timestamp_ms < self.cooldown_until_ms
         async with self.state.lock:
             paper = dict(self.state.paper_portfolio or {})
+            rules = dict(paper.get("rules") or {})
+            rules.update({
+                "strategy": self.STRATEGY_NAME,
+                "adaptive_cooldown_enabled": self.cooldown_enabled,
+                "cooldown_after_losses": self.cooldown_after_losses,
+                "cooldown_sec": self.cooldown_sec,
+                "auto_tuning_enabled": False,
+                "analytics_min_samples": self.analytics_min_samples,
+            })
+            paper["rules"] = rules
             paper["analytics"] = analytics
             paper["adaptive_guard"] = {
                 "cooldown_enabled": self.cooldown_enabled,
