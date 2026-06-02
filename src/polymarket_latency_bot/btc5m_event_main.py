@@ -9,8 +9,9 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
+from .btc5m_adaptive_engine import BTC5mAdaptiveRoundPredictionEngine
+from .btc5m_performance import build_paper_analytics
 from .btc5m_prediction_market_ui import register_btc5m_prediction_market_ui
-from .btc5m_round_prediction import BTC5mRoundPredictionEngine
 from .config import Settings
 from .measured_feeds import MeasuredFeedHub
 from .models import Prediction, now_ms
@@ -20,8 +21,8 @@ from .runtime_profile import apply_balanced_btc5m_paper_profile
 from .state import BotState
 
 
-STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V2_GUARDED"
-MODE_NAME = "btc_5m_prediction_market_paper_scale_in_guarded"
+STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V3_ADAPTIVE_GUARDED"
+MODE_NAME = "btc_5m_prediction_market_paper_scale_in_adaptive_guarded"
 
 
 class ForecastIn(BaseModel):
@@ -81,13 +82,13 @@ def build_mode_status() -> dict[str, Any]:
     return {
         "mode": MODE_NAME,
         "strategy": STRATEGY_NAME,
-        "execution": "guarded_three_stage_scale_in_50_30_20",
+        "execution": "adaptive_guarded_three_stage_scale_in_50_30_20",
         "market": {"asset": "BTC", "interval_minutes": 5},
         "outputs": ["YES", "NO", "WAIT"],
         "rules": {
             "YES": "BTC close price is higher than BTC open price after 5 minutes",
             "NO": "BTC close price is lower than BTC open price after 5 minutes",
-            "WAIT": "A quality gate rejected the Paper entry",
+            "WAIT": "A quality gate or adaptive cooldown rejected the Paper entry",
             "max_entries_per_market": 3,
             "scale_in_weights": [0.50, 0.30, 0.20],
             "require_same_direction_revalidation": True,
@@ -95,6 +96,8 @@ def build_mode_status() -> dict[str, Any]:
             "require_fresh_book": True,
             "require_net_edge": True,
             "require_book_depth": True,
+            "adaptive_cooldown": True,
+            "auto_tuning_enabled": False,
             "settlement": "btc_close_vs_btc_open",
         },
         "safety": {
@@ -102,6 +105,7 @@ def build_mode_status() -> dict[str, Any]:
             "paper_orders_enabled": True,
             "paper_positions_enabled": True,
             "scale_in_enabled": True,
+            "adaptive_cooldown_enabled": True,
             "paper_only": True,
             "live_orders_enabled": False,
             "wallet_signing_enabled": False,
@@ -196,7 +200,7 @@ async def run() -> None:
     apply_balanced_btc5m_paper_profile(settings)
     state = BotState()
 
-    round_engine: BTC5mRoundPredictionEngine | None = None
+    round_engine: BTC5mAdaptiveRoundPredictionEngine | None = None
 
     async def evaluate() -> None:
         await state.record_event("prediction_evaluation")
@@ -205,10 +209,10 @@ async def run() -> None:
 
     feeds = MeasuredFeedHub(settings, state, evaluate)
     fusion = MultiSourceFusion(settings, state, feeds)
-    round_engine = BTC5mRoundPredictionEngine(settings, state)
+    round_engine = BTC5mAdaptiveRoundPredictionEngine(settings, state)
     await round_engine.publish_state()
 
-    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In Guarded")
+    app = FastAPI(title="Polymarket BTC 5m Prediction Market Paper Scale In Adaptive Guarded")
     register_btc5m_prediction_market_ui(app)
 
     @app.get("/", include_in_schema=False)
@@ -250,6 +254,22 @@ async def run() -> None:
             "skipped_wait": int(summary.get("skipped_wait", 0) or 0),
             "rejection_counts": summary.get("rejection_counts", {}),
             "sample_status": "collecting" if closed_trades < 100 else "review_ready",
+        }
+
+    @app.get("/paper/analytics")
+    async def paper_analytics() -> dict[str, Any]:
+        snapshot = await state.snapshot()
+        paper = snapshot.get("paper_portfolio", {}) or {}
+        analytics = build_paper_analytics(
+            paper,
+            cooldown_after_losses=round_engine.cooldown_after_losses,
+            min_samples_for_review=round_engine.analytics_min_samples,
+        )
+        return {
+            "mode": MODE_NAME,
+            "strategy": STRATEGY_NAME,
+            "analytics": analytics,
+            "adaptive_guard": paper.get("adaptive_guard", {}),
         }
 
     @app.get("/paper/rounds")
