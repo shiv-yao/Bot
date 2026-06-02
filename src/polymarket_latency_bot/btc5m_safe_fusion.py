@@ -4,13 +4,24 @@ from .multi_source import MultiSourceFusion
 
 
 class BTC5mSafeFusion(MultiSourceFusion):
-    """Add immediate neutralization when too few fresh BTC sources remain.
+    """Synchronize WAIT state whenever BTC fusion quality degrades.
 
     The base fusion engine already neutralizes outlier and regime failures. This
-    wrapper closes the remaining gap: when the fresh source count drops below the
-    minimum, an older directional prediction is replaced with WAIT immediately
-    rather than remaining actionable until its normal expiry.
+    wrapper also neutralizes insufficient-source states and keeps the fusion
+    snapshot aligned with the shared WAIT prediction so APIs and dashboards do
+    not accidentally display an older directional confidence.
     """
+
+    async def _publish_neutral_prediction(self, timestamp: int, reason: str) -> None:
+        await super()._publish_neutral_prediction(timestamp, reason)
+        async with self.state.lock:
+            snapshot = dict(self.state.fusion_snapshot or {})
+            snapshot["probability_up"] = 0.5
+            snapshot["confidence"] = 0.0
+            snapshot["neutralized"] = True
+            snapshot["neutralized_reason"] = reason
+            snapshot["timestamp_ms"] = timestamp
+            self.state.fusion_snapshot = snapshot
 
     async def _publish_fusion(self, timestamp: int) -> None:
         await super()._publish_fusion(timestamp)
