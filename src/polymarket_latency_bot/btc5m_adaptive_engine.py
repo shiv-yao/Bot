@@ -13,7 +13,7 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
 
     The base scale-in logic remains unchanged. After a configurable number of
     consecutive losing rounds, this wrapper temporarily pauses new evaluations.
-    It exposes analytics and cooldown state through the Paper portfolio payload.
+    Existing Paper rounds continue to settle while the cooldown is active.
     Threshold auto-tuning intentionally remains disabled until enough Paper
     samples have been reviewed.
     """
@@ -70,6 +70,10 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
 
         active = self.cooldown_enabled and timestamp < self.cooldown_until_ms
         if active:
+            prices = await self._btc_prices()
+            if prices:
+                await self.settle_due_rounds(prices)
+            analytics = await self._analytics()
             self.last_reason = "adaptive_cooldown_active"
             await super().publish_state()
             await self._publish_adaptive_guard(analytics, timestamp)
@@ -77,7 +81,7 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
                 previous = self.state.last_order_result or {}
                 if previous.get("reason") != "adaptive_cooldown_active":
                     self.state.last_order_result = {
-                        "mode": "btc_5m_prediction_market_paper_scale_in_guarded",
+                        "mode": "btc_5m_prediction_market_paper_scale_in_adaptive_guarded",
                         "accepted": False,
                         "reason": "adaptive_cooldown_active",
                         "cooldown_until_ms": self.cooldown_until_ms,
