@@ -12,10 +12,11 @@ from pydantic import BaseModel, Field
 from .btc5m_adaptive_engine import BTC5mAdaptiveRoundPredictionEngine
 from .btc5m_performance import build_paper_analytics
 from .btc5m_prediction_market_ui import register_btc5m_prediction_market_ui
+from .btc5m_safe_fusion import BTC5mSafeFusion
 from .config import Settings
 from .measured_feeds import MeasuredFeedHub
 from .models import Prediction, now_ms
-from .multi_source import MultiSourceFusion, binance_ws_loop, coinbase_ws_loop
+from .multi_source import binance_ws_loop, coinbase_ws_loop
 from .rtds_chainlink import chainlink_rtds_loop
 from .runtime_profile import apply_balanced_btc5m_paper_profile
 from .state import BotState
@@ -208,7 +209,7 @@ async def run() -> None:
             await round_engine.evaluate()
 
     feeds = MeasuredFeedHub(settings, state, evaluate)
-    fusion = MultiSourceFusion(settings, state, feeds)
+    fusion = BTC5mSafeFusion(settings, state, feeds)
     round_engine = BTC5mAdaptiveRoundPredictionEngine(settings, state)
     await round_engine.publish_state()
 
