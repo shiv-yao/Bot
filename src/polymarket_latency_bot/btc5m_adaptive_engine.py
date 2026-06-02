@@ -3,20 +3,20 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .btc5m_hardened_round_prediction import BTC5mHardenedRoundPredictionEngine
 from .btc5m_performance import build_paper_analytics
-from .btc5m_round_prediction import BTC5mRoundPredictionEngine
 from .models import now_ms
 
 
-class BTC5mAdaptiveRoundPredictionEngine(BTC5mRoundPredictionEngine):
-    """Run guarded Paper scale-in with observational analytics only.
+class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
+    """Run V4 hardened Paper scale-in with observational analytics only.
 
     Adaptive cooldown is intentionally disabled. Loss streaks, calibration,
     drift and walk-forward diagnostics remain visible for review, but they do
     not pause new Paper evaluations or alter strategy thresholds automatically.
     """
 
-    STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V3_ADAPTIVE_GUARDED"
+    STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V4_HARDENED"
 
     def __init__(self, settings: Any, state: Any, db_path: str | None = None) -> None:
         super().__init__(settings, state, db_path=db_path)
