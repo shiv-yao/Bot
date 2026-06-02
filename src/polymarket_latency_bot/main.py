@@ -10,6 +10,7 @@ from .ai_api import register_ai_routes
 from .api import create_app
 from .config import Settings
 from .dashboard5m import register_dashboard5m
+from .history_api import register_history_routes
 from .logging_utils import log_event, setup_logging
 from .measured_feeds import MeasuredFeedHub
 from .models import now_ms
@@ -77,6 +78,7 @@ async def run() -> None:
         register_ops_routes(app, settings, state, feeds, risk, portfolio)
         register_watchdog_routes(app, watchdog)
         register_ai_routes(app, settings, state)
+        register_history_routes(app, settings, portfolio)
         server = uvicorn.Server(
             uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning")
         )
