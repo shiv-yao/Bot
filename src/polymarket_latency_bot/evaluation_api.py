@@ -5,6 +5,15 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+
+EVALUATION_HTML = r"""
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BTC 5m Evaluation</title><style>
+body{margin:0;background:#07111f;color:#eef5ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:900px;margin:auto;padding:14px}.card{background:#10213a;border:1px solid #2a405e;border-radius:18px;padding:14px;margin-top:12px}.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(159,178,204,.18)}.muted{color:#9fb2cc}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}a{color:#b9e6ff}
+</style></head><body><main class="wrap"><h1>BTC 5m Balanced HF 評估</h1><p class="muted">新 5 分鐘策略與舊歷史分開統計，不會合併。</p><section class="card"><h2>樣本階段</h2><div id="stage"></div><p id="recommendation" class="muted"></p></section><section class="card"><h2>新 5 分鐘序列</h2><div id="current"></div></section><section class="card"><h2>舊歷史序列</h2><div id="legacy"></div></section><section class="card"><div class="mono"><a href="/dashboard5m">/dashboard5m</a> · <a href="/evaluation/status">/evaluation/status</a> · <a href="/performance/compare">/performance/compare</a> · <a href="/history/status">/history/status</a></div></section></main><script>
+const $=id=>document.getElementById(id);const pct=x=>Number.isFinite(Number(x))?`${(Number(x)*100).toFixed(2)}%`:'—';const usd=x=>Number.isFinite(Number(x))?`$${Number(x).toFixed(4)}`:'—';const row=(a,b)=>`<div class="row"><span>${a}</span><strong>${b}</strong></div>`;const summary=x=>row('資料庫',x.db_path||'—')+row('已平倉',x.closed_trades||0)+row('勝率',pct(x.win_rate||0))+row('淨 PnL',usd(x.net_pnl||0))+row('Profit Factor',x.profit_factor??'—');async function refresh(){const [e,c]=await Promise.all([fetch('/evaluation/status',{cache:'no-store'}).then(r=>r.json()),fetch('/performance/compare',{cache:'no-store'}).then(r=>r.json())]);$('stage').innerHTML=row('Profile',e.profile||'—')+row('階段',e.stage||'—')+row('最低樣本',e.minimum_initial_sample||0)+row('建議複核樣本',e.preferred_review_sample||0);$('recommendation').textContent=e.recommendation||'';$('current').innerHTML=summary(c.current||{});$('legacy').innerHTML=summary(c.legacy_15m_history||{})}refresh();setInterval(refresh,3000)</script></body></html>
+"""
 
 
 def _empty_summary(path: str, exists: bool) -> dict[str, Any]:
@@ -70,6 +79,10 @@ def _read_summary(path: str) -> dict[str, Any]:
 
 def register_evaluation_routes(app: FastAPI, portfolio: Any) -> None:
     legacy_path = "/data/polymarket_paper.db"
+
+    @app.get("/evaluation", response_class=HTMLResponse)
+    async def evaluation_dashboard() -> HTMLResponse:
+        return HTMLResponse(EVALUATION_HTML)
 
     @app.get("/performance/compare")
     async def performance_compare() -> dict[str, Any]:
