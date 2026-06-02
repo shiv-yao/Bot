@@ -62,6 +62,39 @@ class BTC5mPerformanceTests(unittest.TestCase):
         self.assertEqual(analytics["cooldown"]["consecutive_round_losses"], 0)
         self.assertEqual(analytics["sample_status"], "review_ready")
 
+    def test_review_recommendations_require_enough_group_samples(self) -> None:
+        rounds = []
+        for index in range(10):
+            won = index < 3
+            rounds.append(settled(f"r{index}", index, won, [order(2, 0.013, won, direction="NO")]))
+        paper = {"closed_trades": rounds}
+        analytics = build_paper_analytics(
+            paper,
+            min_group_samples_for_review=10,
+            review_win_rate_threshold=0.45,
+        )
+        stage_reviews = analytics["review"]["recommendations"]["scale_stage"]
+        self.assertEqual(len(stage_reviews), 1)
+        self.assertEqual(stage_reviews[0]["group"], "stage_2")
+        self.assertEqual(stage_reviews[0]["action"], "review_only")
+        self.assertIn("win_rate_below_review_threshold", stage_reviews[0]["reasons"])
+        self.assertIn("negative_pnl", stage_reviews[0]["reasons"])
+        self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
+
+    def test_review_does_not_flag_small_groups(self) -> None:
+        paper = {
+            "closed_trades": [
+                settled("r1", 1000, False, [order(3, 0.020, False)]),
+                settled("r2", 2000, False, [order(3, 0.020, False)]),
+            ]
+        }
+        analytics = build_paper_analytics(
+            paper,
+            min_group_samples_for_review=3,
+            review_win_rate_threshold=0.99,
+        )
+        self.assertEqual(analytics["review"]["recommendation_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
