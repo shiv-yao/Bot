@@ -149,6 +149,43 @@ class BTC5mPerformanceTests(unittest.TestCase):
         self.assertIsNotNone(analytics["review"]["drift"])
         self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
 
+    def test_walk_forward_collects_until_both_segments_are_large_enough(self) -> None:
+        rounds = []
+        for index in range(8):
+            rows = [order(1, 0.020, True, probability=0.75, created_ms=index)]
+            rounds.append(settled(f"r{index}", index, True, rows))
+        analytics = build_paper_analytics(
+            {"closed_trades": rounds},
+            walk_forward_train_min_samples=10,
+            walk_forward_validation_samples=5,
+        )
+        walk_forward = analytics["walk_forward"]
+        self.assertEqual(walk_forward["status"], "collecting")
+        self.assertFalse(walk_forward["review_only"])
+        self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
+
+    def test_walk_forward_validation_deterioration_is_review_only(self) -> None:
+        rounds = []
+        for index in range(25):
+            won = index < 20
+            probability = 0.80 if index < 20 else 0.90
+            rows = [order(1, 0.020, won, probability=probability, created_ms=index)]
+            rounds.append(settled(f"r{index}", index, won, rows))
+        analytics = build_paper_analytics(
+            {"closed_trades": rounds},
+            walk_forward_train_min_samples=20,
+            walk_forward_validation_samples=5,
+            walk_forward_win_rate_drop_threshold=0.10,
+            walk_forward_brier_increase_threshold=0.01,
+        )
+        walk_forward = analytics["walk_forward"]
+        self.assertEqual(walk_forward["status"], "ready")
+        self.assertTrue(walk_forward["review_only"])
+        self.assertIn("validation_win_rate_below_baseline", walk_forward["reasons"])
+        self.assertIn("validation_brier_worse_than_baseline", walk_forward["reasons"])
+        self.assertIsNotNone(analytics["review"]["walk_forward"])
+        self.assertFalse(analytics["guidance"]["auto_tuning_enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()
