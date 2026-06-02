@@ -4,7 +4,7 @@ from typing import Any
 
 from . import btc5m_event_main as legacy
 from .btc5m_analytics_v4 import build_paper_analytics as build_v4_paper_analytics
-from .btc5m_prediction_market_ui_v4 import register_btc5m_prediction_market_ui_v4
+from .btc5m_prediction_market_ui_v4_linked import register_btc5m_prediction_market_ui_v4
 from .btc5m_selfcheck import register_btc5m_selfcheck
 
 
