@@ -6,9 +6,10 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
+from .btc5m_event_ui import register_btc5m_event_ui
 from .config import Settings
 from .measured_feeds import MeasuredFeedHub
 from .models import Prediction, now_ms
@@ -21,14 +22,6 @@ from .state import BotState
 class ForecastIn(BaseModel):
     probability_up: float = Field(ge=0, le=1)
     confidence: float = Field(default=0.7, ge=0, le=1)
-
-
-HTML = """
-<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>BTC 5m Event Prediction</title><style>
-body{margin:0;background:#07111f;color:#eef5ff;font-family:system-ui}.wrap{max-width:900px;margin:auto;padding:16px}.card{background:#10213a;border:1px solid #2a405e;border-radius:18px;padding:14px;margin:12px 0}.row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(159,178,204,.18)}.value{font-size:30px;font-weight:900}.muted{color:#9fb2cc}.mono{font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}a{color:#b9e6ff}
-</style></head><body><main class='wrap'><h1>BTC 5m Event Prediction</h1><p class='muted'>只判斷 BTC 5 分鐘漲跌 · YES / NO / WAIT · Prediction only</p><section class='card'><div class='muted'>AI 判斷</div><div id='direction' class='value'>WAIT</div><div id='prob' class='muted'></div></section><section class='card'><h2>市場</h2><div class='row'><span>狀態</span><b id='status'>—</b></div><div class='row'><span>Slug</span><b id='slug' class='mono'>—</b></div><div class='row'><span>問題</span><b id='question' class='mono'>—</b></div></section><section class='card'><h2>來源</h2><pre id='sources' class='mono'></pre></section><section class='card'><div class='mono'><a href='/status'>/status</a> · <a href='/mode'>/mode</a> · <a href='/healthz'>/healthz</a> · <a href='/docs'>/docs</a></div></section></main><script>
-const pct=x=>Number.isFinite(Number(x))?`${(Number(x)*100).toFixed(2)}%`:'—';async function refresh(){const r=await fetch('/status',{cache:'no-store'}).then(x=>x.json());document.getElementById('direction').textContent=r.ai.direction;document.getElementById('prob').textContent=`上漲機率 ${pct(r.ai.probability_up)} · 信心 ${pct(r.ai.confidence)} · Edge ${pct(r.ai.selected_edge)}`;document.getElementById('status').textContent=r.market.discovery_status;document.getElementById('slug').textContent=(r.market.current||{}).slug||'—';document.getElementById('question').textContent=(r.market.current||{}).question||'—';document.getElementById('sources').textContent=JSON.stringify(r.sources,null,2)}refresh();setInterval(refresh,2000)</script></body></html>
-"""
 
 
 def _secret_ready(value: str) -> bool:
@@ -107,10 +100,11 @@ async def run() -> None:
     feeds = MeasuredFeedHub(settings, state, evaluate)
     fusion = MultiSourceFusion(settings, state, feeds)
     app = FastAPI(title="BTC 5m Event Prediction")
+    register_btc5m_event_ui(app)
 
-    @app.get("/", response_class=HTMLResponse)
-    async def dashboard() -> HTMLResponse:
-        return HTMLResponse(HTML)
+    @app.get("/", include_in_schema=False)
+    async def dashboard() -> RedirectResponse:
+        return RedirectResponse(url="/ui", status_code=307)
 
     @app.get("/mode")
     async def mode() -> dict[str, Any]:
