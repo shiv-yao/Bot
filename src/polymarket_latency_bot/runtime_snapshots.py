@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,17 @@ from .models import now_ms
 
 PROFILE_NAME = "balanced_btc5m_hf"
 PROFILE_VERSION = "2026-06-02.1"
+
+
+def _to_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if is_dataclass(value):
+        return asdict(value)
+    data = getattr(value, "__dict__", None)
+    if isinstance(data, dict):
+        return dict(data)
+    return {"value": str(value)}
 
 
 class RuntimeSnapshotStore:
@@ -106,7 +117,7 @@ class RuntimeSnapshotRecorder:
     async def capture(self) -> dict[str, Any]:
         snapshot = await self.state.snapshot()
         async with self.risk.lock:
-            risk_snapshot = asdict(self.risk.snapshot)
+            risk_snapshot = _to_dict(self.risk.snapshot)
         paper_summary = (snapshot.get("paper_portfolio") or {}).get("summary", {})
         strategy = snapshot.get("last_strategy_snapshot") or {}
         payload = {
