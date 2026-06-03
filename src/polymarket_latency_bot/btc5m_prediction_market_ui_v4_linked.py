@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse
 from .btc5m_prediction_market_ui_v4 import DASHBOARD_HTML_V4
 
 
-UI_BUILD = "btc5m-v4-health-20260603-1"
+UI_BUILD = "btc5m-v4-health-20260603-2"
 _STATUS_FETCH = "const [s,m]=await Promise.all([fetch('/status',{cache:'no-store'}).then(r=>r.json()),fetch('/mode',{cache:'no-store'}).then(r=>r.json())]);"
 _STATUS_FETCH_ROBUST = "const statusResponse=await fetch('/status',{cache:'no-store'});if(!statusResponse.ok)throw new Error('status_unavailable');const s=await statusResponse.json();let m={};try{const modeResponse=await fetch('/mode',{cache:'no-store'});if(modeResponse.ok)m=await modeResponse.json()}catch(_){m={}};refreshFailures=0;lastSuccessAt=Date.now();"
 _CATCH_OFFLINE = "}catch(e){$('system').textContent='OFFLINE';$('system').className='pill no'}}"
@@ -22,13 +22,15 @@ _NO_STORE_HEADERS = {
 
 
 def build_dashboard_html_v4() -> str:
-    """Add selfcheck, reconnect tolerance, freshness diagnostics and a visible build stamp."""
+    """Add health shortcuts, reconnect tolerance, freshness diagnostics and a visible build stamp."""
 
     html = DASHBOARD_HTML_V4
     marker = '<a href="/docs">/docs</a>'
-    shortcut = '<a href="/selfcheck">/selfcheck</a>'
-    if shortcut not in html:
-        html = html.replace(marker, f"{shortcut}{marker}")
+    shortcuts = '<a href="/selfcheck">/selfcheck</a><a href="/runtime-health">/runtime-health</a>'
+    if '<a href="/selfcheck">/selfcheck</a>' not in html:
+        html = html.replace(marker, f"{shortcuts}{marker}")
+    elif '<a href="/runtime-health">/runtime-health</a>' not in html:
+        html = html.replace('<a href="/selfcheck">/selfcheck</a>', shortcuts)
     if 'id="freshnessStatus"' not in html:
         html = html.replace('<article class="card"><a href="/mode">', f'{_SOURCE_HEALTH_CARD}<article class="card"><a href="/mode">')
     if "let refreshFailures=0,lastSuccessAt=0;" not in html:
