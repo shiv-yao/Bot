@@ -12,6 +12,43 @@ class BTC5mV4LinkedUITests(unittest.TestCase):
         self.assertEqual(html.count('<a href="/selfcheck">/selfcheck</a>'), 1)
         self.assertIn('<a href="/docs">/docs</a>', html)
 
+    def test_dashboard_contains_source_health_card(self) -> None:
+        html = build_dashboard_html_v4()
+        for expected in (
+            "即時資料健康",
+            "資料狀態",
+            "最後成功更新",
+            "Connected Sources",
+            "Clean Fusion Sources",
+            "Fusion Status",
+            "最舊盤口資料",
+            "來源摘要",
+        ):
+            self.assertIn(expected, html)
+
+    def test_dashboard_distinguishes_active_degraded_stale_and_reconnecting(self) -> None:
+        html = build_dashboard_html_v4()
+        for expected in (
+            "SYSTEM ACTIVE",
+            "DEGRADED",
+            "STALE DATA",
+            "RECONNECTING",
+            "OFFLINE",
+        ):
+            self.assertIn(expected, html)
+        self.assertIn("oldestBookAge>5000", html)
+        self.assertIn("fusionState!=='ready'", html)
+        self.assertIn("cleanSources<2", html)
+        self.assertIn("connectedCount<2", html)
+        self.assertIn("refreshFailures>=3", html)
+
+    def test_status_is_primary_and_mode_failure_is_tolerated(self) -> None:
+        html = build_dashboard_html_v4()
+        self.assertIn("const statusResponse=await fetch('/status'", html)
+        self.assertIn("if(!statusResponse.ok)throw new Error('status_unavailable')", html)
+        self.assertIn("try{const modeResponse=await fetch('/mode'", html)
+        self.assertIn("catch(_){m={}}", html)
+
 
 if __name__ == "__main__":
     unittest.main()
