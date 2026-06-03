@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import unittest
 
-from polymarket_latency_bot.btc5m_prediction_market_ui_v4_linked import build_dashboard_html_v4
+from fastapi import FastAPI
+
+from polymarket_latency_bot.btc5m_prediction_market_ui_v4_linked import (
+    UI_BUILD,
+    _NO_STORE_HEADERS,
+    build_dashboard_html_v4,
+    register_btc5m_prediction_market_ui_v4,
+)
 
 
 class BTC5mV4LinkedUITests(unittest.TestCase):
-    def test_dashboard_inserts_selfcheck_link_once(self) -> None:
+    def test_dashboard_inserts_health_links_once(self) -> None:
         html = build_dashboard_html_v4()
         self.assertIn('<a href="/selfcheck">/selfcheck</a>', html)
+        self.assertIn('<a href="/runtime-health">/runtime-health</a>', html)
         self.assertEqual(html.count('<a href="/selfcheck">/selfcheck</a>'), 1)
+        self.assertEqual(html.count('<a href="/runtime-health">/runtime-health</a>'), 1)
         self.assertIn('<a href="/docs">/docs</a>', html)
 
     def test_dashboard_contains_source_health_card(self) -> None:
@@ -23,6 +32,8 @@ class BTC5mV4LinkedUITests(unittest.TestCase):
             "Fusion Status",
             "最舊盤口資料",
             "來源摘要",
+            "UI Build",
+            UI_BUILD,
         ):
             self.assertIn(expected, html)
 
@@ -48,6 +59,15 @@ class BTC5mV4LinkedUITests(unittest.TestCase):
         self.assertIn("if(!statusResponse.ok)throw new Error('status_unavailable')", html)
         self.assertIn("try{const modeResponse=await fetch('/mode'", html)
         self.assertIn("catch(_){m={}}", html)
+
+    def test_ui_route_uses_no_store_headers(self) -> None:
+        app = FastAPI()
+        register_btc5m_prediction_market_ui_v4(app)
+        route = next(route for route in app.routes if getattr(route, "path", None) == "/ui")
+        response = route.endpoint()
+        self.assertEqual(response.headers["cache-control"], _NO_STORE_HEADERS["Cache-Control"])
+        self.assertEqual(response.headers["pragma"], _NO_STORE_HEADERS["Pragma"])
+        self.assertEqual(response.headers["expires"], _NO_STORE_HEADERS["Expires"])
 
 
 if __name__ == "__main__":
