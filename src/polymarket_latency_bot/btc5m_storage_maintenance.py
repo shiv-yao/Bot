@@ -46,7 +46,9 @@ class BTC5mStorageMaintenance:
     """Bound SQLite history growth and expose read-only volume diagnostics.
 
     Only the active BTC 5m table is pruned. Unknown files are listed for
-    diagnostics but are never deleted automatically.
+    diagnostics but are never deleted automatically. Between maintenance
+    windows, all status reads are served from memory to avoid slowing the
+    prediction loop with repeated SQLite queries.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -125,7 +127,7 @@ class BTC5mStorageMaintenance:
     def maybe_run(self, *, force: bool = False) -> dict[str, Any]:
         timestamp = _now_ms()
         if not force and self.last_run_ms and timestamp - self.last_run_ms < self.maintenance_interval_sec * 1000:
-            return self.get_report()
+            return self.get_cached_report()
 
         deleted_rows = 0
         vacuumed = False
@@ -166,7 +168,9 @@ class BTC5mStorageMaintenance:
             self.last_error = f"{type(exc).__name__}: {exc}"
         return self._report(row_count=row_count, deleted_rows=deleted_rows, vacuumed=vacuumed)
 
-    def get_report(self) -> dict[str, Any]:
+    def get_cached_report(self) -> dict[str, Any]:
+        if self.last_report:
+            return dict(self.last_report)
         return self._report()
 
 
