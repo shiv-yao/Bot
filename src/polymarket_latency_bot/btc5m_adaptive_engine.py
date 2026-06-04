@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
 from .btc5m_analytics_v4 import build_paper_analytics
 from .btc5m_hardened_round_prediction import BTC5mHardenedRoundPredictionEngine
+from .btc5m_storage_maintenance import BTC5mStorageMaintenance
 from .models import now_ms
 
 
@@ -41,6 +43,9 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
         self.walk_forward_brier_increase_threshold = min(1.0, max(0.0, float(os.getenv("BTC5M_PAPER_WALK_FORWARD_BRIER_INCREASE_THRESHOLD", "0.05"))))
         self.cooldown_until_ms = 0
         self.cooldown_trigger_round: str | None = None
+        self.storage_maintenance = BTC5mStorageMaintenance(self.db_path)
+        # Run once during startup so an already-full volume is handled promptly.
+        self.storage_maintenance.maybe_run(force=True)
 
     def _record_shadow_decisions(self, item: Any, quality: dict[str, Any], notional: float) -> None:
         """Keep Shadow A/B observational data aligned with executable V4 quality."""
@@ -106,9 +111,13 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
                 "walk_forward_validation_samples": self.walk_forward_validation_samples,
                 "walk_forward_win_rate_drop_threshold": self.walk_forward_win_rate_drop_threshold,
                 "walk_forward_brier_increase_threshold": self.walk_forward_brier_increase_threshold,
+                "storage_retention_enabled": True,
+                "storage_retention_rounds": self.storage_maintenance.retain_rounds,
+                "storage_maintenance_interval_sec": self.storage_maintenance.maintenance_interval_sec,
             })
             paper["rules"] = rules
             paper["analytics"] = analytics
+            paper["storage"] = self.storage_maintenance.get_report()
             paper["adaptive_guard"] = {
                 "cooldown_enabled": False,
                 "cooldown_active": active,
@@ -136,5 +145,6 @@ class BTC5mAdaptiveRoundPredictionEngine(BTC5mHardenedRoundPredictionEngine):
 
     async def evaluate(self) -> None:
         await super().evaluate()
+        await asyncio.to_thread(self.storage_maintenance.maybe_run)
         analytics = await self._analytics()
         await self._publish_adaptive_guard(analytics, now_ms())
