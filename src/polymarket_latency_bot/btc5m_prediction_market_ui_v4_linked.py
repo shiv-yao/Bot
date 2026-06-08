@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse
 from .btc5m_prediction_market_ui_v4 import DASHBOARD_HTML_V4
 
 
-UI_BUILD = "btc5m-v4-health-20260603-2"
+UI_BUILD = "btc5m-v4-poly-integrations-20260608-1"
 _STATUS_FETCH = "const [s,m]=await Promise.all([fetch('/status',{cache:'no-store'}).then(r=>r.json()),fetch('/mode',{cache:'no-store'}).then(r=>r.json())]);"
 _STATUS_FETCH_ROBUST = "const statusResponse=await fetch('/status',{cache:'no-store'});if(!statusResponse.ok)throw new Error('status_unavailable');const s=await statusResponse.json();let m={};try{const modeResponse=await fetch('/mode',{cache:'no-store'});if(modeResponse.ok)m=await modeResponse.json()}catch(_){m={}};refreshFailures=0;lastSuccessAt=Date.now();"
 _CATCH_OFFLINE = "}catch(e){$('system').textContent='OFFLINE';$('system').className='pill no'}}"
@@ -22,15 +22,30 @@ _NO_STORE_HEADERS = {
 
 
 def build_dashboard_html_v4() -> str:
-    """Add health shortcuts, reconnect tolerance, freshness diagnostics and a visible build stamp."""
+    """Add health and integration shortcuts without rewriting the base dashboard."""
 
     html = DASHBOARD_HTML_V4
     marker = '<a href="/docs">/docs</a>'
-    shortcuts = '<a href="/selfcheck">/selfcheck</a><a href="/runtime-health">/runtime-health</a>'
-    if '<a href="/selfcheck">/selfcheck</a>' not in html:
-        html = html.replace(marker, f"{shortcuts}{marker}")
-    elif '<a href="/runtime-health">/runtime-health</a>' not in html:
-        html = html.replace('<a href="/selfcheck">/selfcheck</a>', shortcuts)
+    shortcuts = (
+        '<a href="/selfcheck">/selfcheck</a>'
+        '<a href="/runtime-health">/runtime-health</a>'
+        '<a href="/storage-health">/storage-health</a>'
+        '<a href="/integrations">/integrations</a>'
+        '<a href="/integrations/poly-data">/poly-data</a>'
+        '<a href="/integrations/poly-maker-shadow">/poly-maker-shadow</a>'
+    )
+    for href in (
+        '/selfcheck',
+        '/runtime-health',
+        '/storage-health',
+        '/integrations',
+        '/integrations/poly-data',
+        '/integrations/poly-maker-shadow',
+    ):
+        label = href if href not in {'/integrations/poly-data', '/integrations/poly-maker-shadow'} else ('/poly-data' if href.endswith('poly-data') else '/poly-maker-shadow')
+        link = f'<a href="{href}">{label}</a>'
+        if link not in html:
+            html = html.replace(marker, f'{link}{marker}')
     if 'id="freshnessStatus"' not in html:
         html = html.replace('<article class="card"><a href="/mode">', f'{_SOURCE_HEALTH_CARD}<article class="card"><a href="/mode">')
     if "let refreshFailures=0,lastSuccessAt=0;" not in html:
