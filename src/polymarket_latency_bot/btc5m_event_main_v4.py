@@ -7,6 +7,7 @@ from .btc5m_analytics_v4 import build_paper_analytics as build_v4_paper_analytic
 from .btc5m_prediction_market_ui_v4_linked import register_btc5m_prediction_market_ui_v4
 from .btc5m_runtime_health import register_btc5m_runtime_health, update_runtime_health
 from .btc5m_selfcheck import register_btc5m_selfcheck
+from .btc5m_storage_maintenance import register_btc5m_storage_health
 
 
 legacy.STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V4_HARDENED"
@@ -20,6 +21,7 @@ def register_v4_ui_selfcheck_and_health(app: Any) -> None:
     register_btc5m_prediction_market_ui_v4(app)
     register_btc5m_selfcheck(app)
     register_btc5m_runtime_health(app)
+    register_btc5m_storage_health(app)
 
 
 legacy.register_btc5m_prediction_market_ui = register_v4_ui_selfcheck_and_health
@@ -38,6 +40,7 @@ def build_mode_status() -> dict[str, Any]:
         "validate_btc_open_close_quality": True,
         "shadow_ab_enabled": True,
         "adaptive_cooldown": False,
+        "storage_retention_enabled": True,
     })
     payload["safety"]["adaptive_cooldown_enabled"] = False
     return payload
