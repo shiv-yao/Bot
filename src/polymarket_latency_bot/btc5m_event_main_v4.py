@@ -8,6 +8,7 @@ from .btc5m_prediction_market_ui_v4_linked import register_btc5m_prediction_mark
 from .btc5m_runtime_health import register_btc5m_runtime_health, update_runtime_health
 from .btc5m_selfcheck import register_btc5m_selfcheck
 from .btc5m_storage_maintenance import register_btc5m_storage_health
+from .poly_integrations import register_poly_integrations, update_poly_integrations
 
 
 legacy.STRATEGY_NAME = "BTC_5M_EVENT_SCALE_IN_V4_HARDENED"
@@ -22,6 +23,7 @@ def register_v4_ui_selfcheck_and_health(app: Any) -> None:
     register_btc5m_selfcheck(app)
     register_btc5m_runtime_health(app)
     register_btc5m_storage_health(app)
+    register_poly_integrations(app)
 
 
 legacy.register_btc5m_prediction_market_ui = register_v4_ui_selfcheck_and_health
@@ -41,14 +43,23 @@ def build_mode_status() -> dict[str, Any]:
         "shadow_ab_enabled": True,
         "adaptive_cooldown": False,
         "storage_retention_enabled": True,
+        "poly_data_sidecar_supported": True,
+        "poly_maker_shadow_enabled": True,
     })
-    payload["safety"]["adaptive_cooldown_enabled"] = False
+    payload["safety"].update({
+        "adaptive_cooldown_enabled": False,
+        "poly_data_sidecar_read_only": True,
+        "poly_maker_shadow_only": True,
+        "poly_maker_live_execution_enabled": False,
+    })
     return payload
 
 
 async def build_status(settings: Any, state: Any) -> dict[str, Any]:
     payload = await _legacy_build_status(settings, state)
+    raw_snapshot = await state.snapshot()
     update_runtime_health(payload)
+    payload["integrations"] = update_poly_integrations(payload, raw_snapshot)
     return payload
 
 
