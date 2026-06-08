@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -80,11 +82,11 @@ def _imbalance(bid_depth: float, ask_depth: float) -> float | None:
 
 
 class PolyDataSidecarAdapter:
-    """Read sidecar output produced by warproxxx/poly_data without copying GPL code.
+    """Read output produced by warproxxx/poly_data without copying GPL code.
 
-    The adapter is intentionally file-based. The upstream project runs as a
-    separate process or Railway service and writes its own data files. This
-    project only inspects metadata and never mutates upstream files.
+    The upstream pipeline remains a separate service or process. This adapter
+    reads either a remote JSON manifest or local generated files. It never
+    imports, mutates or executes upstream code.
     """
 
     def __init__(self) -> None:
@@ -94,10 +96,62 @@ class PolyDataSidecarAdapter:
         self.orders_path = Path(os.getenv("POLY_DATA_ORDERS_PATH", str(self.root / "data" / "orderFilled.csv")))
         self.trades_path = Path(os.getenv("POLY_DATA_TRADES_PATH", str(self.root / "processed" / "trades.csv")))
         self.cursor_path = Path(os.getenv("POLY_DATA_CURSOR_PATH", str(self.root / "data" / "cursor_state.json")))
+        self.manifest_url = os.getenv("POLY_DATA_SIDECAR_MANIFEST_URL", "").strip()
+        self.manifest_token = os.getenv("POLY_DATA_SIDECAR_MANIFEST_TOKEN", "").strip()
+        self.request_timeout_sec = max(1.0, float(os.getenv("POLY_DATA_SIDECAR_TIMEOUT_SEC", "3")))
         self.max_stale_sec = max(60, int(os.getenv("POLY_DATA_MAX_STALE_SEC", "900")))
 
-    def snapshot(self, *, timestamp_ms: int | None = None) -> dict[str, Any]:
-        timestamp = int(timestamp_ms if timestamp_ms is not None else _now_ms())
+    def _remote_snapshot(self, *, timestamp_ms: int) -> dict[str, Any]:
+        headers = {"Accept": "application/json", "User-Agent": "btc5m-v4-poly-data-adapter"}
+        if self.manifest_token:
+            headers["Authorization"] = f"Bearer {self.manifest_token}"
+        request = Request(self.manifest_url, headers=headers)
+        try:
+            with urlopen(request, timeout=self.request_timeout_sec) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            manifest = dict(payload) if isinstance(payload, dict) else {}
+            manifest_updated_ms = int(manifest.get("updated_at_ms") or 0)
+            age_ms = timestamp_ms - manifest_updated_ms if manifest_updated_ms > 0 else None
+            stale = age_ms is None or age_ms > self.max_stale_sec * 1000
+            upstream_ready = bool(manifest.get("ready", manifest.get("ok", False)))
+            status = "stale" if stale else ("ready" if upstream_ready else str(manifest.get("status") or "not_ready"))
+            return {
+                "enabled": self.enabled,
+                "status": status,
+                "ready": status == "ready",
+                "repository": POLY_DATA_REPOSITORY,
+                "integration_mode": "separate_sidecar_remote_manifest_read_only",
+                "manifest_url": self.manifest_url,
+                "latest_file_age_ms": age_ms,
+                "max_stale_sec": self.max_stale_sec,
+                "manifest": manifest,
+                "license_boundary": "GPL-3.0 upstream runs separately; this adapter reads a standard JSON manifest only.",
+                "safety": {
+                    "read_only": True,
+                    "mutates_upstream_files": False,
+                    "places_orders": False,
+                    "wallet_signing": False,
+                },
+            }
+        except (HTTPError, URLError, TimeoutError, ValueError, TypeError, OSError) as exc:
+            return {
+                "enabled": self.enabled,
+                "status": "manifest_unavailable",
+                "ready": False,
+                "repository": POLY_DATA_REPOSITORY,
+                "integration_mode": "separate_sidecar_remote_manifest_read_only",
+                "manifest_url": self.manifest_url,
+                "error": f"{type(exc).__name__}: {exc}",
+                "license_boundary": "GPL-3.0 upstream runs separately; this adapter reads a standard JSON manifest only.",
+                "safety": {
+                    "read_only": True,
+                    "mutates_upstream_files": False,
+                    "places_orders": False,
+                    "wallet_signing": False,
+                },
+            }
+
+    def _local_snapshot(self, *, timestamp_ms: int) -> dict[str, Any]:
         files = {
             "markets": self.markets_path,
             "orders": self.orders_path,
@@ -117,12 +171,10 @@ class PolyDataSidecarAdapter:
                 "modified_ms": mtime_ms,
             }
         cursor = _read_json(self.cursor_path)
-        age_ms = timestamp - newest_mtime_ms if newest_mtime_ms is not None else None
+        age_ms = timestamp_ms - newest_mtime_ms if newest_mtime_ms is not None else None
         stale = age_ms is None or age_ms > self.max_stale_sec * 1000
         required_present = self.markets_path.exists() and self.orders_path.exists() and self.trades_path.exists()
-        if not self.enabled:
-            status = "disabled"
-        elif not required_present:
+        if not required_present:
             status = "waiting_for_sidecar_files"
         elif stale:
             status = "stale"
@@ -133,7 +185,7 @@ class PolyDataSidecarAdapter:
             "status": status,
             "ready": status == "ready",
             "repository": POLY_DATA_REPOSITORY,
-            "integration_mode": "separate_sidecar_read_only",
+            "integration_mode": "separate_sidecar_local_files_read_only",
             "license_boundary": "GPL-3.0 upstream runs separately; this adapter reads generated data only.",
             "max_stale_sec": self.max_stale_sec,
             "latest_file_age_ms": age_ms,
@@ -151,6 +203,27 @@ class PolyDataSidecarAdapter:
                 "wallet_signing": False,
             },
         }
+
+    def snapshot(self, *, timestamp_ms: int | None = None) -> dict[str, Any]:
+        timestamp = int(timestamp_ms if timestamp_ms is not None else _now_ms())
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "status": "disabled",
+                "ready": False,
+                "repository": POLY_DATA_REPOSITORY,
+                "integration_mode": "disabled",
+                "license_boundary": "GPL-3.0 upstream is not imported into this project.",
+                "safety": {
+                    "read_only": True,
+                    "mutates_upstream_files": False,
+                    "places_orders": False,
+                    "wallet_signing": False,
+                },
+            }
+        if self.manifest_url:
+            return self._remote_snapshot(timestamp_ms=timestamp)
+        return self._local_snapshot(timestamp_ms=timestamp)
 
 
 class PolyMakerShadowAdapter:
